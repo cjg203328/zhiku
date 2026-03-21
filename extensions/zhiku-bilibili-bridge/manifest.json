@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "知库 B站登录小助手",
+  "version": "0.1.0",
+  "description": "把当前浏览器里的 B 站登录状态临时同步到知库本地服务，用于补全需要登录的视频字幕。",
+  "permissions": [
+    "alarms",
+    "cookies",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://*.bilibili.com/*",
+    "*://b23.tv/*",
+    "http://127.0.0.1:38765/*",
+    "http://localhost:38765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "知库 B站登录小助手"
+  }
+}

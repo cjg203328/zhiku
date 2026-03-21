@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zhiku-api"
+version = "0.1.0"
+description = "Zhiku local sidecar API service"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn[standard]>=0.34,<1.0",
+  "pydantic-settings>=2.8,<3.0",
+  "opencc-python-reimplemented>=0.1.7"
+]
+
+[project.optional-dependencies]
+asr-local = [
+  "faster-whisper>=1.2,<2.0"
+]
+build = [
+  "pyinstaller>=6.0,<7.0"
+]
+test = [
+  "httpx>=0.28,<1.0"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

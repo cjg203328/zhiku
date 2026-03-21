@@ -1,0 +1,25 @@
+{
+  "name": "zhiku",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:web": "npm --prefix apps/web run dev",
+    "preview:web": "npm --prefix apps/web run preview -- --host 127.0.0.1 --port 4173",
+    "build:web": "npm --prefix apps/web run build",
+    "dev:desktop": "npm --prefix apps/desktop run dev",
+    "build:desktop": "npm --prefix apps/desktop run build",
+    "dev:api": "python -m uvicorn zhiku_api.main:app --app-dir services/api/src --reload --host 127.0.0.1 --port 38765",
+    "serve:api": "python -m uvicorn zhiku_api.main:app --app-dir services/api/src --host 127.0.0.1 --port 38765",
+    "test:api": "python scripts/qa/selftest_api.py",
+    "check:env:sidecar": "powershell -ExecutionPolicy Bypass -File ./scripts/build/check_env.ps1 -Profile sidecar",
+    "check:env:bundle": "powershell -ExecutionPolicy Bypass -File ./scripts/build/check_env.ps1 -Profile bundle",
+    "build:sidecar": "powershell -ExecutionPolicy Bypass -File ./scripts/build/build_sidecar.ps1",
+    "build:bundle": "powershell -ExecutionPolicy Bypass -File ./scripts/build/build_desktop.ps1"
+  },
+  "dependencies": {
+    "opencc-js": "^1.0.5"
+  }
+}
