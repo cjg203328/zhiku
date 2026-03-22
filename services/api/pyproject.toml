@@ -12,7 +12,8 @@ dependencies = [
   "fastapi>=0.115,<1.0",
   "uvicorn[standard]>=0.34,<1.0",
   "pydantic-settings>=2.8,<3.0",
-  "opencc-python-reimplemented>=0.1.7"
+  "opencc-python-reimplemented>=0.1.7",
+  "yt-dlp>=2025.3.31,<2026.0"
 ]
 
 [project.optional-dependencies]

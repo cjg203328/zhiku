@@ -76,12 +76,10 @@ export default function ImportInputSection({
           {showAdvanced ? displayText("收起选项") : displayText("更多选项")}
         </button>
       </div>
-      <p className="muted-text">{displayText("自动尝试：字幕 -> 正文 -> 转写")}</p>
 
       {awaitingImportConfirmation && probeRequiresConfirmation && lastProbedUrl === urlValue.trim() ? (
         <article className="result-callout import-guard-callout">
-          <strong>{displayText("这条链接大概率只能先拿到弱材料。")}</strong>
-          <p>{displayText("建议先补 Cookie 或转写；如果你只想先建档，再点一次开始导入也可以。")}</p>
+          <strong>{displayText("这条内容可能只有基础结果。")}</strong>
         </article>
       ) : null}
 
@@ -92,6 +90,7 @@ export default function ImportInputSection({
             <div className="pill-row">
               {[
                 { value: "structured", label: "结构化" },
+                { value: "bilinote", label: "阅读版" },
                 { value: "qa", label: "问答导向" },
                 { value: "brief", label: "精简速记" },
               ].map((item) => (
@@ -101,9 +100,9 @@ export default function ImportInputSection({
                   type="button"
                   onClick={() => setNoteStyle(item.value)}
                 >
-                  {displayText(item.label)}
+                    {displayText(item.label)}
                 </button>
-              ))}
+            ))}
             </div>
           </div>
 
@@ -111,7 +110,7 @@ export default function ImportInputSection({
           <input
             id="summary-focus-input"
             className="search-input"
-            placeholder={displayText("例如：新手引导、产品拆解")}
+            placeholder={displayText("例如：产品拆解、运营策略")}
             value={summaryFocus}
             onChange={(event) => setSummaryFocus(event.target.value)}
           />

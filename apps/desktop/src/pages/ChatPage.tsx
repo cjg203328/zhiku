@@ -550,6 +550,9 @@ export default function ChatPage() {
   );
   const primaryFeedbackSignals = feedbackSignals.slice(0, 4);
   const secondaryFeedbackSignals = feedbackSignals.slice(4).filter((item) => item.value.trim());
+  const compactFeedbackTags = feedbackTags.slice(0, 3);
+  const feedbackPathItems = feedbackPaths.slice(0, 2);
+  const showFeedbackDetails = Boolean(secondaryFeedbackSignals.length || feedbackVariantLabels.length);
   const primaryContentId = useMemo(
     () => feedbackFocus?.content_id?.trim() || citations[0]?.content_id?.trim() || scopedContentId,
     [citations, feedbackFocus?.content_id, scopedContentId],
@@ -573,7 +576,7 @@ export default function ChatPage() {
     if (primaryContentId) {
       items.push({
         kind: "link",
-        label: answerQuality.degraded || answerQuality.level === "blocked" ? "先看材料详情" : `打开${primaryContentTitle ? "主内容" : "详情页"}`,
+        label: answerQuality.degraded || answerQuality.level === "blocked" ? "查看材料详情" : `打开${primaryContentTitle ? "主内容" : "详情页"}`,
         to: `/library/${primaryContentId}`,
         tone: "secondary",
       });
@@ -946,8 +949,8 @@ export default function ChatPage() {
           <div className="qa-message-stream">
             {!conversationMessages.length && (
               <div className="glass-callout qa-empty-stream">
-                <strong>{displayText("开始第一轮提问")}</strong>
-                <p className="muted-text">{displayText("输入一个具体问题，回答会以连续会话的形式展示在这里。")}</p>
+                <strong>{displayText("开始一轮问题")}</strong>
+                <p className="muted-text">{displayText("输入一个明确问题后，回答、引用和回看入口会集中显示在这里。")}</p>
               </div>
             )}
 
@@ -955,7 +958,7 @@ export default function ChatPage() {
               <div className={`qa-quality-banner qa-quality-banner-${qualityBannerTone}`}>
                 <div>
                   <strong>{displayText(answerQuality.label || feedbackModeLabel || "本轮回答状态")}</strong>
-                  <p>{displayText(answerQuality.summary || "系统已经拿到本轮检索和证据信息，你可以继续追问或先回看主内容。")}</p>
+                  <p>{displayText(answerQuality.summary || "系统已生成本轮检索与证据信息，可继续追问或打开详情。")}</p>
                 </div>
                 {!!qualityActionItems.length && (
                   <div className="qa-quality-actions">
@@ -989,8 +992,8 @@ export default function ChatPage() {
               <div className="qa-evidence-recommend-strip">
                 <div className="qa-evidence-recommend-head">
                   <div>
-                    <strong>{displayText("建议先回看这几个证据片段")}</strong>
-                    <p>{displayText("如果你想快速判断这轮回答靠不靠谱，先看这两个命中片段通常最有效。")}</p>
+                    <strong>{displayText("优先回看片段")}</strong>
+                    <p>{displayText("以下片段与当前回答关联度最高。")}</p>
                   </div>
                 </div>
                 <div className="qa-evidence-recommend-list">
@@ -1095,7 +1098,7 @@ export default function ChatPage() {
             {localMessage && <p className="success-text">{displayText(localMessage)}</p>}
             {isLowRecall && (
               <div className="low-recall-warning">
-                <span>⚠ 当前回答依据较弱，建议补充更多相关内容或换一种问法。</span>
+                <span>{displayText("当前回答依据较弱，可补充相关内容或更换问法。")}</span>
               </div>
             )}
             {savedNoteId && (
@@ -1174,52 +1177,16 @@ export default function ChatPage() {
             <article className="card glass-panel qa-sidebar-card qa-feedback-card">
               <div className="panel-heading">
                 <div>
-                  <p className="eyebrow">{displayText("本轮思考反馈")}</p>
-                  <h3>{displayText(feedbackModeLabel || answerQuality.label || "回答分析")}</h3>
+                  <p className="eyebrow">{displayText("本轮摘要")}</p>
+                  <h3>{displayText(answerQuality.label || feedbackModeLabel || "回答分析")}</h3>
                 </div>
               </div>
-              <div className="pill-row">
+              <div className="pill-row qa-feedback-tag-row">
                 {answerQuality.label && <span className="pill">{displayText(answerQuality.label)}</span>}
-                {feedbackTags.map((tag) => (
+                {compactFeedbackTags.map((tag) => (
                   <span className="pill" key={tag}>{displayText(tag)}</span>
                 ))}
               </div>
-              {answerQuality.summary && (
-                <div className="glass-callout">
-                  <strong>{displayText("这轮是怎么得到答案的")}</strong>
-                  <p className="muted-text">{displayText(answerQuality.summary)}</p>
-                  {answerQuality.recommended_action && <p className="muted-text">{displayText(answerQuality.recommended_action)}</p>}
-                </div>
-              )}
-
-              {!!qualityActionItems.length && (
-                <div className="qa-feedback-section">
-                  <p className="eyebrow">{displayText("建议下一步")}</p>
-                  <div className="header-actions">
-                    {qualityActionItems.map((item) =>
-                      item.kind === "link" ? (
-                        <Link
-                          key={`side-${item.kind}-${item.to}`}
-                          className={item.tone === "primary" ? "primary-button button-link" : "secondary-button button-link"}
-                          to={item.to}
-                        >
-                          {displayText(item.label)}
-                        </Link>
-                      ) : (
-                        <button
-                          key={`side-${item.kind}-${item.value}`}
-                          className={item.tone === "primary" ? "primary-button" : "secondary-button"}
-                          type="button"
-                          onClick={() => void submitQuestion(item.value)}
-                          disabled={isStreaming}
-                        >
-                          {displayText(item.label)}
-                        </button>
-                      ),
-                    )}
-                  </div>
-                </div>
-              )}
               <div className="qa-feedback-metrics">
                 {primaryFeedbackSignals.map((item) => (
                   <article className="qa-feedback-metric" key={item.label}>
@@ -1229,36 +1196,11 @@ export default function ChatPage() {
                 ))}
               </div>
 
-              {!!secondaryFeedbackSignals.length && (
-                <details className="qa-feedback-details">
-                  <summary>{displayText("查看细节")}</summary>
-                  <div className="qa-feedback-metrics qa-feedback-metrics-secondary">
-                    {secondaryFeedbackSignals.map((item) => (
-                      <article className="qa-feedback-metric" key={item.label}>
-                        <span>{displayText(item.label)}</span>
-                        <strong>{displayText(item.value)}</strong>
-                      </article>
-                    ))}
-                  </div>
-                </details>
-              )}
-
-              {!!feedbackVariantLabels.length && (
+              {!!feedbackPathItems.length && (
                 <div className="qa-feedback-section">
-                  <p className="eyebrow">{displayText("问题改写")}</p>
-                  <div className="pill-row">
-                    {feedbackVariantLabels.map((item) => (
-                      <span className="pill" key={item}>{displayText(item)}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {!!feedbackPaths.length && (
-                <div className="qa-feedback-section">
-                  <p className="eyebrow">{displayText("优先命中的内容")}</p>
+                  <p className="eyebrow">{displayText("优先内容")}</p>
                   <div className="qa-feedback-paths">
-                    {feedbackPaths.slice(0, 2).map((item) => (
+                    {feedbackPathItems.map((item) => (
                       <Link className="qa-feedback-link" key={item.content_id} to={`/library/${item.content_id}`}>
                         <strong>{displayText(item.title)}</strong>
                         <small>{displayText(`相关度 ${item.score.toFixed(1)}`)}</small>
@@ -1268,24 +1210,42 @@ export default function ChatPage() {
                 </div>
               )}
 
-              {(answerQuality.source === "content_capture" || /Cookie|转写|设置页/.test(answerQuality.recommended_action || "")) && (
-                <div className="header-actions">
-                  <Link className="secondary-button button-link" to="/settings">
-                    {displayText("去补全采集能力")}
-                  </Link>
-                </div>
+              {showFeedbackDetails && (
+                <details className="qa-feedback-details">
+                  <summary>{displayText("更多细节")}</summary>
+                  {!!secondaryFeedbackSignals.length && (
+                    <div className="qa-feedback-metrics qa-feedback-metrics-secondary">
+                      {secondaryFeedbackSignals.map((item) => (
+                        <article className="qa-feedback-metric" key={item.label}>
+                          <span>{displayText(item.label)}</span>
+                          <strong>{displayText(item.value)}</strong>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                  {!!feedbackVariantLabels.length && (
+                    <div className="qa-feedback-section">
+                      <p className="eyebrow">{displayText("问题改写")}</p>
+                      <div className="pill-row">
+                        {feedbackVariantLabels.map((item) => (
+                          <span className="pill" key={item}>{displayText(item)}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </details>
               )}
             </article>
           ) : (
             <article className="card glass-panel qa-sidebar-card qa-feedback-card">
               <div className="panel-heading">
                 <div>
-                  <p className="eyebrow">{displayText("本轮思考反馈")}</p>
-                  <h3>{displayText("等待第一轮回答")}</h3>
+                  <p className="eyebrow">{displayText("本轮摘要")}</p>
+                  <h3>{displayText("等待回答")}</h3>
                 </div>
               </div>
               <p className="muted-text">
-                {displayText("回答生成后，这里会显示检索路径、证据命中、问题改写和优先参考的内容。")}
+                {displayText("回答生成后，这里会显示检索概况与优先内容。")}
               </p>
             </article>
           )}

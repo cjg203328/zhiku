@@ -2,6 +2,7 @@ import uuid
 from contextvars import ContextVar
 
 from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -46,6 +47,9 @@ def create_app() -> FastAPI:
     )
 
     app.state.container = container
+    static_dir = settings_obj.knowledge_base_dir / "static"
+    static_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     app.include_router(health.router)
     app.include_router(system.router)

@@ -2,34 +2,31 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import ImportPanel from "../components/ImportPanel";
+import StageDigest from "../components/StageDigest";
 import {
   assignContentCollection,
   createCollection,
   deleteCollection,
   deleteContent,
+  getContent,
   getContents,
   listCollections,
   listImportJobs,
   upgradeContents,
   type Collection,
+  type ContentDetail,
 } from "../lib/api";
 import { useLanguage } from "../lib/language";
+import {
+  buildStageDigestCards,
+  buildStageDigestSeeds,
+  parseNoteScreenshots,
+  splitStageDigestText,
+} from "../lib/stageDigest";
+import { getImportStepShortLabel } from "../lib/importProgress";
 
 const SEARCH_HISTORY_KEY = "zhiku_search_history";
-const SEARCH_HISTORY_MAX = 5;
-
-function loadSearchHistory(): string[] {
-  try {
-    const raw = localStorage.getItem(SEARCH_HISTORY_KEY);
-    return raw ? (JSON.parse(raw) as string[]) : [];
-  } catch { return []; }
-}
-
-function saveSearchHistory(term: string) {
-  const prev = loadSearchHistory().filter((t) => t !== term);
-  const next = [term, ...prev].slice(0, SEARCH_HISTORY_MAX);
-  try { localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next)); } catch {}
-}
+const SEARCH_HISTORY_MAX = 6;
 
 type FilterKey = "all" | "video" | "article" | "note";
 
@@ -43,6 +40,7 @@ type LibraryCardItem = {
   parseMode: string | null;
   noteStyle: string | null;
   status: string | null;
+  updatedAt: string;
   isDemo: boolean;
 };
 
@@ -53,37 +51,159 @@ type PendingFocusItem = {
   suggestedQuestions: string[];
 };
 
+type WorkspaceNotice = {
+  title: string;
+  description: string;
+  linkTo?: string;
+  linkLabel?: string;
+  tone?: "default" | "warning";
+};
+
+function loadSearchHistory(): string[] {
+  try {
+    const raw = window.localStorage.getItem(SEARCH_HISTORY_KEY);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveSearchHistory(term: string) {
+  const trimmed = term.trim();
+  if (!trimmed) {
+    return;
+  }
+  const next = [trimmed, ...loadSearchHistory().filter((item) => item !== trimmed)].slice(0, SEARCH_HISTORY_MAX);
+  try {
+    window.localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore local storage failures and keep the page interactive.
+  }
+}
+
 function getNoteStyleLabel(value: string | null) {
-  if (value === "qa") return "问答笔记";
-  if (value === "brief") return "快速速记";
-  if (value === "structured") return "结构化笔记";
-  return null;
+  if (value === "bilinote") return "阅读版";
+  if (value === "qa") return "问答版";
+  if (value === "brief") return "速览版";
+  if (value === "structured") return "结构版";
+  return "原始建档";
 }
 
 function getSourceDescription(source: string) {
-  if (source.toLowerCase().includes("bilibili")) return "公开视频";
-  if (source.toLowerCase().includes("doc")) return "结构化文档";
-  if (source.toLowerCase().includes("assistant")) return "对话沉淀";
+  const normalized = source.toLowerCase();
+  if (normalized.includes("bilibili") || normalized.includes("video")) return "视频内容";
+  if (normalized.includes("web") || normalized.includes("article")) return "网页文章";
+  if (normalized.includes("doc") || normalized.includes("file")) return "文档资料";
+  if (normalized.includes("assistant") || normalized.includes("note")) return "对话沉淀";
   return "知识来源";
 }
 
 function getStatusLabel(status: string | null | undefined, parseMode: string | null, noteStyle: string | null) {
-  if (status === "ready") return "可直接验证";
+  if (status === "ready") return "完整可用";
   if (status === "ready_estimated") return "正文已恢复";
-  if (status === "needs_cookie") return "需登录态补全";
-  if (status === "needs_asr") return "需转写补全";
-  if (status === "asr_failed") return "转写待修复";
-  if (status === "limited") return "仅基础建档";
-  if (parseMode === "api") return "解析较完整";
+  if (status === "needs_cookie") return "待补登录态";
+  if (status === "needs_asr") return "待补转写";
+  if (status === "asr_failed") return "转写失败";
+  if (status === "limited") return "材料偏弱";
+  if (parseMode === "api") return "官方信息较完整";
   if (noteStyle) return "已生成笔记";
-  return "待继续验证";
+  return "基础建档";
 }
 
 function getStatusPillClass(status: string | null | undefined) {
   if (status === "ready" || status === "ready_estimated") return "pill pill-success";
   if (status === "needs_cookie" || status === "needs_asr" || status === "asr_failed") return "pill pill-warning";
-  if (status === "import_pending") return "pill pill-muted";
+  if (status === "limited") return "pill";
   return "pill subtle-pill";
+}
+
+function getPendingStepLabel(step: string | null | undefined) {
+  if (step === "queued") return "已进入队列";
+  if (step === "detecting_source") return "识别来源";
+  if (step === "reading_file") return "读取文件";
+  if (step === "parsing_content") return "提取正文";
+  if (step === "saving_content") return "整理入库";
+  if (step === "done") return "已完成";
+  if (step === "failed") return "处理失败";
+  return "处理中";
+}
+
+function plainText(value: string) {
+  return value
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+    .replace(/`/g, "")
+    .replace(/[#>*_-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function snippet(value: string, limit = 200) {
+  const clean = plainText(value);
+  if (!clean) return "";
+  return clean.length <= limit ? clean : `${clean.slice(0, limit).trimEnd()}...`;
+}
+
+function getMetadata(detail: ContentDetail | undefined) {
+  const raw = detail?.metadata;
+  return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+}
+
+function getNotePreview(detail: ContentDetail | undefined) {
+  if (!detail) {
+    return "";
+  }
+  const metadata = getMetadata(detail);
+  const refined = typeof metadata.refined_note_markdown === "string" ? metadata.refined_note_markdown : "";
+  const note = typeof metadata.note_markdown === "string" ? metadata.note_markdown : "";
+  const source = refined || note || detail.content_text || detail.summary;
+  return snippet(source, 800);
+}
+
+function getTranscriptSegmentCount(detail: ContentDetail | undefined) {
+  const metadata = getMetadata(detail);
+  const noteQuality = metadata.note_quality;
+  if (
+    noteQuality &&
+    typeof noteQuality === "object" &&
+    typeof (noteQuality as { transcript_segments?: unknown }).transcript_segments === "number"
+  ) {
+    return (noteQuality as { transcript_segments: number }).transcript_segments;
+  }
+  return Array.isArray(metadata.transcript_segments) ? metadata.transcript_segments.length : 0;
+}
+
+function getQualityScore(detail: ContentDetail | undefined) {
+  const metadata = getMetadata(detail);
+  const noteQuality = metadata.note_quality;
+  if (
+    noteQuality &&
+    typeof noteQuality === "object" &&
+    typeof (noteQuality as { score?: unknown }).score === "number"
+  ) {
+    return (noteQuality as { score: number }).score;
+  }
+  return null;
+}
+
+function formatDateTime(value: string | null | undefined) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString();
+}
+
+function buildQuickQuestions(detail: ContentDetail | undefined) {
+  if (!detail) return [];
+  const title = detail.title.trim();
+  if (!title) return [];
+  return [
+    `请概括《${title}》最值得记住的三个结论`,
+    `围绕《${title}》，还可以继续展开哪些问题`,
+    `如果把《${title}》整理成一页复盘，应该保留哪些信息`,
+  ];
 }
 
 const mockCards: LibraryCardItem[] = [
@@ -91,40 +211,44 @@ const mockCards: LibraryCardItem[] = [
     id: "demo-bilibili-001",
     title: "AI 时代的学习方法",
     source: "Bilibili",
-    summary: "强调收集、整理、输出的闭环，让知识真正可以被复用。",
+    summary: "把视频里的观点沉淀成结构化笔记，再继续追问和回看证据。",
     tags: ["学习", "AI", "知识管理"],
     coverUrl: null,
     parseMode: null,
-    noteStyle: null,
-    status: null,
+    noteStyle: "structured",
+    status: "ready",
+    updatedAt: "",
     isDemo: true,
   },
   {
     id: "demo-docx-001",
-    title: "产品访谈纪要",
+    title: "用户访谈纪要",
     source: "DOCX",
-    summary: "6 位用户描述了知识工具最值得优先解决的核心痛点。",
+    summary: "保留文档导入能力，适合把调研和访谈资料也统一沉淀进来。",
     tags: ["调研", "访谈", "产品"],
     coverUrl: null,
     parseMode: null,
-    noteStyle: null,
-    status: null,
+    noteStyle: "brief",
+    status: "ready",
+    updatedAt: "",
     isDemo: true,
   },
 ];
 
 const filterItems: { key: FilterKey; label: string; hint: string }[] = [
   { key: "all", label: "全部内容", hint: "总览" },
-  { key: "video", label: "视频内容", hint: "B 站优先" },
-  { key: "article", label: "网页文章", hint: "正文抽取" },
-  { key: "note", label: "问答沉淀", hint: "知识卡片" },
+  { key: "video", label: "视频笔记", hint: "视频来源" },
+  { key: "article", label: "网页文章", hint: "正文导入" },
+  { key: "note", label: "问答沉淀", hint: "卡片回看" },
 ];
 
 export default function LibraryPage() {
   const { displayText } = useLanguage();
+  const queryClient = useQueryClient();
+  const searchRef = useRef<HTMLInputElement>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
-  const [searchHistory, setSearchHistory] = useState<string[]>(loadSearchHistory);
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => loadSearchHistory());
   const [showSearchHistory, setShowSearchHistory] = useState(false);
   const [activeFilter, setActiveFilter] = useState<FilterKey>("all");
   const [activeCollectionId, setActiveCollectionId] = useState<string | null>(null);
@@ -133,28 +257,24 @@ export default function LibraryPage() {
   const [maintenanceMessage, setMaintenanceMessage] = useState("");
   const [selectedCardId, setSelectedCardId] = useState("");
   const [pendingFocusItem, setPendingFocusItem] = useState<PendingFocusItem | null>(null);
-  const [recentImportGuide, setRecentImportGuide] = useState<PendingFocusItem | null>(null);
-  const [workbenchMessage, setWorkbenchMessage] = useState("");
-  const queryClient = useQueryClient();
-  const searchRef = useRef<HTMLInputElement>(null);
+  const [workspaceNotice, setWorkspaceNotice] = useState<WorkspaceNotice | null>(null);
 
   useEffect(() => {
-    const id = setTimeout(() => {
+    const timer = window.setTimeout(() => {
       const trimmed = searchTerm.trim();
       setDebouncedSearch(trimmed);
       if (trimmed) {
         saveSearchHistory(trimmed);
         setSearchHistory(loadSearchHistory());
       }
-    }, 300);
-    return () => clearTimeout(id);
+    }, 320);
+    return () => window.clearTimeout(timer);
   }, [searchTerm]);
 
   const pendingJobsQuery = useQuery({
     queryKey: ["imports", "pending"],
     queryFn: () => listImportJobs("pending"),
-    refetchInterval: (query) =>
-      (query.state.data?.pending_count ?? 0) > 0 ? 2000 : false,
+    refetchInterval: (query) => ((query.state.data?.pending_count ?? 0) > 0 ? 1600 : false),
   });
   const pendingCount = pendingJobsQuery.data?.pending_count ?? 0;
 
@@ -162,7 +282,7 @@ export default function LibraryPage() {
     queryKey: ["contents", debouncedSearch, activeCollectionId],
     queryFn: () => getContents(debouncedSearch, activeCollectionId),
     retry: 1,
-    refetchInterval: pendingCount > 0 ? 2000 : false,
+    refetchInterval: pendingCount > 0 ? 1800 : false,
   });
 
   const collectionsQuery = useQuery({
@@ -173,9 +293,10 @@ export default function LibraryPage() {
 
   const createCollectionMutation = useMutation({
     mutationFn: (name: string) => createCollection({ name }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["collections"] });
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["collections"] });
       setNewCollectionName("");
+      setShowCollectionPanel(false);
     },
   });
 
@@ -183,7 +304,9 @@ export default function LibraryPage() {
     mutationFn: (id: string) => deleteCollection(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["collections"] });
-      setActiveCollectionId(null);
+      if (activeCollectionId) {
+        setActiveCollectionId(null);
+      }
     },
   });
 
@@ -204,21 +327,7 @@ export default function LibraryPage() {
       setMaintenanceMessage(result.message);
     },
     onError: (error) => {
-      setMaintenanceMessage(error instanceof Error ? error.message : "旧内容升级失败，请稍后重试。");
-    },
-  });
-
-  const [deleteGuideTitle, setDeleteGuideTitle] = useState("");
-
-  const deleteMutation = useMutation({
-    mutationFn: (contentId: string) => deleteContent(contentId),
-    onSuccess: async (_, contentId) => {
-      await queryClient.invalidateQueries({ queryKey: ["contents"] });
-      await queryClient.invalidateQueries({ queryKey: ["trash"] });
-      // 显示撤销/回收站引导（5秒后自动清除）
-      const card = cards.find((c) => c.id === contentId);
-      setDeleteGuideTitle(card?.title || "内容");
-      setTimeout(() => setDeleteGuideTitle(""), 6000);
+      setMaintenanceMessage(error instanceof Error ? error.message : "旧内容升级失败，请稍后再试。");
     },
   });
 
@@ -234,6 +343,7 @@ export default function LibraryPage() {
         parseMode: item.parse_mode ?? null,
         noteStyle: item.note_style ?? null,
         status: item.status ?? null,
+        updatedAt: item.updated_at,
         isDemo: false,
       }));
     }
@@ -244,8 +354,6 @@ export default function LibraryPage() {
 
     return mockCards;
   }, [contentsQuery.data, contentsQuery.isSuccess]);
-
-  const collections = collectionsQuery.data?.items ?? [];
 
   const filteredCards = useMemo(() => {
     let result = cards;
@@ -265,7 +373,6 @@ export default function LibraryPage() {
       setSelectedCardId("");
       return;
     }
-
     if (!selectedCardId || !filteredCards.some((item) => item.id === selectedCardId)) {
       setSelectedCardId(filteredCards[0].id);
     }
@@ -275,14 +382,11 @@ export default function LibraryPage() {
     if (!pendingFocusItem) {
       return;
     }
-
     const matchedCard = cards.find((item) => item.id === pendingFocusItem.contentId);
     if (!matchedCard) {
       return;
     }
-
     setSelectedCardId(matchedCard.id);
-    setWorkbenchMessage(`已自动切换到新导入内容：《${pendingFocusItem.title}》`);
     setPendingFocusItem(null);
   }, [cards, pendingFocusItem]);
 
@@ -290,24 +394,69 @@ export default function LibraryPage() {
     () => filteredCards.find((item) => item.id === selectedCardId) ?? filteredCards[0] ?? null,
     [filteredCards, selectedCardId],
   );
+
+  const detailQuery = useQuery({
+    queryKey: ["content", selectedCard?.id],
+    queryFn: () => getContent(selectedCard!.id),
+    enabled: Boolean(selectedCard && !selectedCard.isDemo),
+    retry: 1,
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (contentId: string) => deleteContent(contentId),
+    onSuccess: async (_, contentId) => {
+      await queryClient.invalidateQueries({ queryKey: ["contents"] });
+      await queryClient.invalidateQueries({ queryKey: ["trash"] });
+      const card = cards.find((item) => item.id === contentId);
+      setWorkspaceNotice({
+        title: "已移入回收站",
+        description: `《${card?.title || "这条内容"}》已移入回收站。`,
+        linkTo: "/trash",
+        linkLabel: "查看回收站",
+        tone: "warning",
+      });
+    },
+  });
+
+  const collections = collectionsQuery.data?.items ?? [];
   const total = contentsQuery.data?.total ?? 0;
-  const trimmedSearch = debouncedSearch;
-  const recentCards = cards.slice(0, 4);
-  const parsedCount = cards.filter((item) => item.status === "ready" || item.status === "ready_estimated").length;
+  const readyCount = cards.filter((item) => item.status === "ready" || item.status === "ready_estimated").length;
   const noteCount = cards.filter((item) => item.noteStyle).length;
-  const readyLabel = selectedCard
-    ? getStatusLabel(selectedCard.status, selectedCard.parseMode, selectedCard.noteStyle)
-    : "等待内容";
-  const noteStyleLabel = getNoteStyleLabel(selectedCard?.noteStyle ?? null);
-  const showRecentImportGuide = Boolean(
-    recentImportGuide &&
-      selectedCard &&
-      !selectedCard.isDemo &&
-      selectedCard.id === recentImportGuide.contentId,
+  const pendingJobs = pendingJobsQuery.data?.items ?? [];
+  const notePreview = getNotePreview(detailQuery.data);
+  const quickQuestions = buildQuickQuestions(detailQuery.data);
+  const visibleQuickQuestions = quickQuestions.slice(0, 2);
+  const transcriptSegmentCount = getTranscriptSegmentCount(detailQuery.data);
+  const qualityScore = getQualityScore(detailQuery.data);
+  const detailMetadata = getMetadata(detailQuery.data);
+  const captureSummary = typeof detailMetadata.capture_summary === "string" ? detailMetadata.capture_summary : "";
+  const previewScreenshots = useMemo(() => parseNoteScreenshots(detailMetadata), [detailMetadata]);
+  const previewStageSeeds = useMemo(() => {
+    if (detailQuery.data?.key_points.length) {
+      return buildStageDigestSeeds(detailQuery.data.key_points, {
+        idPrefix: `${detailQuery.data?.id ?? "preview"}-point`,
+        eyebrowPrefix: "重点",
+        titlePrefix: "阶段",
+        limit: 4,
+      });
+    }
+
+    return buildStageDigestSeeds(splitStageDigestText(notePreview, 4), {
+      idPrefix: `${detailQuery.data?.id ?? "preview"}-summary`,
+      eyebrowPrefix: "摘要",
+      titlePrefix: "阶段",
+      limit: 4,
+    });
+  }, [detailQuery.data?.id, detailQuery.data?.key_points, notePreview]);
+  const previewStageDigestItems = useMemo(
+    () => buildStageDigestCards(previewStageSeeds, previewScreenshots, { limit: 3 }),
+    [previewScreenshots, previewStageSeeds],
   );
 
   function handleDelete(contentId: string, title: string) {
-    if (!window.confirm(displayText(`确认将《${title}》移入回收站吗？`))) return;
+    if (!window.confirm(displayText(`确认将《${title}》移入回收站吗？`))) {
+      return;
+    }
     deleteMutation.mutate(contentId);
   }
 
@@ -317,69 +466,75 @@ export default function LibraryPage() {
       setSearchTerm("");
     }
     setPendingFocusItem(payload);
-    setRecentImportGuide(payload);
-    setWorkbenchMessage(
-      payload.status === "ready" || payload.status === "ready_estimated"
-        ? `《${payload.title}》已经导入完成，正在为你切到这条内容。`
-        : `《${payload.title}》已经完成基础建档，正在切到这条内容继续处理。`,
-    );
+    setWorkspaceNotice({
+      title: payload.status === "ready" || payload.status === "ready_estimated" ? "导入完成" : "材料已入库",
+      description:
+        payload.status === "ready" || payload.status === "ready_estimated"
+          ? `《${payload.title}》已完成导入，右侧已更新当前笔记。`
+          : `《${payload.title}》已完成基础建档，右侧会显示当前材料状态。`,
+    });
   }
 
   return (
-    <section className="page knowledge-workbench-page">
-      <div className="knowledge-workbench">
-        {/* Collection 侧边栏 */}
-        <div className="knowledge-column knowledge-column-collections">
-          <article className="card glass-panel knowledge-collections-card">
-            <div className="knowledge-collections-head">
-              <p className="eyebrow">{displayText("分组")}</p>
+    <section className="page bili-note-page">
+      <div className="bili-note-shell">
+        <div className="bili-note-column bili-note-column-left">
+          <article className="card glass-panel bili-note-hero-card">
+            <div className="bili-note-hero-copy">
+              <p className="eyebrow">{displayText("内容工作台")}</p>
+              <h2>{displayText("把视频导入、沉淀、追问，收束到一条清晰主线")}</h2>
+              <p className="muted-text">
+                {displayText("基于现有知库能力重新组织：左边导入，中间看队列和历史，右边直接预览当前笔记。")}
+              </p>
+            </div>
+            <div className="bili-note-stat-grid">
+              <article className="bili-note-stat-card">
+                <span>{displayText("知识条目")}</span>
+                <strong>{total}</strong>
+              </article>
+              <article className="bili-note-stat-card">
+                <span>{displayText("完整笔记")}</span>
+                <strong>{readyCount}</strong>
+              </article>
+              <article className="bili-note-stat-card">
+                <span>{displayText("可追问")}</span>
+                <strong>{noteCount}</strong>
+              </article>
+            </div>
+            <div className="pill-row">
+              <span className="pill">{displayText("视频导入")}</span>
+              <span className="pill">{displayText("异步导入")}</span>
+              <span className="pill">{displayText("右侧实时预览")}</span>
+            </div>
+          </article>
+
+          <ImportPanel onImportCompleted={handleImportCompleted} />
+
+          <article className="card glass-panel bili-note-collection-card">
+            <div className="bili-note-section-head">
+              <div>
+                <p className="eyebrow">{displayText("分组管理")}</p>
+                <h3>{displayText("把当前内容归到你自己的主题里")}</h3>
+              </div>
               <button
                 type="button"
-                className="icon-button"
-                title={displayText("新建分组")}
-                onClick={() => setShowCollectionPanel((v) => !v)}
-              >+</button>
+                className="secondary-button"
+                onClick={() => setShowCollectionPanel((value) => !value)}
+              >
+                {displayText(showCollectionPanel ? "收起" : "新建分组")}
+              </button>
             </div>
 
-            <button
-              type="button"
-              className={activeCollectionId === null ? "collection-item collection-item-active" : "collection-item"}
-              onClick={() => setActiveCollectionId(null)}
-            >
-              <span className="collection-item-icon">◫</span>
-              <span className="collection-item-name">{displayText("全部内容")}</span>
-              <span className="collection-item-count">{cards.filter(c => !c.isDemo).length}</span>
-            </button>
-
-            {collections.map((col: Collection) => (
-              <button
-                key={col.id}
-                type="button"
-                className={activeCollectionId === col.id ? "collection-item collection-item-active" : "collection-item"}
-                onClick={() => setActiveCollectionId(col.id)}
-              >
-                <span className="collection-item-icon" style={{ color: col.color }}>{col.icon}</span>
-                <span className="collection-item-name">{col.name}</span>
-                <button
-                  type="button"
-                  className="collection-item-delete"
-                  title={displayText("删除分组")}
-                  onClick={(e) => { e.stopPropagation(); deleteCollectionMutation.mutate(col.id); }}
-                >×</button>
-              </button>
-            ))}
-
             {showCollectionPanel && (
-              <div className="collection-create-panel">
+              <div className="bili-note-collection-create">
                 <input
                   className="search-input"
-                  placeholder={displayText("分组名称")}
+                  placeholder={displayText("输入分组名称")}
                   value={newCollectionName}
-                  onChange={(e) => setNewCollectionName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && newCollectionName.trim()) {
+                  onChange={(event) => setNewCollectionName(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && newCollectionName.trim()) {
                       createCollectionMutation.mutate(newCollectionName.trim());
-                      setShowCollectionPanel(false);
                     }
                   }}
                 />
@@ -387,125 +542,85 @@ export default function LibraryPage() {
                   type="button"
                   className="primary-button"
                   disabled={!newCollectionName.trim() || createCollectionMutation.isPending}
-                  onClick={() => {
-                    if (newCollectionName.trim()) {
-                      createCollectionMutation.mutate(newCollectionName.trim());
-                      setShowCollectionPanel(false);
-                    }
-                  }}
+                  onClick={() => createCollectionMutation.mutate(newCollectionName.trim())}
                 >
-                  {displayText("创建")}
+                  {displayText(createCollectionMutation.isPending ? "创建中..." : "创建")}
                 </button>
               </div>
             )}
+
+            <div className="bili-note-collection-list">
+              <button
+                type="button"
+                className={activeCollectionId === null ? "collection-item collection-item-active" : "collection-item"}
+                onClick={() => setActiveCollectionId(null)}
+              >
+                <span className="collection-item-icon">●</span>
+                <span className="collection-item-name">{displayText("全部内容")}</span>
+              </button>
+              {collections.map((collection: Collection) => (
+                <div className="bili-note-collection-row" key={collection.id}>
+                  <button
+                    type="button"
+                    className={activeCollectionId === collection.id ? "collection-item collection-item-active" : "collection-item"}
+                    onClick={() => setActiveCollectionId(collection.id)}
+                  >
+                    <span className="collection-item-icon" style={{ color: collection.color }}>{collection.icon}</span>
+                    <span className="collection-item-name">{collection.name}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="collection-item-delete collection-item-delete-visible"
+                    title={displayText("删除分组")}
+                    onClick={() => deleteCollectionMutation.mutate(collection.id)}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
 
             {selectedCard && !selectedCard.isDemo && collections.length > 0 && (
-              <div className="collection-assign-panel">
-                <p className="eyebrow">{displayText("移入分组")}</p>
-                {collections.map((col: Collection) => (
+              <div className="bili-note-collection-assign">
+                <p className="eyebrow">{displayText("当前卡片快捷归档")}</p>
+                <div className="pill-row">
+                  {collections.map((collection) => (
+                    <button
+                      key={collection.id}
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => assignCollectionMutation.mutate({ contentId: selectedCard.id, collectionId: collection.id })}
+                    >
+                      {displayText(collection.name)}
+                    </button>
+                  ))}
                   <button
-                    key={col.id}
                     type="button"
-                    className="collection-assign-item"
-                    onClick={() => assignCollectionMutation.mutate({ contentId: selectedCard.id, collectionId: col.id })}
+                    className="secondary-button"
+                    onClick={() => assignCollectionMutation.mutate({ contentId: selectedCard.id, collectionId: null })}
                   >
-                    <span style={{ color: col.color }}>{col.icon}</span> {col.name}
+                    {displayText("移出分组")}
                   </button>
-                ))}
-                <button
-                  type="button"
-                  className="collection-assign-item"
-                  onClick={() => assignCollectionMutation.mutate({ contentId: selectedCard.id, collectionId: null })}
-                >
-                  {displayText("移出分组")}
-                </button>
+                </div>
               </div>
             )}
           </article>
         </div>
-        <div className="knowledge-column knowledge-column-import">
-          <article className="card glass-panel knowledge-overview-card">
-            <div className="knowledge-overview-head">
+
+        <div className="bili-note-column bili-note-column-center">
+          <article className="card glass-panel bili-note-history-card">
+            <div className="bili-note-section-head">
               <div>
-                <p className="eyebrow">{displayText("知识工作台")}</p>
-                <h2>{displayText("导入 B 站视频，沉淀成可搜索、可提问的知识笔记")}</h2>
-                <p className="muted-text">
-                  {displayText("粘贴链接即可导入，自动提取字幕、生成摘要，支持全库智能问答。")}
-                </p>
-              </div>
-              <div className="pill-row">
-                <span className="pill">{displayText("B 站优先")}</span>
-                <span className="pill">{displayText("导入即建档")}</span>
-              </div>
-            </div>
-
-            <div className="knowledge-stat-grid">
-              <article className="knowledge-stat-card">
-                <span>{displayText("知识条目")}</span>
-                <strong>{total}</strong>
-              </article>
-              <article className="knowledge-stat-card">
-                <span>{displayText("解析较完整")}</span>
-                <strong>{parsedCount}</strong>
-              </article>
-              <article className="knowledge-stat-card">
-                <span>{displayText("已生成笔记")}</span>
-                <strong>{noteCount}</strong>
-              </article>
-            </div>
-
-            {!!recentCards.length && (
-              <div className="knowledge-mini-list">
-                {recentCards.map((item) => (
-                  <button
-                    className={selectedCard?.id === item.id ? "knowledge-mini-item knowledge-mini-item-active" : "knowledge-mini-item"}
-                    key={item.id}
-                    type="button"
-                    onClick={() => setSelectedCardId(item.id)}
-                  >
-                    <strong>{displayText(item.title)}</strong>
-                    <span className="muted-text">{displayText(getStatusLabel(item.status, item.parseMode, item.noteStyle))}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {workbenchMessage && (
-              <div className="glass-callout">
-                <strong>{displayText("刚刚更新")}</strong>
-                <p className="muted-text">{displayText(workbenchMessage)}</p>
-              </div>
-            )}
-            {deleteGuideTitle && (
-              <div className="glass-callout delete-guide-callout">
-                <p className="muted-text">
-                  {displayText(`《${deleteGuideTitle}》已移入回收站。`)}
-                  {" "}
-                  <Link to="/trash" className="link-inline">{displayText("查看回收站")}</Link>
-                </p>
-              </div>
-            )}
-          </article>
-
-          <ImportPanel onImportCompleted={handleImportCompleted} />
-        </div>
-
-        <div className="knowledge-column knowledge-column-list">
-          <article className="card glass-panel knowledge-list-card">
-            <div className="knowledge-list-toolbar">
-              <div>
-                <p className="eyebrow">{displayText("内容列表")}</p>
-                <h3>{displayText("全部内容")}</h3>
+                <p className="eyebrow">{displayText("内容队列")}</p>
+                <h3>{displayText("围绕单条内容来回切换")}</h3>
               </div>
               <div className="pill-row">
                 <span className="pill">{displayText(`${filteredCards.length} 条当前结果`)}</span>
-                {pendingCount > 0 && (
-                  <span className="pill pill-warning">{displayText(`${pendingCount} 条导入中`)}</span>
-                )}
+                {pendingCount > 0 && <span className="pill pill-warning">{displayText(`${pendingCount} 条处理中`)}</span>}
               </div>
             </div>
 
-            <div style={{ position: "relative" }}>
+            <div className="bili-note-search-wrap">
               <input
                 ref={searchRef}
                 className="search-input"
@@ -513,26 +628,21 @@ export default function LibraryPage() {
                 value={searchTerm}
                 onChange={(event) => setSearchTerm(event.target.value)}
                 onFocus={() => setShowSearchHistory(true)}
-                onBlur={() => setTimeout(() => setShowSearchHistory(false), 150)}
+                onBlur={() => window.setTimeout(() => setShowSearchHistory(false), 120)}
               />
-              {showSearchHistory && searchHistory.length > 0 && !searchTerm && (
-                <div style={{
-                  position: "absolute", top: "100%", left: 0, right: 0, zIndex: 20,
-                  background: "var(--bg-elevated)", border: "1px solid var(--border)",
-                  borderRadius: "var(--radius-md)", marginTop: 4, overflow: "hidden",
-                }}>
-                  {searchHistory.map((term) => (
+              {showSearchHistory && searchHistory.length > 0 && !searchTerm.trim() && (
+                <div className="bili-note-search-history">
+                  {searchHistory.map((item) => (
                     <button
-                      key={term}
+                      key={item}
                       type="button"
-                      style={{
-                        display: "block", width: "100%", textAlign: "left",
-                        padding: "8px 12px", background: "none", border: "none",
-                        color: "var(--text-secondary)", cursor: "pointer", fontSize: "0.875rem",
+                      className="bili-note-search-history-item"
+                      onMouseDown={() => {
+                        setSearchTerm(item);
+                        setShowSearchHistory(false);
                       }}
-                      onMouseDown={() => { setSearchTerm(term); setShowSearchHistory(false); }}
                     >
-                      {term}
+                      {item}
                     </button>
                   ))}
                 </div>
@@ -553,67 +663,92 @@ export default function LibraryPage() {
               ))}
             </div>
 
-            <p className="muted-text search-panel-copy">
-              {contentsQuery.isSuccess
-                ? displayText(
-                    `当前共 ${total} 条内容，当前视图 ${filteredCards.length} 条${
-                      trimmedSearch ? `，搜索词：${trimmedSearch}` : "，可直接切到你现在要处理的那条"
-                    }`,
-                  )
-                : displayText("本地服务未连接时，会先展示示例内容，方便继续看页面结构。")}
-            </p>
+            {pendingJobs.length > 0 && (
+              <div className="bili-note-pending-list">
+                {pendingJobs.slice(0, 3).map((job) => (
+                  <article className="bili-note-pending-item" key={job.id}>
+                    <div>
+                      <strong>{displayText(job.preview.title || "未命名任务")}</strong>
+                      <p className="muted-text">{displayText(getImportStepShortLabel(job.step))}</p>
+                    </div>
+                    <span className="pill">{displayText(`${Math.max(job.progress ?? 0, 5)}%`)}</span>
+                  </article>
+                ))}
+              </div>
+            )}
 
-            {pendingFocusItem && (
-              <div className="glass-callout">
-                <strong>{displayText("正在切到最新导入")}</strong>
-                <p className="muted-text">{displayText(`正在等待《${pendingFocusItem.title}》进入当前列表。`)}</p>
+            {workspaceNotice && (
+              <div
+                className={
+                  workspaceNotice.tone === "warning"
+                    ? "bili-note-status-strip bili-note-status-strip-warning"
+                    : "bili-note-status-strip"
+                }
+              >
+                <div>
+                  <strong>{displayText(workspaceNotice.title)}</strong>
+                  <p className="muted-text">{displayText(workspaceNotice.description)}</p>
+                </div>
+                {workspaceNotice.linkTo && workspaceNotice.linkLabel && (
+                  <Link to={workspaceNotice.linkTo} className="link-inline bili-note-status-strip-link">
+                    {displayText(workspaceNotice.linkLabel)}
+                  </Link>
+                )}
               </div>
             )}
 
             {contentsQuery.isLoading && <p className="muted-text">{displayText("正在加载知识库内容...")}</p>}
-            {contentsQuery.isError && <p className="muted-text">{displayText("本地服务未连接，当前只展示示例卡片。")}</p>}
+            {contentsQuery.isError && (
+              <p className="muted-text">{displayText("本地服务未连接，当前显示示例卡片。")}</p>
+            )}
 
             {!filteredCards.length ? (
               <div className="knowledge-empty-list">
-                {trimmedSearch ? (
+                {debouncedSearch ? (
                   <>
-                    <strong>{displayText(`没找到包含「${trimmedSearch}」的内容`)}</strong>
-                    <p className="muted-text">{displayText("试试换个关键词，或清空搜索看全部内容。")}</p>
+                    <strong>{displayText(`没有找到包含“${debouncedSearch}”的内容`)}</strong>
+                    <p className="muted-text">{displayText("换一个关键词，或清空搜索后查看全部内容。")}</p>
                   </>
                 ) : (
                   <>
-                    <strong>{displayText("知识库还没有内容")}</strong>
-                    <p className="muted-text">{displayText("先导入一条 B 站链接，内容会自动整理到这里。")}</p>
+                    <strong>{displayText("内容列表还是空的")}</strong>
+                    <p className="muted-text">{displayText("导入一条视频或文档后，这里会自动出现新的内容卡片。")}</p>
                   </>
                 )}
               </div>
             ) : (
-              <div className="knowledge-list">
+              <div className="bili-note-history-list">
                 {filteredCards.map((item) => {
                   const selected = selectedCard?.id === item.id;
-                  const itemNoteStyle = getNoteStyleLabel(item.noteStyle);
                   return (
                     <button
-                      className={selected ? "knowledge-list-item knowledge-list-item-active" : "knowledge-list-item"}
                       key={item.id}
                       type="button"
+                      className={selected ? "bili-note-history-item bili-note-history-item-active" : "bili-note-history-item"}
                       onClick={() => setSelectedCardId(item.id)}
                     >
-                      <div className="knowledge-list-item-head">
+                      <div className="bili-note-history-item-head">
                         <div className="pill-row">
                           <span className="pill">{displayText(item.source)}</span>
-                          <span className={getStatusPillClass(item.status)}>{displayText(getStatusLabel(item.status, item.parseMode, item.noteStyle))}</span>
+                          <span className={getStatusPillClass(item.status)}>
+                            {displayText(getStatusLabel(item.status, item.parseMode, item.noteStyle))}
+                          </span>
                         </div>
-                        {itemNoteStyle && <span className="pill">{displayText(itemNoteStyle)}</span>}
+                        {item.noteStyle && (
+                          <span className="pill">{displayText(getNoteStyleLabel(item.noteStyle))}</span>
+                        )}
                       </div>
                       <strong className="knowledge-list-item-title">{displayText(item.title)}</strong>
                       <p className="knowledge-list-item-summary">{displayText(item.summary)}</p>
-                      <div className="tag-row-soft">
-                        {(item.tags.length ? item.tags : ["暂无标签"]).slice(0, 3).map((tag) => (
-                          <span className="pill" key={`${item.id}-${tag}`}>
-                            {displayText(tag)}
-                          </span>
-                        ))}
+                      <div className="bili-note-history-item-foot">
+                        <div className="tag-row-soft">
+                          {(item.tags.length ? item.tags : ["暂无标签"]).slice(0, 3).map((tag) => (
+                            <span className="pill" key={`${item.id}-${tag}`}>
+                              {displayText(tag)}
+                            </span>
+                          ))}
+                        </div>
+                        <span className="muted-text">{displayText(item.updatedAt ? formatDateTime(item.updatedAt) : "示例内容")}</span>
                       </div>
                     </button>
                   );
@@ -623,122 +758,170 @@ export default function LibraryPage() {
           </article>
         </div>
 
-        <div className="knowledge-column knowledge-column-preview">
-          <article className="card glass-panel knowledge-preview-card">
+        <div className="bili-note-column bili-note-column-right">
+          <article className="card glass-panel bili-note-preview-card">
             {selectedCard ? (
-              <>
-                <div className="knowledge-preview-head">
-                  <div>
-                    <p className="eyebrow">{displayText("当前预览")}</p>
-                    <h3>{displayText(selectedCard.title)}</h3>
-                  </div>
+              selectedCard.isDemo ? (
+                <div className="bili-note-preview-empty">
+                  <p className="eyebrow">{displayText("当前预览")}</p>
+                  <h3>{displayText(selectedCard.title)}</h3>
+                  <p className="muted-text">{displayText(selectedCard.summary)}</p>
                   <div className="pill-row">
-                    {workbenchMessage && selectedCard.id === selectedCardId && <span className="pill">{displayText("当前焦点")}</span>}
-                    <span className="pill">{displayText(readyLabel)}</span>
-                    {selectedCard.parseMode && (
-                      <span className="pill">{displayText(selectedCard.parseMode === "api" ? "官方信息" : "页面补充")}</span>
+                    <span className="pill">{displayText(selectedCard.source)}</span>
+                    <span className="pill">{displayText(getNoteStyleLabel(selectedCard.noteStyle))}</span>
+                  </div>
+                  <div className="bili-note-reader">
+                    <p>{displayText("接入真实内容详情后，这里会直接显示阶段总结、关键片段和后续追问入口。")}</p>
+                  </div>
+                </div>
+              ) : detailQuery.isLoading ? (
+                <div className="bili-note-preview-empty">
+                  <p className="eyebrow">{displayText("当前预览")}</p>
+                  <h3>{displayText("正在加载当前笔记")}</h3>
+                  <p className="muted-text">{displayText("右侧会直接显示当前内容的阶段摘要和快捷入口。")}</p>
+                </div>
+              ) : detailQuery.isError || !detailQuery.data ? (
+                <div className="bili-note-preview-empty">
+                  <p className="eyebrow">{displayText("当前预览")}</p>
+                  <h3>{displayText(selectedCard.title)}</h3>
+                  <p className="muted-text">{displayText("当前还没拿到详情数据，你仍然可以打开详情页继续查看。")}</p>
+                  <div className="header-actions">
+                    <Link className="primary-button button-link" to={`/library/${selectedCard.id}`}>
+                      {displayText("打开详情")}
+                    </Link>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="bili-note-preview-head">
+                    <div>
+                      <p className="eyebrow">{displayText("当前笔记")}</p>
+                      <h3>{displayText(detailQuery.data.title)}</h3>
+                      <p className="muted-text">
+                        {displayText(captureSummary || detailQuery.data.summary || "当前这条内容已经进入可阅读、可回看的笔记阶段。")}
+                      </p>
+                    </div>
+                    <div className="pill-row">
+                      <span className={getStatusPillClass(detailQuery.data.status)}>
+                        {displayText(getStatusLabel(detailQuery.data.status, selectedCard.parseMode, selectedCard.noteStyle))}
+                      </span>
+                      <span className="pill">{displayText(detailQuery.data.platform ?? detailQuery.data.source_type ?? "未知来源")}</span>
+                      <span className="pill">{displayText(getNoteStyleLabel(selectedCard.noteStyle))}</span>
+                    </div>
+                  </div>
+
+                  <div className="bili-note-metric-strip">
+                    <article className="bili-note-metric-card">
+                      <span>{displayText("来源类型")}</span>
+                      <strong>{displayText(getSourceDescription(selectedCard.source))}</strong>
+                    </article>
+                    <article className="bili-note-metric-card">
+                      <span>{displayText("材料规模")}</span>
+                      <strong>
+                        {displayText(
+                          transcriptSegmentCount > 0
+                            ? `${transcriptSegmentCount} 段证据 / ${detailQuery.data.chunks.length} 块检索`
+                            : `${detailQuery.data.chunks.length} 块检索`,
+                        )}
+                      </strong>
+                    </article>
+                    <article className="bili-note-metric-card">
+                      <span>{displayText("质量分")}</span>
+                      <strong>{displayText(qualityScore !== null ? String(qualityScore) : "待评估")}</strong>
+                    </article>
+                  </div>
+
+                  {!!previewStageDigestItems.length ? (
+                    <StageDigest
+                      eyebrow="阶段总结"
+                      title="阶段摘要"
+                      description="当前笔记会按阶段摘要展示，并附带相关画面。"
+                      items={previewStageDigestItems}
+                      compact
+                      className="library-stage-digest"
+                    />
+                  ) : (
+                    <article className="bili-note-preview-block">
+                      <p className="eyebrow">{displayText("笔记预览")}</p>
+                      <div className="bili-note-reader">
+                        {notePreview ? (
+                          notePreview.split(/(?<=。|！|？|\.)\s+/).slice(0, 6).map((paragraph, index) => (
+                            <p key={`${detailQuery.data.id}-paragraph-${index}`}>{displayText(paragraph)}</p>
+                          ))
+                        ) : (
+                          <p>{displayText("这条内容还没有稳定的笔记正文，可打开详情页继续查看。")}</p>
+                        )}
+                      </div>
+                    </article>
+                  )}
+
+                  <article className="bili-note-preview-block bili-note-preview-block-compact">
+                    <div className="bili-note-preview-block-head">
+                      <div>
+                        <p className="eyebrow">{displayText("继续处理")}</p>
+                        <p className="muted-text">{displayText("从当前笔记继续提问，或先查看关键资料状态。")}</p>
+                      </div>
+                    </div>
+                    {!!visibleQuickQuestions.length && (
+                      <div className="pill-row chip-grid">
+                        {visibleQuickQuestions.map((question) => (
+                          <Link
+                            key={question}
+                            className="secondary-button button-link suggestion-chip"
+                            to={`/chat?q=${encodeURIComponent(question)}&contentId=${detailQuery.data.id}&title=${encodeURIComponent(detailQuery.data.title)}`}
+                          >
+                            {displayText(question)}
+                          </Link>
+                        ))}
+                      </div>
                     )}
-                  </div>
-                </div>
-
-                {selectedCard.coverUrl ? (
-                  <img className="cover-image knowledge-preview-cover" src={selectedCard.coverUrl} alt={selectedCard.title} />
-                ) : (
-                  <div className="knowledge-preview-placeholder">
-                    <span>{displayText(getSourceDescription(selectedCard.source))}</span>
-                  </div>
-                )}
-
-                <article className="knowledge-preview-block">
-                  <span className="pill">{displayText(selectedCard.source)}</span>
-                  <p>{displayText(selectedCard.summary)}</p>
-                </article>
-
-                <div className="knowledge-preview-meta">
-                  <article className="knowledge-preview-metric">
-                    <span>{displayText("来源定位")}</span>
-                    <strong>{displayText(getSourceDescription(selectedCard.source))}</strong>
-                  </article>
-                  <article className="knowledge-preview-metric">
-                    <span>{displayText("笔记形态")}</span>
-                    <strong>{displayText(noteStyleLabel || "原始建档")}</strong>
-                  </article>
-                </div>
-
-                {showRecentImportGuide && recentImportGuide && (
-                  <article className="knowledge-preview-block">
-                    <p className="eyebrow">{displayText("建议先这样验证")}</p>
-                    <strong>{displayText("这条内容已经切到当前焦点，先跑一轮首问会更顺。")}</strong>
-                    <p>{displayText(
-                      recentImportGuide.status === "ready" || recentImportGuide.status === "ready_estimated"
-                        ? "先用一条总结类问题验证回答质量，再看引用跳转和详情页回看是不是顺手。"
-                        : "这条内容还在补强阶段，先问材料线索和可核对问题，比直接追求最终结论更稳。",
-                    )}</p>
-                    <div className="header-actions knowledge-preview-actions">
-                      {recentImportGuide.suggestedQuestions.slice(0, 2).map((item) => (
-                        <Link
-                          className="secondary-button button-link"
-                          key={item}
-                          to={`/chat?q=${encodeURIComponent(item)}&contentId=${recentImportGuide.contentId}&title=${encodeURIComponent(recentImportGuide.title)}`}
-                        >
-                          {displayText(item)}
-                        </Link>
+                    <div className="pill-row bili-note-preview-meta-pills">
+                      <span className="pill">{displayText(`作者：${detailQuery.data.author || "未知"}`)}</span>
+                      <span className="pill">{displayText(`更新时间：${formatDateTime(detailQuery.data.updated_at)}`)}</span>
+                      <span className="pill">{displayText(`检索块：${detailQuery.data.chunks.length}`)}</span>
+                    </div>
+                    <div className="tag-row-soft bili-note-preview-tag-row">
+                      {(detailQuery.data.tags.length ? detailQuery.data.tags : ["暂无标签"]).slice(0, 4).map((tag) => (
+                        <span className="pill" key={`${detailQuery.data.id}-tag-${tag}`}>
+                          {displayText(tag)}
+                        </span>
                       ))}
-                      <button className="secondary-button" type="button" onClick={() => setRecentImportGuide(null)}>
-                        {displayText("稍后再看")}
-                      </button>
                     </div>
                   </article>
-                )}
 
-                <div className="knowledge-preview-block">
-                  <p className="eyebrow">{displayText("标签")}</p>
-                  <div className="tag-row-soft">
-                    {(selectedCard.tags.length ? selectedCard.tags : ["暂无标签"]).map((tag) => (
-                      <span className="pill" key={`${selectedCard.id}-preview-${tag}`}>
-                        {displayText(tag)}
-                      </span>
-                    ))}
+                  <div className="header-actions bili-note-preview-actions">
+                    <Link className="primary-button button-link" to={`/library/${detailQuery.data.id}`}>
+                      {displayText("打开详情")}
+                    </Link>
+                    <Link
+                      className="secondary-button button-link"
+                      to={`/chat?q=${encodeURIComponent(detailQuery.data.title)}&contentId=${detailQuery.data.id}&title=${encodeURIComponent(detailQuery.data.title)}`}
+                    >
+                      {displayText("围绕它提问")}
+                    </Link>
+                    <button
+                      className="danger-button"
+                      type="button"
+                      disabled={deleteMutation.isPending && deleteMutation.variables === detailQuery.data.id}
+                      onClick={() => handleDelete(detailQuery.data.id, detailQuery.data.title)}
+                    >
+                      {displayText(deleteMutation.isPending && deleteMutation.variables === detailQuery.data.id ? "删除中..." : "删除")}
+                    </button>
                   </div>
-                </div>
-
-                <div className="header-actions knowledge-preview-actions">
-                  {!selectedCard.isDemo ? (
-                    <>
-                      <Link className="primary-button button-link" to={`/library/${selectedCard.id}`}>
-                        {displayText("打开知识详情")}
-                      </Link>
-                      <Link className="secondary-button button-link" to={`/chat?q=${encodeURIComponent(selectedCard.title)}&contentId=${selectedCard.id}&title=${encodeURIComponent(selectedCard.title)}`}>
-                        {displayText("围绕它提问")}
-                      </Link>
-                      <button
-                        className="danger-button"
-                        type="button"
-                        disabled={deleteMutation.isPending && deleteMutation.variables === selectedCard.id}
-                        onClick={() => handleDelete(selectedCard.id, selectedCard.title)}
-                      >
-                        {deleteMutation.isPending && deleteMutation.variables === selectedCard.id
-                          ? displayText("删除中...")
-                          : displayText("删除")}
-                      </button>
-                    </>
-                  ) : (
-                    <span className="pill">{displayText("示例内容，仅用于预览布局")}</span>
-                  )}
-                </div>
-              </>
+                </>
+              )
             ) : (
-              <div className="knowledge-preview-empty">
-                <strong>{displayText("导入后，这里会显示当前知识卡片")}</strong>
-                <p className="muted-text">{displayText("你可以像看工作台一样，在左边导入，中间选条目，右边直接预览和继续操作。")}</p>
+              <div className="bili-note-preview-empty">
+                <strong>{displayText("导入一条内容后，右侧会直接展示当前笔记")}</strong>
+                <p className="muted-text">{displayText("右侧会集中显示阶段总结、关键材料和继续提问入口。")}</p>
               </div>
             )}
           </article>
 
-          <details className="card glass-panel maintenance-details knowledge-maintenance-card">
+          <details className="card glass-panel maintenance-details bili-note-maintenance-card">
             <summary>{displayText("旧内容维护")}</summary>
             <p className="muted-text search-panel-copy">
-              {displayText("只在需要时使用。它会补齐质量标记、时间跳转，并重试仍未完整转化的条目。")}
+              {displayText("需要时再用。它会重试不完整内容，补质量标记和时间跳转，并把旧数据升级到更适合问答的状态。")}
             </p>
             <div className="header-actions">
               <button
@@ -747,7 +930,7 @@ export default function LibraryPage() {
                 disabled={upgradeMutation.isPending}
                 onClick={() => upgradeMutation.mutate()}
               >
-                {upgradeMutation.isPending ? displayText("升级中...") : displayText("升级旧内容")}
+                {displayText(upgradeMutation.isPending ? "升级中..." : "升级旧内容")}
               </button>
             </div>
 
@@ -768,7 +951,7 @@ export default function LibraryPage() {
                     <span className="pill">{displayText(`本地修复 ${upgradeMutation.data.summary.repaired}`)}</span>
                     <span className="pill">{displayText(`重新抓取 ${upgradeMutation.data.summary.reimported}`)}</span>
                     {upgradeMutation.data.summary.fallback_repaired > 0 && (
-                      <span className="pill">{displayText(`失败回退修复 ${upgradeMutation.data.summary.fallback_repaired}`)}</span>
+                      <span className="pill">{displayText(`回退修复 ${upgradeMutation.data.summary.fallback_repaired}`)}</span>
                     )}
                     {upgradeMutation.data.summary.failed > 0 && (
                       <span className="pill">{displayText(`失败 ${upgradeMutation.data.summary.failed}`)}</span>

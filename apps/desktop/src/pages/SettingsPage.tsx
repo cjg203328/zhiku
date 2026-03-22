@@ -28,7 +28,7 @@ const PROVIDER_PRESETS = [
     id: "ollama",
     label: "Ollama",
     description: "本地运行，数据不出机器，适合隐私优先场景。",
-    hint: "需先本地安装 Ollama 并拉取模型。",
+    hint: "本地已安装 Ollama 后即可读取模型。",
     chatModel: "qwen2.5:7b",
     chatOptions: ["qwen2.5:7b", "qwen2.5:14b", "llama3.2:3b", "deepseek-r1:7b"],
     embeddingModel: "bge-m3",
@@ -38,7 +38,7 @@ const PROVIDER_PRESETS = [
     id: "deepseek",
     label: "DeepSeek",
     description: "性价比高，适合长文档理解和中文问答。",
-    hint: "先填 Key，再读取可用模型。",
+    hint: "填写 Key 后可读取模型列表。",
     chatModel: "deepseek-chat",
     chatOptions: ["deepseek-chat", "deepseek-reasoner"],
     embeddingModel: DEFAULT_EMBEDDING_MODEL,
@@ -48,7 +48,7 @@ const PROVIDER_PRESETS = [
     id: "moonshot",
     label: "Moonshot",
     description: "适合把视频和网页整理成更自然的中文回答。",
-    hint: "先填 Key，再读取可用模型。",
+    hint: "填写 Key 后可读取模型列表。",
     chatModel: "kimi-latest",
     chatOptions: ["kimi-latest"],
     embeddingModel: DEFAULT_EMBEDDING_MODEL,
@@ -57,8 +57,8 @@ const PROVIDER_PRESETS = [
   {
     id: "zhipu",
     label: "智谱",
-    description: "适合先快速接通在线理解和问答链路。",
-    hint: "支持先按厂商接入，再自由换模型。",
+    description: "适合快速接通在线理解和问答链路。",
+    hint: "支持按厂商接入，也可手动更换模型。",
     chatModel: "glm-4-flash-250414",
     chatOptions: ["glm-4-flash-250414"],
     embeddingModel: DEFAULT_EMBEDDING_MODEL,
@@ -172,9 +172,6 @@ export default function SettingsPage() {
   });
 
   const [localMessage, setLocalMessage] = useState("");
-  const [settingsGuided, setSettingsGuided] = useState(() => {
-    try { return localStorage.getItem("zhiku_settings_guided") === "true"; } catch { return false; }
-  });
   const [providerId, setProviderId] = useState<ProviderId>("custom");
   const [chatModel, setChatModel] = useState("");
   const [embeddingModel, setEmbeddingModel] = useState(DEFAULT_EMBEDDING_MODEL);
@@ -241,10 +238,6 @@ export default function SettingsPage() {
     bilibiliStatusQuery.data?.browser_bridge_source_label ||
     bilibiliSettings?.browser_bridge_source_label ||
     "";
-  const browserBridgeSummary =
-    bilibiliStatusQuery.data?.browser_bridge_summary ||
-    bilibiliSettings?.browser_bridge_summary ||
-    "";
   const browserBridgeLastSeen =
     bilibiliStatusQuery.data?.browser_bridge_last_seen ||
     bilibiliSettings?.browser_bridge_last_seen ||
@@ -263,7 +256,7 @@ export default function SettingsPage() {
     ? "手动登录态增强"
     : bilibiliCookieStored
     ? "已保存手动方式"
-    : "先走公开链路";
+    : "公开链路";
   const bilibiliModeTitle = browserBridgeEnabled
     ? browserBridgeActive
       ? "已连上浏览器登录状态"
@@ -275,17 +268,6 @@ export default function SettingsPage() {
     : bilibiliCookieStored
     ? "已保存手动登录状态"
     : "当前只读取公开内容";
-  const bilibiliModeDescription = browserBridgeEnabled
-    ? browserBridgeActive
-      ? browserBridgeSummary || "知库会在导入时自动补全需要登录才能看到的字幕和正文。"
-      : "安装一次浏览器小助手后，知库会自动接收当前浏览器的临时登录状态，不需要你长期保存 Cookie。"
-    : cookieEnabled
-    ? cookieReady
-      ? "当前会在公开链路不够时，继续使用你手动提供的登录状态。"
-      : "你已经打开手动方式，但还没有填入可用内容；保存后仍会退回公开链路。"
-    : bilibiliCookieStored
-    ? "当前已保存手动登录状态，但默认不会参与抓取。"
-    : "默认先走公开可见内容，不会主动读取你的登录状态。";
   const bilibiliCookieSource = bilibiliSettings?.cookie_source ?? "none";
 
   const chatModelSuggestions = useMemo(
@@ -317,28 +299,6 @@ export default function SettingsPage() {
     ],
   );
 
-  const sideSummaryItems = useMemo(
-    () => [
-      {
-        label: "厂商",
-        value: detectedPreset?.label || (isKnownPreset(providerId) ? activePreset.label : "自定义接口"),
-      },
-      {
-        label: "聊天模型",
-        value: chatModel.trim() || "保存后可继续调整",
-      },
-      {
-        label: "向量模型",
-        value: embeddingModel.trim() || DEFAULT_EMBEDDING_MODEL,
-      },
-      {
-        label: "转写模式",
-        value: getAsrChoiceLabel(asrModeChoice),
-      },
-    ],
-    [activePreset.label, asrModeChoice, chatModel, detectedPreset?.label, embeddingModel, providerId],
-  );
-
   const asrStatusPills = useMemo(
     () =>
       [
@@ -359,7 +319,7 @@ export default function SettingsPage() {
     modelProbeMutation.reset();
 
     if (nextPreset.id === "custom") {
-      setLocalMessage("已切换为自定义接口，你可以自己填写地址，再读取模型列表。");
+      setLocalMessage("已切换为自定义接口，可手动填写地址并读取模型列表。");
       return;
     }
 
@@ -374,7 +334,7 @@ export default function SettingsPage() {
         setAsrModel(DEFAULT_REMOTE_ASR_MODEL);
       }
     }
-    setLocalMessage(`已切到 ${nextPreset.label}，现在只需要补 API Key。`);
+    setLocalMessage(`已切换到 ${nextPreset.label}。`);
   }
 
   function handleLoadModelCatalog() {
@@ -497,11 +457,6 @@ export default function SettingsPage() {
       ? Boolean(asrModel.trim())
       : Boolean(asrBaseUrl.trim() && asrModel.trim() && (asrApiKey.trim() || currentAsrHasDedicatedKey));
 
-  const modelStepHint = modelCatalog.length
-    ? "已读取到模型列表，直接点选或手动改模型名即可。"
-    : activePreset.chatModel
-    ? `暂时不确定模型名时，可以先用系统预填的 ${activePreset.chatModel}。`
-    : "如果你还不知道模型名，先保存 Key，再点“读取模型列表”。";
   const requestedFocus = (searchParams.get("focus")?.trim() || "") as "" | "model" | "asr" | "bilibili";
 
   useEffect(() => {
@@ -532,9 +487,6 @@ export default function SettingsPage() {
           <div>
             <p className="eyebrow">{displayText("设置")}</p>
             <h2>{displayText("模型与采集")}</h2>
-            <p className="muted-text">
-              {displayText("先接主模型，再决定是否补转写和 B 站登录状态。")}
-            </p>
           </div>
         </div>
 
@@ -547,90 +499,34 @@ export default function SettingsPage() {
           ))}
         </div>
 
-        <div className="result-callout settings-top-helper-callout">
-          <strong>
-            {displayText(
-              browserBridgeActive
-                ? `B 站小助手已连上 ${browserBridgeSourceLabel || "当前浏览器"}`
-                : "B 站小助手入口在这里",
-            )}
-          </strong>
-          <p>
-            {displayText(
-              browserBridgeActive
-                ? "现在已经拿到浏览器登录状态了。后面导入需要登录的视频时，知库会优先自动补全。"
-                : "不用往下翻。点下面这个按钮，就会直接打开浏览器扩展页和小助手目录。",
-            )}
-          </p>
-          <div className="header-actions settings-top-helper-actions">
-            <button
-              className="primary-button"
-              type="button"
-              onClick={() => openBilibiliHelperMutation.mutate()}
-              disabled={openBilibiliHelperMutation.isPending}
-            >
-              {openBilibiliHelperMutation.isPending ? displayText("打开中...") : displayText("一键打开小助手")}
-            </button>
-            <button
-              className="secondary-button"
-              type="button"
-              onClick={jumpToBilibiliSection}
-            >
-              {displayText("定位到 B 站设置")}
-            </button>
-            <button
-              className="secondary-button"
-              type="button"
-              onClick={() => void bilibiliStatusQuery.refetch()}
-              disabled={bilibiliStatusQuery.isFetching}
-            >
-              {bilibiliStatusQuery.isFetching ? displayText("刷新中...") : displayText("刷新连接状态")}
-            </button>
-          </div>
+        <div className="header-actions settings-top-actions">
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => openBilibiliHelperMutation.mutate()}
+            disabled={openBilibiliHelperMutation.isPending}
+          >
+            {openBilibiliHelperMutation.isPending ? displayText("打开中...") : displayText("打开桥接")}
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={jumpToBilibiliSection}
+          >
+            {displayText("B站模块")}
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => void bilibiliStatusQuery.refetch()}
+            disabled={bilibiliStatusQuery.isFetching}
+          >
+            {bilibiliStatusQuery.isFetching ? displayText("刷新中...") : displayText("刷新状态")}
+          </button>
         </div>
 
-        {!settingsGuided && (
-          <div style={{
-            display: "flex", alignItems: "center", gap: "var(--space-2)",
-            marginBottom: "var(--space-4)", padding: "12px 16px",
-            background: "var(--bg-elevated)", borderRadius: "var(--radius-md)",
-            border: "1px solid var(--border)",
-          }}>
-            {([
-              { label: "选择模型", done: providerId !== "custom" || Boolean(baseUrl.trim()) },
-              { label: "填写 Key", done: Boolean(apiKey.trim()) || modelKeyConfigured },
-              { label: "测试连通", done: modelProbeResult?.ok === true },
-            ] as { label: string; done: boolean }[]).map((step, i) => (
-              <div key={step.label} style={{ display: "flex", alignItems: "center", gap: "var(--space-2)", flex: 1 }}>
-                <span style={{
-                  width: 22, height: 22, borderRadius: "50%", display: "flex",
-                  alignItems: "center", justifyContent: "center", fontSize: "0.75rem",
-                  background: step.done ? "var(--accent)" : "var(--bg-base)",
-                  color: step.done ? "#fff" : "var(--text-muted)",
-                  border: step.done ? "none" : "1px solid var(--border)",
-                  flexShrink: 0,
-                }}>{step.done ? "✓" : i + 1}</span>
-                <span style={{ fontSize: "0.8rem", color: step.done ? "var(--text-primary)" : "var(--text-muted)" }}>
-                  {step.label}
-                </span>
-                {i < 2 && <div style={{ flex: 1, height: 1, background: "var(--border)" }} />}
-              </div>
-            ))}
-            {modelProbeResult?.ok === true && (
-              <button
-                type="button"
-                style={{ marginLeft: "auto", fontSize: "0.75rem", color: "var(--text-muted)", background: "none", border: "none", cursor: "pointer", whiteSpace: "nowrap" }}
-                onClick={() => {
-                  try { localStorage.setItem("zhiku_settings_guided", "true"); } catch {}
-                  setSettingsGuided(true);
-                }}
-              >不再显示</button>
-            )}
-          </div>
-        )}
-
         {settingsQuery.isLoading && <p className="muted-text">{displayText("正在读取设置...")}</p>}
-        {settingsQuery.isError && <p className="error-text">{displayText("当前还没读到设置，请先确认本地服务已启动。")}</p>}
+        {settingsQuery.isError && <p className="error-text">{displayText("当前还没读到设置，请确认本地服务已启动。")}</p>}
         {localMessage && <p className="success-text">{displayText(localMessage)}</p>}
         {saveMutation.isError && <p className="error-text">{displayText("保存失败，请确认本地服务仍在运行。")}</p>}
         {diagnosticsMutation.isSuccess && <p className="success-text">{displayText(`排查信息已导出：${diagnosticsMutation.data.path}`)}</p>}
@@ -649,7 +545,7 @@ export default function SettingsPage() {
           <div className="panel-heading">
             <div>
               <p className="eyebrow">{displayText("主模型")}</p>
-              <h3>{displayText("先接主模型")}</h3>
+              <h3>{displayText("主模型连接")}</h3>
             </div>
           </div>
 
@@ -657,8 +553,8 @@ export default function SettingsPage() {
             <section className="settings-step-card">
               <div className="settings-step-head">
                 <div>
-                  <p className="eyebrow">{displayText("步骤 1")}</p>
-                  <h4>{displayText("选择厂商")}</h4>
+                  <p className="eyebrow">{displayText("连接方式")}</p>
+                  <h4>{displayText("厂商")}</h4>
                 </div>
                 <span className="subtle-pill">{displayText(detectedPreset?.label || activePreset.label)}</span>
               </div>
@@ -684,8 +580,8 @@ export default function SettingsPage() {
             <section className="settings-step-card">
               <div className="settings-step-head">
                 <div>
-                  <p className="eyebrow">{displayText("步骤 2")}</p>
-                  <h4>{displayText("填入 API Key")}</h4>
+                  <p className="eyebrow">{displayText("凭证")}</p>
+                  <h4>{displayText("API Key")}</h4>
                 </div>
                 <span className="subtle-pill">{displayText(modelKeyConfigured ? "已保存旧 Key" : "等待 Key")}</span>
               </div>
@@ -724,13 +620,11 @@ export default function SettingsPage() {
             <section className="settings-step-card">
               <div className="settings-step-head">
                 <div>
-                  <p className="eyebrow">{displayText("步骤 3")}</p>
-                  <h4>{displayText("选择模型")}</h4>
+                  <p className="eyebrow">{displayText("模型")}</p>
+                  <h4>{displayText("聊天模型")}</h4>
                 </div>
                 <span className="subtle-pill">{displayText(modelCatalog.length ? `已读取 ${modelCatalog.length} 个` : "可后置处理")}</span>
               </div>
-
-              <p className="muted-text">{displayText(modelStepHint)}</p>
 
               {!!modelCatalog.length && (
                 <div className="pill-row settings-model-chip-row">
@@ -856,30 +750,6 @@ export default function SettingsPage() {
             </article>
           )}
         </article>
-
-        <aside className="card detail-section-card glass-panel settings-side-card">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">{displayText("当前模式")}</p>
-              <h3>{displayText("你现在的配置")}</h3>
-            </div>
-          </div>
-
-          <div className="settings-side-list">
-            {sideSummaryItems.map((item) => (
-              <article className="settings-side-item" key={item.label}>
-                <span>{displayText(item.label)}</span>
-                <strong>{displayText(item.value)}</strong>
-              </article>
-            ))}
-          </div>
-
-          <div className="glass-callout">
-            <strong>{displayText("推荐用法")}</strong>
-            <p>{displayText("视频和网页先交给模型做理解，再用检索负责证据和回看。")}</p>
-            <p className="muted-text">{displayText(activePreset.hint)}</p>
-          </div>
-        </aside>
       </div>
 
       <div className="settings-secondary-grid">
@@ -930,13 +800,6 @@ export default function SettingsPage() {
               </button>
             ))}
           </div>
-
-          {asrModeChoice === "shared" && (
-            <div className="result-callout">
-              <strong>{displayText("最省事")}</strong>
-              <p>{displayText("直接复用主模型，适合先把链路跑通。")}</p>
-            </div>
-          )}
 
           {asrModeChoice === "dedicated" && (
             <div className="form-grid">
@@ -1006,21 +869,15 @@ export default function SettingsPage() {
           <div className="panel-heading">
             <div>
               <p className="eyebrow">{displayText("B 站登录状态")}</p>
-              <h3>{displayText("自动连接更省事")}</h3>
+              <h3>{displayText("B 站连接")}</h3>
             </div>
-          </div>
-
-          <div className="result-callout">
-            <strong>{displayText("推荐做法：安装一次浏览器小助手")}</strong>
-            <p>{displayText("装好后，知库会自动接收当前浏览器的临时登录状态。平时不用手动找 Cookie。")}</p>
           </div>
 
           <div className="settings-provider-card">
             <div>
               <strong>{displayText(bilibiliModeTitle)}</strong>
-              <p className="muted-text">{displayText(bilibiliModeDescription)}</p>
             </div>
-            <span className="subtle-pill">{displayText(browserBridgeEnabled ? "自动连接" : "公开优先")}</span>
+            <span className="subtle-pill">{displayText(browserBridgeEnabled ? "浏览器桥接" : "公开内容")}</span>
           </div>
 
           {(() => {
@@ -1051,7 +908,7 @@ export default function SettingsPage() {
 
           <div className="segment-rail">
             {[
-              { value: true, label: "自动连接浏览器（推荐）" },
+              { value: true, label: "浏览器桥接" },
               { value: false, label: "仅公开内容" },
             ].map((item) => (
               <button
@@ -1075,51 +932,22 @@ export default function SettingsPage() {
                       : "还没有收到浏览器登录状态",
                   )}
                 </strong>
-                <p>
-                  {displayText(
-                    browserBridgeActive
-                      ? "知库会优先使用这份临时登录状态补全需要登录的视频，不会长期保存在本地。"
-                      : "先把本地浏览器小助手装好并保持启用。之后你只要打开过一次 B 站页面，知库通常就会自动连上。",
-                  )}
-                </p>
                 {!!browserBridgeLastSeen && (
                   <p className="muted-text">
                     {displayText(`最近同步：${new Date(browserBridgeLastSeen).toLocaleString()}`)}
                   </p>
                 )}
               </div>
-
-              {!browserBridgeActive && (
-                <div className="result-callout" style={{ borderColor: "var(--warning, #f59e0b)" }}>
-                  <strong>{displayText("第一次这样做就行")}</strong>
-                  <ol className="muted-text" style={{ paddingLeft: "1.2em", margin: "6px 0 0", lineHeight: 1.8 }}>
-                    <li>{displayText("打开浏览器扩展管理页，加载本地小助手目录")}</li>
-                    <li>{displayText("保持小助手开启，然后打开一次 bilibili.com")}</li>
-                    <li>{displayText("回到这里点“刷新连接状态”，看到已连上就可以了")}</li>
-                  </ol>
-                </div>
-              )}
-
-              <div className="glass-callout">
-                <strong>{displayText("本地小助手目录")}</strong>
-                <p className="muted-text">{displayText(browserBridgeExtensionDir || "当前环境还没有提供目录信息。")}</p>
-                {!!browserBridgeInstallDoc && (
-                  <p className="muted-text">{displayText(`安装说明：${browserBridgeInstallDoc}`)}</p>
-                )}
-              </div>
             </>
           )}
 
           <details className="metadata-details advanced-details">
-            <summary>{displayText("手动方式（高级）")}</summary>
-            <p className="muted-text settings-inline-note">
-              {displayText("只有在自动连接不方便时，再手动补登录状态。")}
-            </p>
+            <summary>{displayText("手动登录态")}</summary>
 
             <div className="segment-rail">
               {[
-                { value: false, label: "手动方式关闭" },
-                { value: true, label: "启用手动登录状态" },
+                { value: false, label: "关闭手动来源" },
+                { value: true, label: "启用手动来源" },
               ].map((item) => (
                 <button
                   key={item.label}
@@ -1155,15 +983,9 @@ export default function SettingsPage() {
             </div>
 
             {!cookieReady && cookieEnabled && (
-              <div className="result-callout" style={{ borderColor: "var(--warning, #f59e0b)" }}>
-                <strong>{displayText("如何手动获取")}</strong>
-                <ol className="muted-text" style={{ paddingLeft: "1.2em", margin: "6px 0 0", lineHeight: 1.8 }}>
-                  <li>{displayText("浏览器访问 bilibili.com 并登录")}</li>
-                  <li>{displayText("按 F12 打开开发者工具 → Network 标签")}</li>
-                  <li>{displayText("刷新页面，点任意请求 → Headers → Request Headers")}</li>
-                  <li>{displayText("找到 \"cookie\" 字段，复制整行内容粘贴到上面")}</li>
-                </ol>
-              </div>
+              <p className="muted-text settings-inline-note">
+                {displayText("自动桥接不可用时，再填写 Cookie 文件路径或完整内容。")}
+              </p>
             )}
             {bilibiliCookieStored && !cookieEnabled && (
               <p className="muted-text settings-inline-note">
@@ -1174,7 +996,7 @@ export default function SettingsPage() {
 
           <div className="header-actions">
             <button className="primary-button" type="button" onClick={handleSaveBilibiliConfig} disabled={saveMutation.isPending}>
-              {saveMutation.isPending ? displayText("保存中...") : displayText("保存 B 站连接")}
+              {saveMutation.isPending ? displayText("保存中...") : displayText("保存连接")}
             </button>
             <button
               className="secondary-button"
@@ -1182,7 +1004,7 @@ export default function SettingsPage() {
               onClick={() => openBilibiliHelperMutation.mutate()}
               disabled={openBilibiliHelperMutation.isPending}
             >
-              {openBilibiliHelperMutation.isPending ? displayText("打开中...") : displayText("一键打开小助手")}
+              {openBilibiliHelperMutation.isPending ? displayText("打开中...") : displayText("打开桥接")}
             </button>
             <button
               className="secondary-button"
@@ -1190,7 +1012,7 @@ export default function SettingsPage() {
               onClick={() => void bilibiliStatusQuery.refetch()}
               disabled={bilibiliStatusQuery.isFetching}
             >
-              {bilibiliStatusQuery.isFetching ? displayText("刷新中...") : displayText("刷新连接状态")}
+              {bilibiliStatusQuery.isFetching ? displayText("刷新中...") : displayText("刷新状态")}
             </button>
             {!!browserBridgeExtensionDir && (
               <button
@@ -1226,7 +1048,7 @@ export default function SettingsPage() {
                 <span className="backup-path">{backupMutation.data.archive_path}</span>
               </p>
             ) : (
-              <p className="muted-text">{displayText("尚未备份 — 点击右侧按钮手动生成备份文件。")}</p>
+              <p className="muted-text">{displayText("暂无备份记录。")}</p>
             )}
             {backupMutation.isError && <p className="error-text">{displayText("备份失败，请稍后再试。")}</p>}
           </div>

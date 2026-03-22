@@ -1,8 +1,24 @@
 import { useLanguage } from "../../lib/language";
+import StageDigest from "../StageDigest";
+import {
+  buildStageDigestCards,
+  buildStageDigestSeeds,
+  parseNoteScreenshots,
+  splitStageDigestText,
+} from "../../lib/stageDigest";
 
 type StageItem = { key: string; label: string };
 type StepMeta = { label: string; description: string };
-type RunningJob = { progress?: number; preview: { title?: string; summary?: string } };
+type RunningJob = {
+  progress?: number;
+  preview: {
+    title?: string;
+    summary?: string;
+    content_text?: string;
+    key_points?: string[];
+    metadata?: Record<string, unknown>;
+  };
+};
 
 type Props = {
   runningImportJob: RunningJob | null;
@@ -13,6 +29,25 @@ type Props = {
 
 export default function ImportProgressCard({ runningImportJob, importStepMeta, importStageItems, importStageIndex }: Props) {
   const { displayText } = useLanguage();
+  const progressValue = Math.min(100, Math.max(runningImportJob?.progress ?? 0, 5));
+  const progressPreview = runningImportJob?.preview;
+  const progressSummarySource = progressPreview?.summary || progressPreview?.content_text || "";
+  const progressScreenshots = parseNoteScreenshots(progressPreview?.metadata);
+  const progressStageSeeds = (progressPreview?.key_points?.length ?? 0) > 0
+    ? buildStageDigestSeeds(progressPreview?.key_points ?? [], {
+        idPrefix: "progress-point",
+        eyebrowPrefix: "重点",
+        titlePrefix: "阶段",
+        limit: 3,
+      })
+    : buildStageDigestSeeds(splitStageDigestText(progressSummarySource, 3), {
+        idPrefix: "progress-summary",
+        eyebrowPrefix: "进度",
+        titlePrefix: "阶段",
+        limit: 3,
+      });
+  const progressStageDigestItems = buildStageDigestCards(progressStageSeeds, progressScreenshots, { limit: 3 });
+
   return (
     <article className="preview-card smart-status-card">
       <div className="panel-heading">
@@ -21,13 +56,10 @@ export default function ImportProgressCard({ runningImportJob, importStepMeta, i
           <h4>{displayText(importStepMeta.label)}</h4>
           <p className="muted-text">{displayText(importStepMeta.description)}</p>
         </div>
-        <span className="pill">{displayText(`${Math.max(runningImportJob?.progress ?? 0, 5)}%`)}</span>
+        <span className="pill">{displayText(`${progressValue}%`)}</span>
       </div>
       <div className="smart-progress-track" aria-hidden="true">
-        <div
-          className="smart-progress-fill"
-          style={{ width: `${Math.min(100, Math.max(runningImportJob?.progress ?? 0, 5))}%` }}
-        />
+        <div className="smart-progress-fill" style={{ width: `${progressValue}%` }} />
       </div>
       <div className="status-timeline">
         {importStageItems.map((stage, index) => (
@@ -45,13 +77,21 @@ export default function ImportProgressCard({ runningImportJob, importStepMeta, i
           </div>
         ))}
       </div>
-      {runningImportJob?.preview.title && (
-        <div className="glass-callout">
-          <strong>{displayText(runningImportJob.preview.title)}</strong>
-          <p className="muted-text">
-            {displayText(runningImportJob.preview.summary || "系统正在持续整理内容，完成后会自动展示结果。")}
-          </p>
-        </div>
+      {progressPreview?.title && (
+        <article className="smart-progress-preview">
+          <strong>{displayText(progressPreview.title)}</strong>
+          <p>{displayText(progressSummarySource || "系统正在持续整理内容。")}</p>
+        </article>
+      )}
+      {!!progressStageDigestItems.length && (
+        <StageDigest
+          eyebrow="处理中"
+          title="当前重点"
+          description="已提取内容会在这里持续刷新。"
+          items={progressStageDigestItems}
+          compact
+          className="import-progress-stage-digest"
+        />
       )}
     </article>
   );

@@ -225,6 +225,8 @@ class AsrRuntimeService:
         if provider == LOCAL_ASR_PROVIDER:
             if available:
                 engine_label = "faster-whisper" if runtime.local_engine == "faster_whisper" else "openai-whisper"
+                if config_mode == "auto_local":
+                    return f"当前会自动使用 {engine_label} 在本机执行音频转写。"
                 return f"当前将使用 {engine_label} 在本机执行音频转写。"
             return "已选择本地转写，但当前机器还没有检测到可用的本地运行时。"
 
@@ -254,6 +256,8 @@ class AsrRuntimeService:
             if not runtime.faster_whisper_installed and not runtime.openai_whisper_installed:
                 return "安装 faster-whisper，或安装 openai-whisper 并准备 ffmpeg。"
             return "先补齐本地转写运行时，再重新解析视频。"
+        if provider == LOCAL_ASR_PROVIDER and config_mode == "auto_local":
+            return "可以直接导入视频；系统会在缺字幕时自动回退到本地转写。"
 
         if config_mode == "inherited" and not available:
             return "先完成主模型接入，或者切换到本地转写模式。"

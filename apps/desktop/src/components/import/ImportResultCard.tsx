@@ -1,9 +1,17 @@
 import { Link } from "react-router-dom";
 import { useLanguage } from "../../lib/language";
 import type { NoteQuality } from "../../lib/api";
+import FailureGuideCard from "./FailureGuideCard";
+import StageDigest from "../StageDigest";
+import {
+  buildStageDigestCards,
+  buildStageDigestSeeds,
+  parseNoteScreenshots,
+  splitStageDigestText,
+} from "../../lib/stageDigest";
 
-type DiagnosticItem = { label: string; value: string; tone: string };
-type RecoveryHint = { label: string; value: string; detail: string; tone: string; focus?: "model" | "asr" | "bilibili" };
+type DiagnosticItem = { label: string; value: string; tone: "success" | "info" | "warning" };
+type RecoveryHint = { label: string; value: string; detail: string; tone: "success" | "info" | "warning"; focus?: "model" | "asr" | "bilibili" };
 type Preview = {
   content_id?: string;
   title: string;
@@ -16,18 +24,29 @@ type Preview = {
 
 function getStatusTone(status: string) {
   if (status === "ready") return { label: "结果完整", tone: "success", hint: "已经形成可读笔记和可追问证据。" };
-  if (status === "ready_estimated") return { label: "正文已恢复", tone: "info", hint: "当前正文来自转写，建议核对关键片段。" };
+  if (status === "ready_estimated") return { label: "正文已恢复", tone: "info", hint: "当前正文来自转写，可结合证据层核对。" };
   if (status === "needs_cookie") return { label: "需要 Cookie", tone: "warning", hint: "这条视频需要登录态才能拿到完整字幕。" };
   if (status === "needs_asr") return { label: "需要转写", tone: "warning", hint: "当前没有字幕，补全转写后可大幅提升质量。" };
   if (status === "asr_failed") return { label: "转写失败", tone: "warning", hint: "转写过程有异常，当前只有部分材料。" };
-  if (status === "limited") return { label: "仅基础建档", tone: "info", hint: "当前只采集到基础元数据，后续可补强。" };
+  if (status === "limited") return { label: "仅基础建档", tone: "info", hint: "当前以基础材料为主，可按需继续补强。" };
   return { label: "已建档", tone: "info", hint: "内容已归档，可以继续提问。" };
 }
 
 function getNoteStyleLabel(value: string) {
-  if (value === "qa") return "问答导向";
-  if (value === "brief") return "精简速记";
-  return "结构化笔记";
+  if (value === "bilinote") return "阅读版";
+  if (value === "qa") return "问答版";
+  if (value === "brief") return "速览版";
+  return "结构版";
+}
+
+function getCaptureStrategyPill(metadata: Record<string, unknown>) {
+  if (metadata.subtitle_ytdlp_fallback_used === true || metadata.audio_ytdlp_fallback_used === true) {
+    return "yt-dlp 兜底";
+  }
+  if (typeof metadata.subtitle_fetch_strategy === "string" || typeof metadata.audio_fetch_strategy === "string") {
+    return "原生采集";
+  }
+  return "";
 }
 
 function buildSettingsLink(focus?: string) {
@@ -70,12 +89,30 @@ export default function ImportResultCard({
   preview, metadata, noteQuality, noteStyle,
   importDiagnostics, importIssues, importNeedsSettings,
   firstQuestions, shouldOfferReparse, recoveryHints, shouldShowRecoveryPanel,
-  transcriptSegmentCount, evidenceSnippet, summaryFocus,
+  transcriptSegmentCount, evidenceSnippet,
   isReparsePending, isReparseSuccess, reparseMessage, isReparseError, reparseErrorMessage,
   onReparse, onReset,
 }: Props) {
   const { displayText } = useLanguage();
   const statusTone = getStatusTone(preview.status);
+  const captureStrategyPill = getCaptureStrategyPill(metadata);
+  const visibleRecoveryHints = recoveryHints.slice(0, 3);
+  const visibleFirstQuestions = firstQuestions.slice(0, 3);
+  const previewScreenshots = parseNoteScreenshots(metadata);
+  const previewStageSeeds = preview.key_points.length
+    ? buildStageDigestSeeds(preview.key_points, {
+        idPrefix: `${preview.content_id ?? preview.title}-point`,
+        eyebrowPrefix: "重点",
+        titlePrefix: "阶段",
+        limit: 4,
+      })
+    : buildStageDigestSeeds(splitStageDigestText(preview.summary || preview.content_text, 4), {
+        idPrefix: `${preview.content_id ?? preview.title}-summary`,
+        eyebrowPrefix: "摘要",
+        titlePrefix: "阶段",
+        limit: 4,
+      });
+  const previewStageDigestItems = buildStageDigestCards(previewStageSeeds, previewScreenshots, { limit: 3 });
 
   return (
     <article className="preview-card smart-result-card">
@@ -93,6 +130,7 @@ export default function ImportResultCard({
           <span className={`result-badge result-badge-${statusTone.tone}`}>{displayText(statusTone.label)}</span>
           <span className="pill">{displayText(preview.platform || "未知来源")}</span>
           <span className="pill">{displayText(getNoteStyleLabel(noteStyle))}</span>
+          {captureStrategyPill && <span className="pill">{displayText(captureStrategyPill)}</span>}
           {typeof noteQuality?.score === "number" && <span className="pill">{displayText(`质量 ${noteQuality.score}`)}</span>}
           {metadata.llm_enhanced === true && <span className="pill">{displayText("模型增强")}</span>}
           {metadata.noisy_asr_detected === true && <span className="pill">{displayText("转写噪声")}</span>}
@@ -112,7 +150,7 @@ export default function ImportResultCard({
         <strong>{displayText(statusTone.hint)}</strong>
         <p>{displayText(
           noteQuality?.summary ||
-          (typeof metadata.capture_recommended_action === "string" ? metadata.capture_recommended_action : "下一步建议直接打开详情页继续验证。"),
+          (typeof metadata.capture_recommended_action === "string" ? metadata.capture_recommended_action : "可打开详情页继续查看当前内容。"),
         )}</p>
       </article>
 
@@ -123,15 +161,19 @@ export default function ImportResultCard({
         </article>
       )}
       {isReparseError && (
-        <article className="preview-card smart-status-card">
-          <p className="eyebrow">{displayText("重新整理失败")}</p>
-          <p className="error-text">{displayText(reparseErrorMessage || "当前无法重新整理，请稍后再试。")}</p>
-        </article>
+        <FailureGuideCard
+          eyebrow="重新整理失败"
+          title="这次没有顺利刷新内容"
+          description="补齐当前关键能力后再重新整理，结果通常会更稳定。"
+          message={reparseErrorMessage || "当前无法重新整理，请稍后再试。"}
+          hints={recoveryHints}
+          issues={importIssues}
+        />
       )}
 
       {!!importIssues.length && (
         <details className="smart-inline-details">
-          <summary>{displayText("查看诊断细节")}</summary>
+          <summary>{displayText(`查看诊断细节 · ${Math.min(importIssues.length, 4)}`)}</summary>
           <div className="smart-issue-list">
             {importIssues.slice(0, 4).map((item) => (
               <p className="muted-text" key={item}>{displayText(item)}</p>
@@ -159,79 +201,65 @@ export default function ImportResultCard({
         </article>
       </div>
 
+      {!!previewStageDigestItems.length && (
+        <StageDigest
+          eyebrow="阶段总结"
+          title="阶段摘要"
+          description="当前结果已压缩为几个重点。"
+          items={previewStageDigestItems}
+          compact
+          className="import-stage-digest"
+        />
+      )}
+
       {shouldShowRecoveryPanel && (
-        <>
-          <article className="result-callout">
-            <strong>{displayText("先补这几项")}</strong>
-            <p>{displayText("系统已经定位到当前短板，补齐后再重整理会更稳。")}</p>
-          </article>
-          <div className="advice-grid">
-            {recoveryHints.map((item) => (
-              <article className="advice-card" key={`${item.label}-${item.value}`}>
-                <span className={`result-badge result-badge-${item.tone}`}>{displayText(item.label)}</span>
-                <strong>{displayText(item.value)}</strong>
-                <p>{displayText(item.detail)}</p>
-                {item.focus ? (
-                  <Link className="text-link-inline" to={buildSettingsLink(item.focus)}>
-                    {displayText("去设置")}
-                  </Link>
-                ) : null}
-              </article>
-            ))}
+        <details className="smart-inline-details smart-inline-details-block">
+          <summary>{displayText("待补能力")}</summary>
+          <div className="smart-inline-panel">
+            <div className="advice-grid">
+              {visibleRecoveryHints.map((item) => (
+                <article className="advice-card" key={`${item.label}-${item.value}`}>
+                  <span className={`result-badge result-badge-${item.tone}`}>{displayText(item.label)}</span>
+                  <strong>{displayText(item.value)}</strong>
+                  <p>{displayText(item.detail)}</p>
+                  {item.focus ? (
+                    <Link className="text-link-inline" to={buildSettingsLink(item.focus)}>
+                      {displayText("去设置")}
+                    </Link>
+                  ) : null}
+                </article>
+              ))}
+            </div>
           </div>
-        </>
+        </details>
       )}
 
-      {!!firstQuestions.length && (
-        <>
-          <article className="result-callout">
-            <strong>{displayText("建议先这样问")}</strong>
-            <p>{displayText(
-              noteQuality?.question_answer_ready
-                ? "先用 1 到 2 个首问验证总结和证据。"
-                : "先围绕材料线索提问，不要一上来追求最终结论。",
-            )}</p>
-          </article>
-          <div className="pill-row chip-grid">
-            {firstQuestions.map((item) => (
-              <Link
-                key={item}
-                className="secondary-button button-link suggestion-chip"
-                to={buildChatLink(item, { contentId: preview.content_id, title: preview.title })}
-              >
-                {displayText(item)}
-              </Link>
-            ))}
+      {!!visibleFirstQuestions.length && (
+        <details className="smart-inline-details smart-inline-details-block">
+          <summary>{displayText("问题入口")}</summary>
+          <div className="smart-inline-panel">
+            <div className="pill-row chip-grid">
+              {visibleFirstQuestions.map((item) => (
+                <Link
+                  key={item}
+                  className="secondary-button button-link suggestion-chip"
+                  to={buildChatLink(item, { contentId: preview.content_id, title: preview.title })}
+                >
+                  {displayText(item)}
+                </Link>
+              ))}
+            </div>
           </div>
-        </>
+        </details>
       )}
 
-      {!!preview.key_points.length && (
+      {!previewStageDigestItems.length && !!preview.key_points.length && (
         <ul className="bullet-list compact-list">
           {preview.key_points.slice(0, 3).map((point) => (
             <li key={point}>{displayText(point)}</li>
           ))}
         </ul>
       )}
-
-      <div className="pill-row chip-grid">
-        {preview.title && (
-          <Link
-            className="secondary-button button-link suggestion-chip"
-            to={buildChatLink(`请概括《${preview.title}》最值得记住的三个结论`, { contentId: preview.content_id, title: preview.title })}
-          >
-            {displayText("生成总结")}
-          </Link>
-        )}
-        {preview.title && (
-          <Link
-            className="secondary-button button-link suggestion-chip"
-            to={buildChatLink(`如果把《${preview.title}》整理成一页复盘，应该保留哪些信息？`, { contentId: preview.content_id, title: preview.title })}
-          >
-            {displayText("继续提问")}
-          </Link>
-        )}
-      </div>
 
       <div className="header-actions">
         {preview.content_id && (
@@ -270,7 +298,7 @@ export default function ImportResultCard({
           </Link>
         )}
         <button className="secondary-button" type="button" onClick={onReset}>
-          {displayText("继续导入")}
+          {displayText("新建导入")}
         </button>
       </div>
     </article>

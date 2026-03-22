@@ -14,7 +14,6 @@ const enTranslations: Record<string, string> = {
   "正在加载当前工作台": "Loading your workspace",
   "继续保持当前操作，页面马上就绪。": "Hang on for a moment. The page will be ready soon.",
   "简体中文": "Simplified Chinese",
-  "首次引导": "Getting Started",
   "把第一次使用，收束成一条清晰路径": "Turn the first-use experience into one clear path",
   "你现在最重要的不是研究所有配置项，而是确认：环境接稳了没有、第一条内容能不能导入、问答值不值得继续用。":
     "The goal right now is not to study every setting. First make sure the environment is stable, the first item can be imported, and chat is genuinely useful.",
@@ -85,9 +84,6 @@ const enTranslations: Record<string, string> = {
   "如果引用能定位、详情可回看、回答不僵硬，这条产品链路就已经有交付基础。": "If citations can locate evidence, details are reviewable, and answers feel natural, the product flow is ready to deliver.",
   "下一步": "Next step",
   "按这条顺序继续就好": "Follow this order",
-  "步骤 1 · 确认环境": "Step 1 · Check environment",
-  "步骤 2 · 导入内容": "Step 2 · Import content",
-  "步骤 3 · 验证价值": "Step 3 · Validate value",
   "引导已完成": "Onboarding complete",
   "当前最佳动作": "Best next action",
   "标记为已完成": "Mark as completed",
@@ -130,23 +126,17 @@ const enTranslations: Record<string, string> = {
   "先把服务和模型接稳": "Stabilize the service and model first",
   "先确认首页状态正常，再去设置页把模型连通性测通，后面的导入和问答体验才会稳定。":
     "First make sure Home looks healthy, then verify the model connection in Settings so import and chat feel reliable.",
-  "打开首次引导": "Open onboarding",
-  "步骤 1 / 3": "Step 1 / 3",
   "优先用最容易成功的公开视频或稳定文件，先拿到第一条完整笔记，再判断体验是否值得继续。":
     "Start with a public video or stable file that is most likely to succeed, then decide whether the experience is worth continuing.",
   "去知识库": "Go to Library",
-  "步骤 2 / 3": "Step 2 / 3",
   "用首轮问答做验收": "Use the first chat round as validation",
   "围绕整条内容和单个片段各问一轮，确认引用定位、详情回看和回答自然度都过关。":
     "Ask once about the whole item and once about a segment to verify citation jumps, detail review, and answer quality.",
   "去问答页": "Go to Chat",
-  "步骤 3 / 3": "Step 3 / 3",
   "主链路已经打通": "The main flow is working",
   "你已经具备继续导入、追问和沉淀内容的基础，可以按正常工作流继续使用。":
     "You already have the foundation to keep importing, asking follow-up questions, and saving useful knowledge.",
-  "查看首次引导": "View onboarding",
   "回到知识库": "Back to Library",
-  "稍后再看": "Maybe later",
 };
 
 export function translateToEnglish(value: string) {

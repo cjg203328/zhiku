@@ -8,17 +8,34 @@ import {
   generateMindmap,
   generateQuiz,
   getContent,
+  getImportJob,
   listDerivedItems,
   deleteDerivedItem,
   reindexContent,
   reparseContent,
+  restoreNoteVersion,
   updateContent,
   type DerivedItem,
+  type ImportJob,
   type NoteQuality,
 } from "../lib/api";
+import {
+  getImportJobStepMeta as getSharedImportJobStepMeta,
+  getImportStageItems as getSharedImportStageItems,
+  isImportJobTerminal as isSharedImportJobTerminal,
+  resolveImportStageIndex as resolveSharedImportStageIndex,
+} from "../lib/importProgress";
 import { useLanguage } from "../lib/language";
 import { formatMilliseconds, formatTimeRange } from "../lib/utils";
 import RichNoteEditor from "../components/RichNoteEditor";
+import ImportProgressCard from "../components/import/ImportProgressCard";
+import StageDigest from "../components/StageDigest";
+import {
+  buildStageDigestCards,
+  buildStageDigestSeeds,
+  parseNoteScreenshots,
+  splitStageDigestText,
+} from "../lib/stageDigest";
 
 type HighlightColor = "yellow" | "blue" | "green" | "";
 type SegmentAnnotation = { highlight: HighlightColor; note: string };
@@ -96,6 +113,303 @@ function getAsrModeLabel(value: unknown) {
   return null;
 }
 
+function getCaptureStrategyLabel(value: unknown) {
+  if (value === "yt_dlp") return "yt-dlp 兜底";
+  if (value === "native_api") return "原生接口";
+  return "";
+}
+
+function getNoteStyleLabel(value: unknown) {
+  if (value === "bilinote") return "阅读版";
+  if (value === "qa") return "问答版";
+  if (value === "brief") return "速览版";
+  if (value === "structured") return "结构版";
+  return "标准版";
+}
+
+function isImportJobTerminal(status: string | undefined) {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function getImportJobStepMeta(step: string | undefined) {
+  if (step === "queued") return { label: "已接收任务", description: "当前重整理任务已进入队列。" };
+  if (step === "detecting_source") return { label: "识别来源", description: "正在确认当前内容的重解析来源，并选择合适的抓取方式。" };
+  if (step === "reading_file") return { label: "读取文件", description: "正在重新读取原始文件内容，并准备生成新的结构化笔记。" };
+  if (step === "parsing_content") return { label: "提取内容", description: "正在重新整理正文、字幕、截图和可回看的证据层。" };
+  if (step === "saving_content") return { label: "刷新当前内容", description: "正在保存版本历史，并用新的结果刷新当前内容。" };
+  if (step === "done") return { label: "重解析完成", description: "当前内容已经刷新完成，现在可以继续阅读或回看。" };
+  if (step === "failed") return { label: "重解析失败", description: "这次没有顺利刷新当前内容，请按提示调整后再试一次。" };
+  return { label: "处理中", description: "系统正在继续整理当前重解析任务。" };
+}
+
+function getImportStageItems(sourceKind?: string) {
+  if (sourceKind === "file" || sourceKind === "file_upload") {
+    return [
+      { key: "queued", label: "接收任务" },
+      { key: "reading_file", label: "读取文件" },
+      { key: "parsing_content", label: "提取内容" },
+      { key: "saving_content", label: "刷新内容" },
+    ];
+  }
+
+  return [
+    { key: "queued", label: "接收任务" },
+    { key: "detecting_source", label: "识别来源" },
+    { key: "parsing_content", label: "提取内容" },
+    { key: "saving_content", label: "刷新内容" },
+  ];
+}
+
+function resolveImportStageIndex(step: string | undefined, sourceKind?: string) {
+  const stages = getImportStageItems(sourceKind);
+  if (step === "done") return stages.length - 1;
+  const index = stages.findIndex((item) => item.key === step);
+  return index >= 0 ? index : 0;
+}
+
+type MarkdownSection = {
+  title: string;
+  lines: string[];
+};
+
+type OverviewDigestItem = {
+  label: string;
+  value: string;
+};
+
+type TimelineDigestItem = {
+  label: string;
+  href: string | null;
+  summary: string;
+};
+
+type ClipDigestItem = {
+  label: string;
+  href: string | null;
+  summary: string;
+};
+
+type NoteVersionSnapshot = {
+  id: string;
+  capturedAt: string;
+  source: string;
+  title: string;
+  summary: string;
+  keyPoints: string[];
+  noteMarkdown: string;
+  noteStyle: string;
+  summaryFocus: string;
+  status: string;
+  transcriptSource: string;
+  captureSummary: string;
+};
+
+function trimSectionLines(lines: string[]) {
+  const next = [...lines];
+  while (next.length && !next[0].trim()) next.shift();
+  while (next.length && !next[next.length - 1].trim()) next.pop();
+  return next;
+}
+
+function parseMarkdownSections(markdown: string) {
+  if (!markdown.trim()) return [] as MarkdownSection[];
+
+  const sections: MarkdownSection[] = [];
+  let currentTitle = "";
+  let currentLines: string[] = [];
+
+  for (const rawLine of markdown.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const headingMatch = line.match(/^##\s+(.*)$/);
+    if (headingMatch) {
+      if (currentTitle) {
+        sections.push({ title: currentTitle, lines: trimSectionLines(currentLines) });
+      }
+      currentTitle = headingMatch[1].trim();
+      currentLines = [];
+      continue;
+    }
+
+    if (currentTitle) {
+      currentLines.push(rawLine);
+    }
+  }
+
+  if (currentTitle) {
+    sections.push({ title: currentTitle, lines: trimSectionLines(currentLines) });
+  }
+
+  return sections.filter((section) => section.title && section.lines.some((line) => line.trim()));
+}
+
+function getSectionText(section: MarkdownSection | null | undefined) {
+  if (!section) return "";
+  return section.lines
+    .map((line) => line.trim())
+    .filter((line) => line && !/^[-*]\s+/.test(line) && !/^\d+[.)]\s+/.test(line) && !/^###\s+/.test(line))
+    .map((line) => line.replace(/^>\s*/, ""))
+    .join("\n")
+    .trim();
+}
+
+function getSectionList(section: MarkdownSection | null | undefined) {
+  if (!section) return [] as string[];
+  return section.lines
+    .map((line) => line.trim())
+    .map((line) => line.match(/^(?:[-*]|\d+[.)])\s+(.*)$/)?.[1]?.trim() ?? "")
+    .filter(Boolean);
+}
+
+function shortenText(value: string, limit: number) {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  return compact.length <= limit ? compact : `${compact.slice(0, limit).trimEnd()}...`;
+}
+
+function parseNoteVersions(value: unknown) {
+  if (!Array.isArray(value)) return [] as NoteVersionSnapshot[];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const entry = item as Record<string, unknown>;
+      const noteMarkdown = typeof entry.note_markdown === "string" ? entry.note_markdown.trim() : "";
+      const summary = typeof entry.summary === "string" ? entry.summary.trim() : "";
+      const keyPoints = readStringList(entry.key_points);
+      if (!noteMarkdown && !summary && !keyPoints.length) return null;
+      return {
+        id: typeof entry.id === "string" && entry.id.trim() ? entry.id.trim() : `version-${Math.random().toString(36).slice(2, 8)}`,
+        capturedAt: typeof entry.captured_at === "string" ? entry.captured_at.trim() : "",
+        source: typeof entry.source === "string" ? entry.source.trim() : "reparse",
+        title: typeof entry.title === "string" ? entry.title.trim() : "未命名版本",
+        summary,
+        keyPoints,
+        noteMarkdown,
+        noteStyle: typeof entry.note_style === "string" && entry.note_style.trim() ? entry.note_style.trim() : "structured",
+        summaryFocus: typeof entry.summary_focus === "string" ? entry.summary_focus.trim() : "",
+        status: typeof entry.status === "string" ? entry.status.trim() : "ready",
+        transcriptSource: typeof entry.transcript_source === "string" ? entry.transcript_source.trim() : "",
+        captureSummary: typeof entry.capture_summary === "string" ? entry.capture_summary.trim() : "",
+      } satisfies NoteVersionSnapshot;
+    })
+    .filter((item): item is NoteVersionSnapshot => Boolean(item));
+}
+
+function getNoteVersionSourceLabel(value: string) {
+  if (value === "current") return "当前版本";
+  if (value === "reparse") return "重解析前";
+  if (value === "restore") return "恢复前";
+  return "历史版本";
+}
+
+function buildMarkdownPreviewText(markdown: string, limit = 520) {
+  const compact = markdown
+    .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, "$1")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^>\s?/gm, "")
+    .replace(/^\s*[-*]\s+/gm, "")
+    .replace(/^\s*\d+[.)]\s+/gm, "")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+  return shortenText(compact, limit);
+}
+
+function parseOverviewItems(section: MarkdownSection | null | undefined) {
+  return getSectionList(section)
+    .map((item) => {
+      const pairMatch = item.match(/^([^：:]+)[：:]\s*(.*)$/);
+      if (!pairMatch) {
+        return { label: item, value: "" };
+      }
+      return {
+        label: pairMatch[1].trim(),
+        value: pairMatch[2].trim(),
+      };
+    })
+    .filter((item) => item.label);
+}
+
+function parseTimelineItems(section: MarkdownSection | null | undefined) {
+  return getSectionList(section)
+    .map((item) => {
+      const linkedMatch = item.match(/^\[([^\]]+)\]\(([^)]+)\)\s*(.*)$/);
+      if (linkedMatch) {
+        return {
+          label: linkedMatch[1].trim(),
+          href: linkedMatch[2].trim(),
+          summary: linkedMatch[3].trim(),
+        };
+      }
+      const pairMatch = item.match(/^([^：:]+)[：:]\s*(.*)$/);
+      if (pairMatch) {
+        return {
+          label: pairMatch[1].trim(),
+          href: null,
+          summary: pairMatch[2].trim(),
+        };
+      }
+      return {
+        label: item,
+        href: null,
+        summary: "",
+      };
+    })
+    .filter((item) => item.label);
+}
+
+function parseClipItems(section: MarkdownSection | null | undefined) {
+  if (!section) return [] as ClipDigestItem[];
+
+  const clips: ClipDigestItem[] = [];
+  let currentLabel = "";
+  let currentHref: string | null = null;
+  let currentLines: string[] = [];
+
+  function flushCurrentClip() {
+    if (!currentLabel) return;
+    clips.push({
+      label: currentLabel,
+      href: currentHref,
+      summary: currentLines.join(" ").replace(/\s+/g, " ").trim(),
+    });
+    currentLabel = "";
+    currentHref = null;
+    currentLines = [];
+  }
+
+  for (const rawLine of section.lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    const headingMatch = line.match(/^###\s+(.*)$/);
+    if (headingMatch) {
+      flushCurrentClip();
+      const linkedMatch = headingMatch[1].trim().match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      if (linkedMatch) {
+        currentLabel = linkedMatch[1].trim();
+        currentHref = linkedMatch[2].trim();
+      } else {
+        currentLabel = headingMatch[1].trim();
+        currentHref = null;
+      }
+      continue;
+    }
+
+    if (currentLabel) {
+      if (/^!\[[^\]]*\]\([^)]+\)$/.test(line)) {
+        continue;
+      }
+      if (/^\*?Screenshot-(?:\[\d{2}:\d{2}\]|\d{2}:\d{2})$/.test(line)) {
+        continue;
+      }
+      currentLines.push(line);
+    }
+  }
+
+  flushCurrentClip();
+  return clips.filter((item) => item.label);
+}
+
 function getQualityInfo(status: string | null | undefined, metadata: Record<string, unknown> | null | undefined) {
   const captureSummary = typeof metadata?.capture_summary === "string" ? metadata.capture_summary.trim() : "";
   const recommendedAction = typeof metadata?.capture_recommended_action === "string" ? metadata.capture_recommended_action.trim() : "";
@@ -104,24 +418,24 @@ function getQualityInfo(status: string | null | undefined, metadata: Record<stri
 
   if (status === "ready" && noisyAsrDetected) {
     return {
-      label: "证据就绪，理解待重整",
-      description: "当前正文来自音频转写，证据和时间片段已经可用，但语义噪声仍较明显，更适合围绕片段继续问答与核对。",
+      label: "证据完整",
+      description: "当前正文主要来自音频转写，证据和时间锚点已可用，但语义仍需进一步重整。",
       actionLabel: "去配置模型",
     };
   }
-  if (status === "ready") return { label: "双层笔记已就绪", description: captureSummary || "这条内容已经具备精炼笔记、原始转写和时间定位。", actionLabel: null };
+  if (status === "ready") return { label: "笔记完成", description: captureSummary || "已形成精炼笔记、原始正文与时间锚点。", actionLabel: null };
   if (status === "ready_estimated") {
     return {
-      label: "正文已恢复",
-      description: captureSummary || (asrModeLabel ? `当前正文来自${asrModeLabel}的音频转写，建议核对关键片段。` : "当前正文来自音频转写，建议核对关键片段。"),
+      label: "正文恢复",
+      description: captureSummary || (asrModeLabel ? `当前正文来自${asrModeLabel}的音频转写，可结合证据层查看关键片段。` : "当前正文来自音频转写，可结合证据层查看关键片段。"),
       actionLabel: null,
     };
   }
-  if (status === "needs_cookie") return { label: "待登录态补全", description: captureSummary || "这条视频的字幕需要登录态，当前只完成了基础建档。", actionLabel: "去检查 B 站增强" };
-  if (status === "needs_asr") return { label: "待转写补全", description: captureSummary || "这条视频还没有拿到可直接使用的正文。", actionLabel: "去配置音频转写" };
-  if (status === "asr_failed") return { label: "转写待修复", description: captureSummary || recommendedAction || "字幕和转写都没有拿到可用正文。", actionLabel: "去检查转写配置" };
-  if (status === "limited") return { label: "仅完成基础建档", description: captureSummary || "当前只拿到了较弱内容，先不要把它当成完整笔记。", actionLabel: null };
-  return { label: "基础整理", description: captureSummary || "当前已生成基础档案，适合先看精炼笔记。", actionLabel: null };
+  if (status === "needs_cookie") return { label: "待补登录", description: captureSummary || "这条视频的字幕需要登录态，当前仅保留了基础档案。", actionLabel: "去检查 B 站增强" };
+  if (status === "needs_asr") return { label: "待补转写", description: captureSummary || "这条视频还没有拿到可直接使用的正文。", actionLabel: "去配置音频转写" };
+  if (status === "asr_failed") return { label: "转写异常", description: captureSummary || recommendedAction || "字幕和转写都还没有返回可用正文。", actionLabel: "去检查转写配置" };
+  if (status === "limited") return { label: "材料有限", description: captureSummary || "当前仅保留了较弱材料，内容仍需继续补齐。", actionLabel: null };
+  return { label: "已建档", description: captureSummary || "当前已生成基础档案，可查看本页摘要与已保留材料。", actionLabel: null };
 }
 
 function buildFallbackSeekUrl(sourceUrl: string | null | undefined, startMs: number | null | undefined) {
@@ -154,14 +468,14 @@ function readStringList(value: unknown): string[] {
 }
 
 function getCaptureStatusLabel(status: string | null | undefined) {
-  if (status === "ready") return "完整材料";
-  if (status === "ready_estimated") return "已恢复正文";
-  if (status === "needs_cookie") return "缺登录态";
-  if (status === "needs_asr") return "缺转写";
-  if (status === "asr_failed") return "转写失败";
-  if (status === "limited") return "材料较弱";
-  if (status === "preview_ready") return "预览建档";
-  return "基础建档";
+  if (status === "ready") return "材料完整";
+  if (status === "ready_estimated") return "正文恢复";
+  if (status === "needs_cookie") return "待补登录";
+  if (status === "needs_asr") return "待补转写";
+  if (status === "asr_failed") return "转写异常";
+  if (status === "limited") return "材料有限";
+  if (status === "preview_ready") return "预览就绪";
+  return "已建档";
 }
 
 function getMaterialReadiness(
@@ -195,19 +509,19 @@ function getMaterialReadiness(
     },
     {
       label: "精炼笔记",
-      value: noteReady ? "已形成" : weakCapture ? "先保留草稿" : "整理中",
+      value: noteReady ? "已形成" : weakCapture ? "草稿" : "整理中",
       tone: noteReady ? "success" : weakCapture ? "warning" : "info",
     },
   ] as const;
 
-  let title = "材料已基本就绪";
-  let description = "这条内容已经有正文、片段和笔记层，适合直接围绕结论和证据来回看。";
+  let title = "材料已成形";
+  let description = "正文、片段与笔记层已汇齐，可以直接阅读、检索和继续追问。";
   if (weakCapture) {
-    title = "先按种子材料来用";
-    description = captureAction || "当前还没拿到足够稳的正文，但系统已经把可用线索整理成了可检索、可追问的草稿。";
+    title = "材料仍在补齐";
+    description = captureAction || "当前以来源简介或片段草稿为主，但检索链路已经可用。";
   } else if (!noteReady || !chunkReady) {
-    title = "材料正在补齐";
-    description = captureAction || "当前主链路已通，但片段和精炼层还在继续完善。";
+    title = "层级仍在补齐";
+    description = captureAction || "主链路已打通，片段与精炼层仍在继续完善。";
   }
 
   return {
@@ -336,10 +650,17 @@ export default function ContentDetailPage() {
   const [annotatingIndex, setAnnotatingIndex] = useState<number | null>(null);
   const [newTagInput, setNewTagInput] = useState("");
   const [isEditingNote, setIsEditingNote] = useState(false);
+  const [showFullNote, setShowFullNote] = useState(false);
+  const [showSupplementPanel, setShowSupplementPanel] = useState(false);
+  const [showDerivePanel, setShowDerivePanel] = useState(false);
   const [richNoteContent, setRichNoteContent] = useState("");
+  const [selectedVersionId, setSelectedVersionId] = useState("current");
   const [deriveView, setDeriveView] = useState<"none" | "mindmap" | "quiz">("none");
   const [quizAnswers, setQuizAnswers] = useState<Record<number, string>>({});
   const [quizRevealed, setQuizRevealed] = useState<Record<number, boolean>>({});
+  const [activeReparseJobId, setActiveReparseJobId] = useState("");
+  const [activeReparseJob, setActiveReparseJob] = useState<ImportJob | null>(null);
+  const [reparseFailureMessage, setReparseFailureMessage] = useState("");
 
   const derivedItemsQuery = useQuery({
     queryKey: ["derived", contentId],
@@ -440,15 +761,153 @@ export default function ContentDetailPage() {
     if (typeof refined === "string" && refined.trim()) return refined;
     return typeof metadata?.note_markdown === "string" ? metadata.note_markdown : "";
   }, [metadata]);
+  const noteStyleValue = useMemo(() => (typeof metadata?.note_style === "string" ? metadata.note_style.trim() : ""), [metadata]);
+  const historicalNoteVersions = useMemo(() => parseNoteVersions(metadata?.note_versions), [metadata]);
+  const currentNoteVersion = useMemo<NoteVersionSnapshot>(
+    () => ({
+      id: "current",
+      capturedAt: contentQuery.data?.updated_at ?? contentQuery.data?.created_at ?? "",
+      source: "current",
+      title: contentQuery.data?.title ?? "当前版本",
+      summary: contentQuery.data?.summary ?? "",
+      keyPoints: contentQuery.data?.key_points ?? [],
+      noteMarkdown: refinedNote,
+      noteStyle: noteStyleValue || "structured",
+      summaryFocus: typeof metadata?.summary_focus === "string" ? metadata.summary_focus.trim() : "",
+      status: contentQuery.data?.status ?? "ready",
+      transcriptSource: typeof metadata?.transcript_source === "string" ? metadata.transcript_source.trim() : "",
+      captureSummary: typeof metadata?.capture_summary === "string" ? metadata.capture_summary.trim() : "",
+    }),
+    [contentQuery.data?.created_at, contentQuery.data?.key_points, contentQuery.data?.status, contentQuery.data?.summary, contentQuery.data?.title, contentQuery.data?.updated_at, metadata, noteStyleValue, refinedNote],
+  );
+  const noteVersionItems = useMemo(() => [currentNoteVersion, ...historicalNoteVersions], [currentNoteVersion, historicalNoteVersions]);
+  const selectedNoteVersion = useMemo(
+    () => noteVersionItems.find((item) => item.id === selectedVersionId) ?? currentNoteVersion,
+    [currentNoteVersion, noteVersionItems, selectedVersionId],
+  );
+  const selectedVersionPreview = useMemo(
+    () => buildMarkdownPreviewText(selectedNoteVersion.noteMarkdown || selectedNoteVersion.summary || ""),
+    [selectedNoteVersion.noteMarkdown, selectedNoteVersion.summary],
+  );
+  const selectedVersionPreviewLines = useMemo(
+    () => selectedVersionPreview.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 6),
+    [selectedVersionPreview],
+  );
   const rawTranscript = useMemo(() => (typeof metadata?.raw_transcript_markdown === "string" ? metadata.raw_transcript_markdown : ""), [metadata]);
+  const markdownSections = useMemo(() => parseMarkdownSections(refinedNote), [refinedNote]);
+  const markdownSectionMap = useMemo(() => new Map(markdownSections.map((section) => [section.title, section] as const)), [markdownSections]);
+  const overviewItems = useMemo(
+    () => parseOverviewItems(markdownSectionMap.get("视频速览") ?? markdownSectionMap.get("网页速览")),
+    [markdownSectionMap],
+  );
+  const focusNote = useMemo(() => getSectionText(markdownSectionMap.get("本次关注")), [markdownSectionMap]);
+  const coreConclusion = useMemo(() => getSectionText(markdownSectionMap.get("核心结论")), [markdownSectionMap]);
+  const memoryPoints = useMemo(() => getSectionList(markdownSectionMap.get("值得记住的内容")), [markdownSectionMap]);
+  const timelineItems = useMemo(() => parseTimelineItems(markdownSectionMap.get("时间线笔记")), [markdownSectionMap]);
+  const clipItems = useMemo(() => parseClipItems(markdownSectionMap.get("片段整理")), [markdownSectionMap]);
+  const practicalDigest = useMemo(() => shortenText(getSectionText(markdownSectionMap.get("实用整理")), 320), [markdownSectionMap]);
+  const originItems = useMemo(() => getSectionList(markdownSectionMap.get("原始信息保留")), [markdownSectionMap]);
+  const noteScreenshots = useMemo(() => parseNoteScreenshots(metadata), [metadata]);
+  const noteScreenshotStatus = useMemo(() => (typeof metadata?.note_screenshots_status === "string" ? metadata.note_screenshots_status.trim() : ""), [metadata]);
+  const noteScreenshotSummary = useMemo(() => (typeof metadata?.note_screenshots_summary === "string" ? metadata.note_screenshots_summary.trim() : ""), [metadata]);
+  const featuredNoteScreenshots = useMemo(() => noteScreenshots.slice(0, 3), [noteScreenshots]);
+  const stageDigestSeeds = useMemo(() => {
+    if (clipItems.length > 0) {
+      return buildStageDigestSeeds(
+        clipItems.map((item, index) => ({
+          id: `clip-${index + 1}-${item.label}`,
+          eyebrow: item.label || undefined,
+          title: item.label || undefined,
+          summary: item.summary,
+          href: item.href,
+        })),
+        { idPrefix: "clip", eyebrowPrefix: "阶段", titlePrefix: "阶段", limit: 4 },
+      );
+    }
+    if (timelineItems.length > 0) {
+      return buildStageDigestSeeds(
+        timelineItems.map((item, index) => ({
+          id: `timeline-${index + 1}-${item.label}`,
+          eyebrow: item.label || undefined,
+          title: item.label || undefined,
+          summary: item.summary,
+          href: item.href,
+        })),
+        { idPrefix: "timeline", eyebrowPrefix: "阶段", titlePrefix: "阶段", limit: 4 },
+      );
+    }
+    return buildStageDigestSeeds(memoryPoints, {
+      idPrefix: "memory",
+      eyebrowPrefix: "阶段",
+      titlePrefix: "阶段",
+      limit: 4,
+    });
+  }, [clipItems, timelineItems, memoryPoints]);
+  const stageDigestItems = useMemo(
+    () => buildStageDigestCards(stageDigestSeeds, noteScreenshots, { limit: 4 }),
+    [noteScreenshots, stageDigestSeeds],
+  );
+  const selectedVersionStageSeeds = useMemo(() => {
+    if (selectedNoteVersion.keyPoints.length > 0) {
+      return buildStageDigestSeeds(selectedNoteVersion.keyPoints, {
+        idPrefix: `${selectedNoteVersion.id}-point`,
+        eyebrowPrefix: "重点",
+        titlePrefix: "阶段",
+        limit: 3,
+      });
+    }
+
+    return buildStageDigestSeeds(
+      splitStageDigestText(selectedNoteVersion.summary || selectedVersionPreview, 3),
+      {
+        idPrefix: `${selectedNoteVersion.id}-summary`,
+        eyebrowPrefix: "摘要",
+        titlePrefix: "阶段",
+        limit: 3,
+      },
+    );
+  }, [selectedNoteVersion.id, selectedNoteVersion.keyPoints, selectedNoteVersion.summary, selectedVersionPreview]);
+  const selectedVersionStageDigestItems = useMemo(
+    () => buildStageDigestCards(selectedVersionStageSeeds, selectedNoteVersion.id === "current" ? noteScreenshots : [], { limit: 3 }),
+    [noteScreenshots, selectedNoteVersion.id, selectedVersionStageSeeds],
+  );
+  const isBiliNoteStyle = noteStyleValue === "bilinote";
   const transcriptSegments = useMemo(() => parseTranscriptSegments(metadata), [metadata]);
   const transcriptSourceLabel = useMemo(() => getTranscriptSourceLabel(metadata?.transcript_source), [metadata]);
+  const captureRouteSummary = useMemo(() => {
+    if (!metadata) return "";
+    const subtitleStrategy = getCaptureStrategyLabel(metadata.subtitle_fetch_strategy);
+    const audioStrategy = getCaptureStrategyLabel(metadata.audio_fetch_strategy);
+    const parts: string[] = [];
+
+    if (subtitleStrategy && (metadata.transcript_source === "subtitle" || metadata.subtitle_ytdlp_fallback_used === true)) {
+      parts.push(`字幕：${subtitleStrategy}`);
+    }
+    if (audioStrategy && (metadata.audio_available === true || metadata.transcript_source === "asr" || metadata.audio_ytdlp_fallback_used === true)) {
+      parts.push(`音频：${audioStrategy}`);
+    }
+
+    return parts.join(" / ");
+  }, [metadata]);
   const noteQuality = useMemo(() => getNoteQuality(metadata), [metadata]);
   const qualityInfo = useMemo(() => getQualityInfo(contentQuery.data?.status, metadata), [contentQuery.data?.status, metadata]);
+  const runningReparseJob = useMemo(
+    () => (activeReparseJob && !isSharedImportJobTerminal(activeReparseJob.status) ? activeReparseJob : null),
+    [activeReparseJob],
+  );
+  const reparseStepMeta = useMemo(() => getSharedImportJobStepMeta(runningReparseJob?.step, "reparse"), [runningReparseJob?.step]);
+  const reparseStageItems = useMemo(() => getSharedImportStageItems(runningReparseJob?.source_kind, "reparse"), [runningReparseJob?.source_kind]);
+  const reparseStageIndex = useMemo(
+    () => resolveSharedImportStageIndex(runningReparseJob?.step, runningReparseJob?.source_kind, "reparse"),
+    [runningReparseJob?.source_kind, runningReparseJob?.step],
+  );
   const materialSeedPoints = useMemo(() => readStringList(metadata?.material_seed_points), [metadata]);
   const materialSeedQueries = useMemo(() => readStringList(metadata?.material_seed_queries), [metadata]);
   const materialSeedSummary = useMemo(() => (typeof metadata?.material_seed_summary === "string" ? metadata.material_seed_summary.trim() : ""), [metadata]);
   const sourceDescription = useMemo(() => (typeof metadata?.source_description === "string" ? metadata.source_description.trim() : ""), [metadata]);
+  const fullNoteContent = richNoteContent || refinedNote || contentQuery.data?.summary || "";
+  const hasSupplementPanel = Boolean(practicalDigest || originItems.length > 0 || (contentQuery.data?.key_points.length ?? 0) > 0);
+  const hasDerivedOutputs = Boolean(derivedMindmap || derivedQuiz);
   const savedFrom = useMemo(() => (typeof metadata?.saved_from === "string" ? metadata.saved_from.trim() : ""), [metadata]);
   const sourceQuestion = useMemo(() => (typeof metadata?.question === "string" ? metadata.question.trim() : ""), [metadata]);
   const evidenceSummary = useMemo(() => (typeof metadata?.evidence_summary === "string" ? metadata.evidence_summary.trim() : ""), [metadata]);
@@ -469,6 +928,107 @@ export default function ContentDetailPage() {
   const requestedEndMs = useMemo(() => readNumber(searchParams.get("endMs")), [searchParams]);
   const timestampsAvailable = Boolean(metadata?.timestamps_available) || transcriptSegments.some((item) => item.startMs !== null || item.endMs !== null);
   const timestampsEstimated = Boolean(metadata?.timestamps_estimated);
+
+  useEffect(() => {
+    setSelectedVersionId("current");
+  }, [contentId, historicalNoteVersions.length, noteStyleValue, refinedNote]);
+
+  useEffect(() => {
+    if (hasDerivedOutputs) {
+      setShowDerivePanel(true);
+    }
+  }, [hasDerivedOutputs]);
+  useEffect(() => {
+    setActiveReparseJobId("");
+    setActiveReparseJob(null);
+    setReparseFailureMessage("");
+  }, [contentId]);
+  useEffect(() => {
+    if (!activeReparseJobId) {
+      return;
+    }
+
+    let cancelled = false;
+    let timer: number | undefined;
+    const pollStartedAt = Date.now();
+    const POLL_TIMEOUT_MS = 12 * 60 * 1000;
+
+    const poll = async () => {
+      try {
+        if (Date.now() - pollStartedAt > POLL_TIMEOUT_MS) {
+          if (!cancelled) {
+            setReparseFailureMessage("重新解析超时（超过 12 分钟），请稍后重试。");
+            setActiveReparseJobId("");
+            setActiveReparseJob(null);
+          }
+          return;
+        }
+
+        const job = await getImportJob(activeReparseJobId);
+        if (cancelled) {
+          return;
+        }
+
+        setActiveReparseJob((current) => {
+          if (
+            current &&
+            current.id === job.id &&
+            current.status === job.status &&
+            current.progress === job.progress &&
+            current.step === job.step &&
+            current.updated_at === job.updated_at &&
+            current.error_message === job.error_message
+          ) {
+            return current;
+          }
+          return job;
+        });
+
+        if (isImportJobTerminal(job.status)) {
+          setActiveReparseJobId("");
+          if (job.status === "completed") {
+            const jobMetadata =
+              job.preview.metadata && typeof job.preview.metadata === "object"
+                ? (job.preview.metadata as Record<string, unknown>)
+                : {};
+            const jobMessage =
+              typeof jobMetadata.job_message === "string" && jobMetadata.job_message.trim()
+                ? jobMetadata.job_message.trim()
+                : "内容已重新解析并覆盖更新。";
+            await queryClient.invalidateQueries({ queryKey: ["content", contentId] });
+            await queryClient.invalidateQueries({ queryKey: ["contents"] });
+            setLocalMessage(jobMessage);
+            setActiveReparseJob(null);
+            setActiveView("refined");
+          } else {
+            setReparseFailureMessage(job.error_message || "重新解析失败，请稍后再试。");
+            setActiveReparseJob(null);
+          }
+          return;
+        }
+
+        timer = window.setTimeout(() => {
+          void poll();
+        }, 1500);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setReparseFailureMessage(error instanceof Error ? error.message : "读取重解析状态失败");
+        setActiveReparseJobId("");
+        setActiveReparseJob(null);
+      }
+    };
+
+    void poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [activeReparseJobId, contentId, queryClient]);
   const targetChunk = useMemo(() => {
     const chunks = contentQuery.data?.chunks ?? [];
     if (!chunks.length) {
@@ -555,54 +1115,54 @@ export default function ContentDetailPage() {
     if (noteQuality?.llm_enhanced) {
       return {
         label: "模型精炼",
-        description: "精炼层已经过模型重整，适合直接做总结、原因和决策类追问。",
+        description: "已形成高层笔记，可直接用于总结、复盘与扩写。",
       };
     }
     if (noteQuality?.refined_note_ready) {
       return {
         label: "基础整理",
-        description: "已经形成可读笔记，但复杂理解更建议同时参考证据层。",
+        description: "已形成可读笔记，并保留证据层用于核对。",
       };
     }
     return {
       label: "原始建档",
-      description: "当前仍以基础建档为主，先补正文和要点，再做高确定性问答。",
+      description: "当前仍以原始材料为主，精炼层仍可继续补强。",
     };
   }, [noteQuality?.llm_enhanced, noteQuality?.refined_note_ready]);
   const qaModeStatus = useMemo(() => {
     if (noteQuality?.agent_ready) {
       return {
         label: "理解问答",
-        description: "优先按整条内容理解，再回到命中片段核对证据。",
+        description: "支持整条内容理解，并可回溯到命中证据。",
       };
     }
     if (noteQuality?.retrieval_ready) {
       return {
         label: "证据检索",
-        description: "更适合围绕片段核对，不建议把结论无限外推。",
+        description: "优先命中具体片段，适合精确核对。",
       };
     }
     return {
       label: "待补强",
-      description: "先做整理、补证或模型增强，再继续深问。",
+      description: "问答能力仍在补齐。",
     };
   }, [noteQuality?.agent_ready, noteQuality?.retrieval_ready]);
   const evidenceStatus = useMemo(() => {
     if (noteQuality?.time_jump_ready) {
       return {
         label: "可回看",
-        description: timestampsEstimated ? "命中后可以回看原视频时间点，当前部分时间来自估算定位。" : "命中后可以直接跳回原视频时间点。",
+        description: timestampsEstimated ? "已保留时间锚点，部分位置来自估算定位。" : "已保留时间锚点，可直接回到原始内容。",
       };
     }
     if (noteQuality?.raw_evidence_ready) {
       return {
         label: "可核对",
-        description: "已有原始正文或片段，适合做证据核对。",
+        description: "已保留原始正文或片段，可用于交叉核对。",
       };
     }
     return {
       label: "较弱",
-      description: "原始证据层还不够稳，先谨慎参考。",
+      description: "原始证据仍偏弱，结论仅供参考。",
     };
   }, [noteQuality?.raw_evidence_ready, noteQuality?.time_jump_ready, timestampsEstimated]);
   const materialReadiness = useMemo(
@@ -626,6 +1186,32 @@ export default function ContentDetailPage() {
     }
     return unique;
   }, [materialSeedQueries]);
+  const quickAskPreviewItems = useMemo(() => quickAskItems.slice(0, 3), [quickAskItems]);
+  const detailInfoItems = useMemo(() => {
+    const items = [
+      { label: "作者", value: contentQuery.data?.author || "-" },
+      { label: "分类", value: contentQuery.data?.category || "未分类" },
+      ...(savedFrom === "chat" && sourceQuestion ? [{ label: "来源问题", value: sourceQuestion }] : []),
+      { label: "笔记层", value: noteLayerStatus.label },
+      { label: "问答方式", value: qaModeStatus.label },
+      { label: "证据层", value: evidenceStatus.label },
+      { label: "正文来源", value: transcriptSourceLabel },
+      { label: "创建时间", value: formatDateTime(contentQuery.data?.created_at) },
+      { label: "更新时间", value: formatDateTime(contentQuery.data?.updated_at) },
+    ];
+    return items;
+  }, [
+    contentQuery.data?.author,
+    contentQuery.data?.category,
+    contentQuery.data?.created_at,
+    contentQuery.data?.updated_at,
+    evidenceStatus.label,
+    noteLayerStatus.label,
+    qaModeStatus.label,
+    savedFrom,
+    sourceQuestion,
+    transcriptSourceLabel,
+  ]);
 
   const updateMutation = useMutation({
     mutationFn: () =>
@@ -667,11 +1253,36 @@ export default function ContentDetailPage() {
       reparseContent(contentId, {
         note_style: typeof metadata?.note_style === "string" ? metadata.note_style : undefined,
         summary_focus: typeof metadata?.summary_focus === "string" ? metadata.summary_focus : undefined,
+        async_mode: true,
       }),
+    onMutate: () => {
+      setReparseFailureMessage("");
+      setActiveReparseJobId("");
+      setActiveReparseJob(null);
+    },
+    onSuccess: async (result) => {
+      if (result.job && !isImportJobTerminal(result.job.status)) {
+        setLocalMessage(result.message || "已开始后台重新解析，完成后会自动刷新当前内容。");
+        setActiveReparseJobId(result.job.id);
+        setActiveReparseJob(result.job);
+        return;
+      }
+      await queryClient.invalidateQueries({ queryKey: ["content", contentId] });
+      await queryClient.invalidateQueries({ queryKey: ["contents"] });
+      setLocalMessage(result.message || "内容已重新解析并覆盖更新。");
+      setActiveView("refined");
+    },
+    onError: (error) => {
+      setReparseFailureMessage(error instanceof Error ? error.message : "启动重解析失败，请稍后再试。");
+    },
+  });
+  const restoreNoteVersionMutation = useMutation({
+    mutationFn: (versionId: string) => restoreNoteVersion(contentId, { version_id: versionId }),
     onSuccess: async (result) => {
       await queryClient.invalidateQueries({ queryKey: ["content", contentId] });
       await queryClient.invalidateQueries({ queryKey: ["contents"] });
       setLocalMessage(result.message);
+      setSelectedVersionId("current");
       setActiveView("refined");
     },
   });
@@ -739,38 +1350,27 @@ export default function ContentDetailPage() {
     if (window.confirm(displayText("确认将这条内容移入回收站吗？"))) deleteMutation.mutate();
   }
 
+  function handleRestoreSelectedVersion() {
+    if (selectedNoteVersion.id === "current") return;
+    if (!window.confirm(displayText("确认将这一版恢复为当前版本吗？当前版本会自动保留进历史记录。"))) {
+      return;
+    }
+    restoreNoteVersionMutation.mutate(selectedNoteVersion.id);
+  }
+
   const heroFacts = [
-    { label: "质量", value: typeof noteQuality?.score === "number" ? `${noteQuality.score} 分` : qualityInfo.label, hint: noteQuality?.label || "当前建档状态" },
-    { label: "双层笔记", value: noteQuality?.double_note_ready ? "已就绪" : "待补全", hint: noteQuality?.llm_enhanced ? "模型精炼层 + 原始证据层" : "精炼层 + 原始证据层" },
-    { label: "时间定位", value: noteQuality?.time_jump_ready ? "可回看" : timestampsAvailable ? "部分可用" : "未提供", hint: timestampsEstimated ? "当前来自估算转写" : "命中后可回到原链接" },
-    { label: "片段数", value: transcriptSegments.length ? `${transcriptSegments.length} 段` : String(contentQuery.data.chunks.length), hint: noteQuality?.question_answer_ready ? "可直接问答验证" : qaModeStatus.label },
+    { label: "完整度", value: typeof noteQuality?.score === "number" ? `${noteQuality.score} 分` : qualityInfo.label, hint: noteQuality?.label || "当前解析状态" },
+    { label: "笔记结构", value: noteQuality?.double_note_ready ? "双层完成" : "继续补齐", hint: noteQuality?.llm_enhanced ? "模型重整 + 证据保留" : "精炼内容 + 原始证据" },
+    { label: "时间锚点", value: noteQuality?.time_jump_ready ? "可回跳" : timestampsAvailable ? "部分可用" : "未提供", hint: timestampsEstimated ? "含估算定位" : "支持原链接回看" },
+    { label: "证据片段", value: transcriptSegments.length ? `${transcriptSegments.length} 段` : String(contentQuery.data.chunks.length), hint: noteQuality?.question_answer_ready ? "问答可用" : qaModeStatus.label },
   ];
 
   const activeViewMeta =
     activeView === "refined"
-      ? { title: "精炼层", summary: "先看结论和要点，判断这条内容值不值得继续深挖。" }
+      ? { title: "精炼层", summary: "聚合结论、要点与可直接复用的表达。" }
       : activeView === "transcript"
-      ? { title: "证据层", summary: "保留原始正文和时间片段，适合核对原意与回看。" }
-      : { title: "检索层", summary: "这是问答系统优先命中的片段层，适合围绕局部继续提问。" };
-  const heroGuides = [
-    {
-      title: "当前形态",
-      text: `${noteLayerStatus.label} / ${evidenceStatus.label} · ${noteLayerStatus.description}`,
-    },
-    {
-      title: "问答方式",
-      text: `${qaModeStatus.label} · ${qaModeStatus.description}`,
-    },
-    {
-      title: "推荐下一步",
-      text:
-        noteQuality?.recommended_action ||
-        (metadata?.noisy_asr_detected === true
-          ? "先围绕具体片段提问和核对，再决定是否接模型做语义重整。"
-          : "先看精炼层，再围绕结论、原因或做法继续追问。"),
-    },
-  ];
-
+      ? { title: "证据层", summary: "保留原始正文、时间锚点与回看入口。" }
+      : { title: "检索层", summary: "展示问答优先命中的片段与上下文。" };
   return (
     <section className="page note-workbench-page">
       <article className="card detail-hero glass-hero product-detail-hero compact-detail-hero">
@@ -810,7 +1410,7 @@ export default function ContentDetailPage() {
                   title="点击编辑摘要"
                   onClick={() => setIsEditingMeta(true)}
                 >
-                  {displayText(contentQuery.data.summary || "当前已完成基础建档。先看精炼层，再在需要时回到底层证据。")}
+                  {displayText(contentQuery.data.summary || qualityInfo.description)}
                 </p>
               )}
             </div>
@@ -827,8 +1427,6 @@ export default function ContentDetailPage() {
           <div className="pill-row" style={{ alignItems: "center" }}>
             <span className="pill">{displayText(contentQuery.data.platform ?? "未知平台")}</span>
             <span className="pill">{displayText(qualityInfo.label)}</span>
-            <span className="pill">{displayText(noteLayerStatus.label)}</span>
-            <span className="pill">{displayText(qaModeStatus.label)}</span>
             <span className="pill">{displayText(transcriptSourceLabel)}</span>
             {metadata?.noisy_asr_detected === true && <span className="pill">{displayText("转写噪声")}</span>}
           </div>
@@ -871,43 +1469,116 @@ export default function ContentDetailPage() {
             ))}
           </div>
 
-          <div className="detail-guide-grid">
-            {heroGuides.map((item) => (
-              <article className="detail-guide-card" key={item.title}>
-                <span>{displayText(item.title)}</span>
-                <strong>{displayText(item.text)}</strong>
-              </article>
-            ))}
-          </div>
+          {!!featuredNoteScreenshots.length && (
+            <section className="detail-shot-preview-card" id="detail-note-screenshots">
+              <div className="panel-heading">
+                <div>
+                  <p className="eyebrow">{displayText("关键画面")}</p>
+                  <h3>{displayText("画面摘录")}</h3>
+                  <p className="muted-text">
+                    {displayText(
+                      noteScreenshotSummary ||
+                        "已抽取与笔记对应的关键帧，可直接回到原视频核对。",
+                    )}
+                  </p>
+                </div>
+                <div className="pill-row">
+                  <span className="pill">{displayText(`${noteScreenshots.length} 帧画面`)}</span>
+                </div>
+              </div>
+              <div className="detail-shot-preview-strip">
+                {featuredNoteScreenshots.map((item) => {
+                  const shotTileBody = (
+                    <>
+                      <div className="detail-shot-preview-image-wrap">
+                        <img
+                          className="detail-shot-preview-image"
+                          src={item.imageUrl}
+                          alt={item.caption || item.timestampLabel || "关键画面"}
+                          loading="lazy"
+                        />
+                        <span className="detail-shot-preview-badge">{displayText(item.timestampLabel || item.rangeLabel || "关键画面")}</span>
+                      </div>
+                      <div className="detail-shot-preview-copy">
+                        <strong>{displayText(item.rangeLabel || item.timestampLabel || "关键画面")}</strong>
+                        <p>{displayText(shortenText(item.caption || item.sourceText || "已生成关键画面，可直接继续回看。", 88))}</p>
+                      </div>
+                    </>
+                  );
+                  return item.seekUrl ? (
+                    <a className="detail-shot-preview-tile" key={item.id} href={item.seekUrl} target="_blank" rel="noreferrer">
+                      {shotTileBody}
+                    </a>
+                  ) : (
+                    <article className="detail-shot-preview-tile" key={item.id}>
+                      {shotTileBody}
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+          )}
 
-          <div className="header-actions">
-            <Link className="primary-button button-link" to={buildScopedChatLink("请基于这条笔记，给我一版更适合复盘的结论整理", { contentId: contentQuery.data.id, title: contentQuery.data.title })}>
-              {displayText("围绕这条内容提问")}
-            </Link>
-            {contentQuery.data.source_url && (
-              <a className="secondary-button button-link" href={contentQuery.data.source_url} target="_blank" rel="noreferrer">
-                {displayText("打开原链接")}
-              </a>
-            )}
-            <button className="secondary-button" type="button" onClick={() => reparseMutation.mutate()} disabled={reparseMutation.isPending}>
-              {reparseMutation.isPending ? displayText("重解析中...") : displayText("重新解析")}
-            </button>
-            <button className="secondary-button" type="button" onClick={() => exportMutation.mutate(false)} disabled={exportMutation.isPending}>
-              {exportMutation.isPending ? displayText("导出中...") : displayText("导出 Markdown")}
-            </button>
-            {Object.keys(annotations).length > 0 && (
-              <button className="secondary-button" type="button" onClick={() => exportMutation.mutate(true)} disabled={exportMutation.isPending}>
-                {displayText("导出含批注")}
-              </button>
-            )}
+          <div className="detail-hero-actions">
+            <div className="detail-hero-primary-actions">
+              <Link className="primary-button button-link" to={buildScopedChatLink("请基于这条笔记，给我一版更适合复盘的结论整理", { contentId: contentQuery.data.id, title: contentQuery.data.title })}>
+                {displayText("围绕这条内容提问")}
+              </Link>
+              {contentQuery.data.source_url && (
+                <a className="secondary-button button-link" href={contentQuery.data.source_url} target="_blank" rel="noreferrer">
+                  {displayText("打开原链接")}
+                </a>
+              )}
+            </div>
+
+            <details className="detail-hero-more-actions">
+              <summary>{displayText("更多操作")}</summary>
+              <div className="detail-hero-more-grid">
+                {!!noteScreenshots.length && (
+                  <a className="secondary-button button-link" href="#detail-note-screenshots-gallery">
+                    {displayText("查看全部画面")}
+                  </a>
+                )}
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => reparseMutation.mutate()}
+                  disabled={reparseMutation.isPending || Boolean(runningReparseJob)}
+                >
+                  {reparseMutation.isPending || runningReparseJob ? displayText("重解析中...") : displayText("重新解析")}
+                </button>
+                <button className="secondary-button" type="button" onClick={() => exportMutation.mutate(false)} disabled={exportMutation.isPending}>
+                  {exportMutation.isPending ? displayText("导出中...") : displayText("导出 Markdown")}
+                </button>
+                {Object.keys(annotations).length > 0 && (
+                  <button className="secondary-button" type="button" onClick={() => exportMutation.mutate(true)} disabled={exportMutation.isPending}>
+                    {displayText("导出含批注")}
+                  </button>
+                )}
+              </div>
+            </details>
           </div>
+          {runningReparseJob && (
+            <ImportProgressCard
+              runningImportJob={runningReparseJob}
+              importStepMeta={reparseStepMeta}
+              importStageItems={reparseStageItems}
+              importStageIndex={reparseStageIndex}
+            />
+          )}
+          {!!reparseFailureMessage && (
+            <div className="glass-callout">
+              <strong>{displayText("重新解析没有顺利完成")}</strong>
+              <p className="muted-text">{displayText(reparseFailureMessage)}</p>
+            </div>
+          )}
         </div>
       </article>
 
       <article className="card detail-section-card glass-panel layer-switch-card">
         <div className="panel-heading">
           <div>
-            <p className="eyebrow">{displayText("当前视角")}</p>
+            <p className="eyebrow">{displayText("内容层级")}</p>
             <h3>{displayText(activeViewMeta.title)}</h3>
             <p className="muted-text">{displayText(activeViewMeta.summary)}</p>
           </div>
@@ -927,14 +1598,9 @@ export default function ContentDetailPage() {
             <article className="card detail-section-card glass-panel product-reading-card">
               {savedFrom === "chat" && (
                 <div className="chat-note-insight-block">
-                  <div className="glass-callout">
-                    <strong>{displayText("这是一张问答沉淀卡片")}</strong>
-                    <p className="muted-text">{displayText("它不是纯笔记搬运，而是从一次问答里整理出来的结论，并额外保留了证据摘要和回看线索。")}</p>
-                  </div>
-
                   {sourceQuestion && (
                     <article className="detail-material-item">
-                      <span className="eyebrow">{displayText("原始问题")}</span>
+                      <span className="eyebrow">{displayText("问题来源")}</span>
                       <p>{displayText(sourceQuestion)}</p>
                     </article>
                   )}
@@ -952,10 +1618,7 @@ export default function ContentDetailPage() {
                   )}
 
                   {evidenceSummary && (
-                    <div className="glass-callout">
-                      <strong>{displayText("回看建议")}</strong>
-                      <p className="muted-text">{displayText(evidenceSummary)}</p>
-                    </div>
+                    <p className="muted-text detail-chat-evidence-summary">{displayText(evidenceSummary)}</p>
                   )}
 
                   <div className="header-actions">
@@ -971,62 +1634,370 @@ export default function ContentDetailPage() {
                         title: contentQuery.data.title,
                       })}
                     >
-                      {displayText("继续围绕这张卡片提问")}
+                      {displayText("继续提问")}
                     </Link>
                   </div>
                 </div>
               )}
 
-              {!!contentQuery.data.key_points.length && (
-                <div className="advice-grid compact-advice-grid">
-                  {contentQuery.data.key_points.slice(0, 4).map((point) => (
-                    <article className="advice-card" key={point}>
-                      <p>{displayText(point)}</p>
-                    </article>
-                  ))}
+              {isBiliNoteStyle && (
+                <section className="bilinote-reading-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <p className="eyebrow">{displayText("内容阅读")}</p>
+                      <h3>{displayText(contentQuery.data.platform === "webpage" ? "网页阅读" : "视频阅读")}</h3>
+                    </div>
+                    <div className="pill-row">
+                      {!!timelineItems.length && <span className="pill">{displayText(`${timelineItems.length} 个时间点`)}</span>}
+                      {!!clipItems.length && <span className="pill">{displayText(`${clipItems.length} 个片段`)}</span>}
+                      {!!noteScreenshots.length && <span className="pill">{displayText(`${noteScreenshots.length} 张关键画面`)}</span>}
+                    </div>
+                  </div>
+
+                  {(overviewItems.length > 0 || focusNote || coreConclusion || memoryPoints.length > 0) && (
+                    <div className="bilinote-reading-grid">
+                      {overviewItems.length > 0 && (
+                        <article className="bilinote-reading-card">
+                          <span className="eyebrow">{displayText("速览")}</span>
+                          <div className="bilinote-overview-list">
+                            {overviewItems.map((item) => (
+                              <div className="bilinote-overview-row" key={`${item.label}-${item.value}`}>
+                                <span>{displayText(item.label)}</span>
+                                <strong>{displayText(item.value || "-")}</strong>
+                              </div>
+                            ))}
+                          </div>
+                        </article>
+                      )}
+
+                      {focusNote && (
+                        <article className="bilinote-reading-card">
+                          <span className="eyebrow">{displayText("本次关注")}</span>
+                          <strong>{displayText("整理焦点")}</strong>
+                          <p>{displayText(focusNote)}</p>
+                        </article>
+                      )}
+
+                      {coreConclusion && (
+                        <article className="bilinote-reading-card">
+                          <span className="eyebrow">{displayText("核心结论")}</span>
+                          <strong>{displayText("核心摘要")}</strong>
+                          <p>{displayText(coreConclusion)}</p>
+                        </article>
+                      )}
+
+                      {!!memoryPoints.length && (
+                        <article className="bilinote-reading-card">
+                          <span className="eyebrow">{displayText("核心要点")}</span>
+                          <div className="bilinote-bullet-list">
+                            {memoryPoints.map((point) => (
+                              <p key={point}>{displayText(`• ${point}`)}</p>
+                            ))}
+                          </div>
+                        </article>
+                      )}
+                    </div>
+                  )}
+
+                  {!!stageDigestItems.length && (
+                    <StageDigest
+                      eyebrow="阶段总结"
+                      title="按阶段看重点"
+                      description="片段与画面已按阶段归并。"
+                      items={stageDigestItems}
+                      className="detail-stage-digest"
+                    />
+                  )}
+
+                  {!!timelineItems.length && (
+                    <div className="bilinote-section-stack">
+                      <div className="panel-heading">
+                        <div>
+                          <p className="eyebrow">{displayText("时间线笔记")}</p>
+                          <h4>{displayText("时间锚点")}</h4>
+                        </div>
+                      </div>
+                      <div className="bilinote-timeline-grid">
+                        {timelineItems.map((item) =>
+                          item.href ? (
+                            <a className="bilinote-timeline-card" key={`${item.label}-${item.href}`} href={item.href} target="_blank" rel="noreferrer">
+                              <span className="eyebrow">{displayText(item.label)}</span>
+                              <strong>{displayText(item.summary || "打开原视频对应时间点")}</strong>
+                            </a>
+                          ) : (
+                            <article className="bilinote-timeline-card" key={`${item.label}-${item.summary}`}>
+                              <span className="eyebrow">{displayText(item.label)}</span>
+                              <strong>{displayText(item.summary || "已保留该时间点摘要")}</strong>
+                            </article>
+                          ),
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {!!clipItems.length && (
+                    <details className="bilinote-section-stack detail-media-disclosure">
+                      <summary className="detail-media-summary">
+                        <div>
+                          <p className="eyebrow">{displayText("片段整理")}</p>
+                          <strong>{displayText("完整分段")}</strong>
+                        </div>
+                        <span className="pill">{displayText(`${clipItems.length} 段`)}</span>
+                      </summary>
+                      <div className="detail-media-body">
+                        <div className="bilinote-clip-grid">
+                          {clipItems.map((item) =>
+                            item.href ? (
+                              <a className="bilinote-clip-card" key={`${item.label}-${item.href}`} href={item.href} target="_blank" rel="noreferrer">
+                                <span className="eyebrow">{displayText(item.label)}</span>
+                                <strong>{displayText("打开原片段")}</strong>
+                                <p>{displayText(shortenText(item.summary || "当前片段已保留，适合回到原文继续核对。", 160))}</p>
+                              </a>
+                            ) : (
+                              <article className="bilinote-clip-card" key={`${item.label}-${item.summary}`}>
+                                <span className="eyebrow">{displayText(item.label)}</span>
+                                <strong>{displayText("片段摘要")}</strong>
+                                <p>{displayText(shortenText(item.summary || "当前片段已保留，适合继续核对。", 160))}</p>
+                              </article>
+                            ),
+                          )}
+                        </div>
+                      </div>
+                    </details>
+                  )}
+
+                  {!!noteScreenshots.length && (
+                    <details className="bilinote-section-stack detail-media-disclosure" id="detail-note-screenshots-gallery">
+                      <summary className="detail-media-summary">
+                        <div>
+                          <p className="eyebrow">{displayText("关键画面")}</p>
+                          <strong>{displayText("全部画面")}</strong>
+                        </div>
+                        <span className="pill">{displayText(`${noteScreenshots.length} 张`)}</span>
+                      </summary>
+                      <div className="detail-media-body">
+                        <div className="bilinote-screenshot-grid">
+                          {noteScreenshots.map((item) => {
+                            const cardBody = (
+                              <>
+                                <div className="bilinote-screenshot-image-wrap">
+                                  <img
+                                    className="bilinote-screenshot-image"
+                                    src={item.imageUrl}
+                                    alt={item.caption || item.timestampLabel || "关键画面"}
+                                    loading="lazy"
+                                  />
+                                </div>
+                                <div className="bilinote-screenshot-copy">
+                                  <span className="eyebrow">{displayText(item.rangeLabel || item.timestampLabel || "关键画面")}</span>
+                                  <strong>{displayText(item.timestampLabel || "关键画面")}</strong>
+                                  <p>{displayText(shortenText(item.caption || item.sourceText || "已保留当前关键时间点画面。", 120))}</p>
+                                </div>
+                              </>
+                            );
+                            return item.seekUrl ? (
+                              <a
+                                className="bilinote-screenshot-card"
+                                key={item.id}
+                                href={item.seekUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                {cardBody}
+                              </a>
+                            ) : (
+                              <article className="bilinote-screenshot-card" key={item.id}>
+                                {cardBody}
+                              </article>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </details>
+                  )}
+
+                  {!noteScreenshots.length && noteScreenshotStatus && noteScreenshotStatus !== "skipped" && noteScreenshotSummary && (
+                    <div className="glass-callout">
+                      <strong>{displayText("画面未生成")}</strong>
+                      <p className="muted-text">{displayText(noteScreenshotSummary)}</p>
+                    </div>
+                  )}
+
+                </section>
+              )}
+
+              {!isBiliNoteStyle && !!noteScreenshots.length && (
+                <details className="bilinote-section-stack detail-generic-screenshot-section detail-media-disclosure" id="detail-note-screenshots-gallery">
+                  <summary className="detail-media-summary">
+                    <div>
+                      <p className="eyebrow">{displayText("关键画面")}</p>
+                      <strong>{displayText("全部画面")}</strong>
+                    </div>
+                    <span className="pill">{displayText(`${noteScreenshots.length} 张`)}</span>
+                  </summary>
+                  <div className="detail-media-body">
+                    <div className="bilinote-screenshot-grid">
+                      {noteScreenshots.map((item) => {
+                        const cardBody = (
+                          <>
+                            <div className="bilinote-screenshot-image-wrap">
+                              <img
+                                className="bilinote-screenshot-image"
+                                src={item.imageUrl}
+                                alt={item.caption || item.timestampLabel || "关键画面"}
+                                loading="lazy"
+                              />
+                            </div>
+                            <div className="bilinote-screenshot-copy">
+                              <span className="eyebrow">{displayText(item.rangeLabel || item.timestampLabel || "关键画面")}</span>
+                              <strong>{displayText(item.timestampLabel || "关键画面")}</strong>
+                              <p>{displayText(shortenText(item.caption || item.sourceText || "已保留当前关键时间点画面。", 120))}</p>
+                            </div>
+                          </>
+                        );
+                        return item.seekUrl ? (
+                          <a
+                            className="bilinote-screenshot-card"
+                            key={item.id}
+                            href={item.seekUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {cardBody}
+                          </a>
+                        ) : (
+                          <article className="bilinote-screenshot-card" key={item.id}>
+                            {cardBody}
+                          </article>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </details>
+              )}
+
+              {!isBiliNoteStyle && !noteScreenshots.length && noteScreenshotStatus && noteScreenshotStatus !== "skipped" && noteScreenshotSummary && (
+                <div className="glass-callout">
+                  <strong>{displayText("画面未生成")}</strong>
+                  <p className="muted-text">{displayText(noteScreenshotSummary)}</p>
                 </div>
               )}
-              <div style={{ marginBottom: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span className="eyebrow" style={{ marginBottom: 0 }}>{displayText(isEditingNote ? "编辑笔记" : "精炼笔记")}</span>
-                <div style={{ display: "flex", gap: 6 }}>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    type="button"
-                    onClick={() => setIsEditingNote((v) => !v)}
-                  >
-                    {isEditingNote ? displayText("完成编辑") : displayText("编辑笔记")}
-                  </button>
-                  <button className="btn btn-ghost btn-sm" type="button" onClick={() => void handleCopyText(richNoteContent || refinedNote || contentQuery.data.summary || "", "精炼笔记")}>
-                    {displayText("复制")}
-                  </button>
-                  <button className="btn btn-ghost btn-sm" type="button" onClick={() => setActiveView("transcript")}>
-                    {displayText("看证据层")}
-                  </button>
+
+              {hasSupplementPanel && (
+                <section className="detail-inline-disclosure">
+                  <div className="detail-disclosure-head">
+                    <div>
+                      <p className="eyebrow">{displayText("补充信息")}</p>
+                      <strong>{displayText("补充内容")}</strong>
+                    </div>
+                    <div className="detail-disclosure-actions">
+                      <button className="btn btn-ghost btn-sm" type="button" onClick={() => setShowSupplementPanel((v) => !v)}>
+                        {showSupplementPanel ? displayText("收起") : displayText("展开")}
+                      </button>
+                    </div>
+                  </div>
+                  {showSupplementPanel && (
+                    <div className="detail-disclosure-body">
+                      <div className="bilinote-reading-grid bilinote-reading-grid-secondary">
+                        {practicalDigest && (
+                          <article className="bilinote-reading-card">
+                            <span className="eyebrow">{displayText("实用整理")}</span>
+                            <strong>{displayText("可直接复用的正文内容")}</strong>
+                            <p>{displayText(practicalDigest)}</p>
+                          </article>
+                        )}
+                        {!!contentQuery.data.key_points.length && (
+                          <article className="bilinote-reading-card">
+                            <span className="eyebrow">{displayText("关键信息")}</span>
+                            <strong>{displayText("提炼出的要点")}</strong>
+                            <div className="bilinote-bullet-list">
+                              {contentQuery.data.key_points.slice(0, 4).map((point) => (
+                                <p key={point}>{displayText(`• ${point}`)}</p>
+                              ))}
+                            </div>
+                          </article>
+                        )}
+                        {originItems.length > 0 && (
+                          <article className="bilinote-reading-card">
+                            <span className="eyebrow">{displayText("原始信息保留")}</span>
+                            <strong>{displayText("采集状态与来源说明")}</strong>
+                            <div className="bilinote-bullet-list">
+                              {originItems.map((item) => (
+                                <p key={item}>{displayText(`• ${item}`)}</p>
+                              ))}
+                            </div>
+                          </article>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </section>
+              )}
+
+              <section className="detail-inline-disclosure detail-note-disclosure">
+                <div className="detail-disclosure-head">
+                  <div>
+                    <p className="eyebrow">{displayText(isEditingNote ? "编辑笔记" : "完整笔记")}</p>
+                    <strong>{displayText(isEditingNote ? "编辑中" : "正文")}</strong>
+                  </div>
+                  <div className="detail-disclosure-actions">
+                    {isBiliNoteStyle && (
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        type="button"
+                        onClick={() => setShowFullNote((v) => !v)}
+                      >
+                        {showFullNote ? displayText("收起正文") : displayText("展开正文")}
+                      </button>
+                    )}
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      type="button"
+                      onClick={() => {
+                        setShowFullNote(true);
+                        setIsEditingNote((v) => !v);
+                      }}
+                    >
+                      {isEditingNote ? displayText("完成编辑") : displayText("编辑笔记")}
+                    </button>
+                    <button className="btn btn-ghost btn-sm" type="button" onClick={() => void handleCopyText(fullNoteContent, "精炼笔记")}>
+                      {displayText("复制")}
+                    </button>
+                    <button className="btn btn-ghost btn-sm" type="button" onClick={() => setActiveView("transcript")}>
+                      {displayText("看证据层")}
+                    </button>
+                  </div>
                 </div>
-              </div>
-              <RichNoteEditor
-                content={richNoteContent || refinedNote || contentQuery.data.summary || ""}
-                editable={isEditingNote}
-                onChange={setRichNoteContent}
-                onSave={(html) => {
-                  updateContent(contentId, { summary: contentQuery.data?.summary ?? "" }).catch(() => {});
-                  setLocalMessage("笔记已自动保存。");
-                  setTimeout(() => setLocalMessage(""), 2000);
-                  void html;
-                }}
-                placeholder="在这里写精炼笔记，支持标题、加粗、列表、高亮..."
-              />
+                {(showFullNote || isEditingNote || !isBiliNoteStyle) && (
+                  <RichNoteEditor
+                    content={fullNoteContent}
+                    editable={isEditingNote}
+                    onChange={setRichNoteContent}
+                    onSave={(html) => {
+                      updateContent(contentId, { summary: contentQuery.data?.summary ?? "" }).catch(() => {});
+                      setLocalMessage("笔记已自动保存。");
+                      setTimeout(() => setLocalMessage(""), 2000);
+                      void html;
+                    }}
+                    placeholder="在这里写精炼笔记，支持标题、加粗、列表、高亮..."
+                  />
+                )}
+              </section>
             </article>
           )}
 
           {activeView === "transcript" && (
             <article className="card detail-section-card glass-panel">
               <div className="glass-callout transcript-callout">
-                <strong>{displayText(`正文来源：${transcriptSourceLabel}`)}</strong>
+                <strong>{displayText("证据层")}</strong>
                 <p className="muted-text">{displayText(qualityInfo.description)}</p>
-                {typeof metadata?.asr_model_used === "string" && metadata.asr_model_used.trim() && (
-                  <p className="muted-text">{displayText(`本次转写模型：${metadata.asr_model_used}`)}</p>
-                )}
+                <div className="pill-row">
+                  <span className="pill">{displayText(transcriptSourceLabel)}</span>
+                  {captureRouteSummary ? <span className="pill">{displayText(captureRouteSummary)}</span> : null}
+                  {typeof metadata?.asr_model_used === "string" && metadata.asr_model_used.trim() ? (
+                    <span className="pill">{displayText(String(metadata.asr_model_used))}</span>
+                  ) : null}
+                </div>
                 {qualityInfo.actionLabel && (
                   <Link className="secondary-button button-link" to="/settings">
                     {displayText(qualityInfo.actionLabel)}
@@ -1187,258 +2158,386 @@ export default function ContentDetailPage() {
             {localMessage && <p className="success-text">{displayText(localMessage)}</p>}
             {exportMutation.isSuccess && <p className="success-text">{displayText(`导出成功：${exportMutation.data.path}`)}</p>}
             {reparseMutation.isError && <p className="error-text">{displayText("重新解析失败，请确认原始链接或文件仍可访问。")}</p>}
+            {restoreNoteVersionMutation.isError && <p className="error-text">{displayText("恢复历史版本失败，请稍后重试。")}</p>}
             {exportMutation.isError && <p className="error-text">{displayText("导出失败，请稍后再试。")}</p>}
 
-            <div className="glass-callout">
-              <strong>{displayText(activeViewMeta.title)}</strong>
-              <p className="muted-text">{displayText(activeViewMeta.summary)}</p>
-            </div>
-
-            <article className="result-callout detail-material-callout">
+            <article className="glass-callout detail-side-summary">
+              <strong>{displayText(materialReadiness.title)}</strong>
+              <p className="muted-text">{displayText(materialSeedSummary || materialReadiness.description)}</p>
               <div className="pill-row" style={{ alignItems: "center" }}>
                 <span className="pill">{displayText(materialReadiness.statusLabel)}</span>
-                {materialReadiness.weakCapture && <span className="pill">{displayText("先用种子材料")}</span>}
+                <span className="pill">{displayText(activeViewMeta.title)}</span>
+                <span className="pill">{displayText(transcriptSourceLabel)}</span>
+                {materialReadiness.weakCapture && <span className="pill">{displayText("种子材料")}</span>}
               </div>
-              <strong>{displayText(materialReadiness.title)}</strong>
-              <p>{displayText(materialSeedSummary || materialReadiness.description)}</p>
             </article>
 
-            <div className="smart-diagnostic-strip">
-              {materialReadiness.cards.map((item) => (
-                <article
-                  className={`smart-diagnostic-card smart-diagnostic-card-${item.tone}`}
-                  key={item.label}
-                >
-                  <span>{displayText(item.label)}</span>
-                  <strong>{displayText(item.value)}</strong>
-                </article>
-              ))}
-            </div>
-
-            {(materialSeedPoints.length > 0 || sourceDescription) && (
-              <article className="card detail-section-card glass-panel detail-material-panel">
-                <div className="panel-heading">
-                  <div>
-                    <p className="eyebrow">{displayText("材料状态")}</p>
-                    <h3>{displayText("当前拿到的线索")}</h3>
-                  </div>
-                </div>
-                {materialSeedPoints.length > 0 && (
-                  <div className="detail-material-list">
-                    {materialSeedPoints.map((item) => (
-                      <article className="detail-material-item" key={item}>
-                        <p>{displayText(item)}</p>
-                      </article>
-                    ))}
-                  </div>
-                )}
-                {!materialSeedPoints.length && sourceDescription && (
-                  <div className="glass-callout">
-                    <strong>{displayText("已保留来源简介")}</strong>
-                    <p className="muted-text">{displayText(sourceDescription)}</p>
-                  </div>
-                )}
-                {(qualityInfo.actionLabel || materialReadiness.weakCapture) && (
-                  <div className="header-actions">
-                    {qualityInfo.actionLabel && (
-                      <Link className="secondary-button button-link" to="/settings">
-                        {displayText(qualityInfo.actionLabel)}
-                      </Link>
-                    )}
-                    <button className="secondary-button" type="button" onClick={() => reparseMutation.mutate()} disabled={reparseMutation.isPending}>
-                      {reparseMutation.isPending ? displayText("重解析中...") : displayText("重新整理材料")}
-                    </button>
-                  </div>
-                )}
-              </article>
+            {!!quickAskPreviewItems.length && (
+              <div className="chip-grid detail-side-shortcuts">
+                {quickAskPreviewItems.map((item) => (
+                  <Link
+                    key={item}
+                    className="secondary-button button-link suggestion-chip detail-quick-ask-chip"
+                    to={buildScopedChatLink(item, { contentId: contentQuery.data.id, title: contentQuery.data.title })}
+                  >
+                    {displayText(item)}
+                  </Link>
+                ))}
+              </div>
             )}
 
-            <div className="chip-grid detail-quick-ask-grid">
-              {quickAskItems.map((item) => (
-                <Link key={item} className="secondary-button button-link suggestion-chip detail-quick-ask-chip" to={buildScopedChatLink(item, { contentId: contentQuery.data.id, title: contentQuery.data.title })}>
-                  {displayText(item)}
-                </Link>
-              ))}
-            </div>
+            {historicalNoteVersions.length > 0 && (
+              <details className="card detail-section-card glass-panel detail-section-card-compact detail-side-disclosure bili-note-history-card">
+                <summary>{displayText(`版本 · ${historicalNoteVersions.length}`)}</summary>
+                <div className="bili-note-history-list">
+                  {noteVersionItems.map((item, index) => {
+                    const selected = selectedNoteVersion.id === item.id;
+                    return (
+                      <button
+                        key={`${item.id}-${index}`}
+                        type="button"
+                        className={selected ? "bili-note-history-item bili-note-history-item-active" : "bili-note-history-item"}
+                        onClick={() => setSelectedVersionId(item.id)}
+                      >
+                        <div className="bili-note-history-item-head">
+                          <div className="pill-row">
+                            <span className="pill">{displayText(getNoteVersionSourceLabel(item.source))}</span>
+                          </div>
+                          <span className="muted-text">{displayText(item.capturedAt ? formatDateTime(item.capturedAt) : "未记录时间")}</span>
+                        </div>
+                        <strong>{displayText(item.summaryFocus || item.title || "未命名版本")}</strong>
+                        <p className="muted-text">
+                          {displayText(
+                            item.summaryFocus
+                              ? `关注点：${item.summaryFocus}`
+                              : item.captureSummary || item.summary || "当前版本已保留快照，可随时回看。",
+                          )}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
 
-            <div className="info-list compact-info-list">
-              <div><dt>{displayText("作者")}</dt><dd>{displayText(contentQuery.data.author || "-")}</dd></div>
-              <div><dt>{displayText("分类")}</dt><dd>{displayText(contentQuery.data.category || "未分类")}</dd></div>
-              {savedFrom === "chat" && sourceQuestion && <div><dt>{displayText("来源问题")}</dt><dd>{displayText(sourceQuestion)}</dd></div>}
-              <div><dt>{displayText("笔记层")}</dt><dd>{displayText(noteLayerStatus.label)}</dd></div>
-              <div><dt>{displayText("问答方式")}</dt><dd>{displayText(qaModeStatus.label)}</dd></div>
-              <div><dt>{displayText("证据层")}</dt><dd>{displayText(evidenceStatus.label)}</dd></div>
-              <div><dt>{displayText("正文来源")}</dt><dd>{displayText(transcriptSourceLabel)}</dd></div>
-              <div><dt>{displayText("创建时间")}</dt><dd>{formatDateTime(contentQuery.data.created_at)}</dd></div>
-              <div><dt>{displayText("更新时间")}</dt><dd>{formatDateTime(contentQuery.data.updated_at)}</dd></div>
-            </div>
+                <div className="bili-note-preview-block">
+                  <div className="bili-note-preview-head">
+                    <div>
+                      <p className="eyebrow">{displayText("当前选中版本")}</p>
+                      <h3>{displayText(selectedNoteVersion.summaryFocus || selectedNoteVersion.title || "未命名版本")}</h3>
+                    </div>
+                    <div className="pill-row">
+                      <span className="pill">{displayText(getNoteVersionSourceLabel(selectedNoteVersion.source))}</span>
+                    </div>
+                  </div>
 
-            <div className="tag-row-soft">
-              {contentQuery.data.tags.length ? contentQuery.data.tags.map((tag) => <span className="pill" key={tag}>{displayText(tag)}</span>) : <span className="pill">{displayText("暂无标签")}</span>}
-            </div>
+                  <div className="bili-note-preview-meta">
+                    <article className="bili-note-preview-meta-card">
+                      <span>{displayText("保存时间")}</span>
+                      <strong>{displayText(selectedNoteVersion.capturedAt ? formatDateTime(selectedNoteVersion.capturedAt) : "当前页面")}</strong>
+                    </article>
+                    <article className="bili-note-preview-meta-card">
+                      <span>{displayText("正文来源")}</span>
+                      <strong>{displayText(getTranscriptSourceLabel(selectedNoteVersion.transcriptSource || metadata?.transcript_source))}</strong>
+                    </article>
+                  </div>
+
+                  {!!selectedVersionStageDigestItems.length && (
+                    <StageDigest
+                      eyebrow="版本摘要"
+                      title="这一版的重点"
+                      description={selectedNoteVersion.id === "current" ? "当前版本重点。" : "历史版本重点。"}
+                      items={selectedVersionStageDigestItems}
+                      compact
+                      className="detail-version-stage-digest"
+                    />
+                  )}
+
+                  {!selectedVersionStageDigestItems.length && selectedNoteVersion.summary && (
+                    <div className="glass-callout">
+                      <strong>{displayText("当时的摘要")}</strong>
+                      <p className="muted-text">{displayText(selectedNoteVersion.summary)}</p>
+                    </div>
+                  )}
+
+                  {!selectedVersionStageDigestItems.length && !!selectedNoteVersion.keyPoints.length && (
+                    <div className="bilinote-bullet-list">
+                      {selectedNoteVersion.keyPoints.slice(0, 4).map((point) => (
+                        <p key={`${selectedNoteVersion.id}-${point}`}>{displayText(`• ${point}`)}</p>
+                      ))}
+                    </div>
+                  )}
+
+                  <details className="detail-mini-disclosure">
+                    <summary>{displayText("查看正文快照")}</summary>
+                    <div className="bili-note-reader">
+                      {selectedVersionPreviewLines.length > 0 ? (
+                        selectedVersionPreviewLines.map((line) => (
+                          <p key={`${selectedNoteVersion.id}-${line}`}>{displayText(line)}</p>
+                        ))
+                      ) : (
+                        <p>{displayText("这版笔记暂时没有可展示的正文。")}</p>
+                      )}
+                    </div>
+                  </details>
+
+                  <div className="header-actions bili-note-preview-actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => void handleCopyText(selectedNoteVersion.noteMarkdown || selectedNoteVersion.summary || "", "当前版本快照")}
+                    >
+                      {displayText("复制这版笔记")}
+                    </button>
+                    {selectedNoteVersion.id !== "current" && (
+                      <button
+                        className="primary-button"
+                        type="button"
+                        onClick={handleRestoreSelectedVersion}
+                        disabled={restoreNoteVersionMutation.isPending}
+                      >
+                        {restoreNoteVersionMutation.isPending ? displayText("恢复中...") : displayText("恢复为当前版本")}
+                      </button>
+                    )}
+                    {selectedNoteVersion.id !== "current" && (
+                      <button className="secondary-button" type="button" onClick={() => setSelectedVersionId("current")}>
+                        {displayText("回到当前版本")}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </details>
+            )}
+
+            <details className="card detail-section-card glass-panel detail-section-card-compact detail-side-disclosure">
+              <summary>{displayText("补充信息")}</summary>
+              <div className="smart-diagnostic-strip">
+                {materialReadiness.cards.map((item) => (
+                  <article
+                    className={`smart-diagnostic-card smart-diagnostic-card-${item.tone}`}
+                    key={item.label}
+                  >
+                    <span>{displayText(item.label)}</span>
+                    <strong>{displayText(item.value)}</strong>
+                  </article>
+                ))}
+              </div>
+
+              {(materialSeedPoints.length > 0 || sourceDescription) && (
+                <div className="detail-side-group">
+                  {materialSeedPoints.length > 0 ? (
+                    <div className="detail-material-list">
+                      {materialSeedPoints.slice(0, 4).map((item) => (
+                        <article className="detail-material-item" key={item}>
+                          <p>{displayText(item)}</p>
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="glass-callout">
+                      <strong>{displayText("来源简介")}</strong>
+                      <p className="muted-text">{displayText(sourceDescription)}</p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="info-list compact-info-list">
+                {detailInfoItems.map((item) => (
+                  <div key={`${item.label}-${item.value}`}>
+                    <dt>{displayText(item.label)}</dt>
+                    <dd>{displayText(item.value)}</dd>
+                  </div>
+                ))}
+              </div>
+
+              <div className="tag-row-soft">
+                {contentQuery.data.tags.length ? contentQuery.data.tags.map((tag) => <span className="pill" key={tag}>{displayText(tag)}</span>) : <span className="pill">{displayText("暂无标签")}</span>}
+              </div>
+
+              {(qualityInfo.actionLabel || materialReadiness.weakCapture) && (
+                <div className="header-actions">
+                  {qualityInfo.actionLabel && (
+                    <Link className="secondary-button button-link" to="/settings">
+                      {displayText(qualityInfo.actionLabel)}
+                    </Link>
+                  )}
+                  <button className="secondary-button" type="button" onClick={() => reparseMutation.mutate()} disabled={reparseMutation.isPending}>
+                    {reparseMutation.isPending ? displayText("重解析中...") : displayText("重新整理材料")}
+                  </button>
+                </div>
+              )}
+            </details>
           </article>
 
           {/* 派生面板：思维导图 + 测验 */}
-          <article className="card detail-section-card glass-panel">
-            <div className="derive-panel-head">
-              <p className="eyebrow">{displayText("AI 派生")}</p>
-              <div className="pill-row">
-                <button
-                  type="button"
-                  className={deriveView === "mindmap" ? "segment-pill segment-pill-active" : "segment-pill"}
-                  onClick={() => setDeriveView(deriveView === "mindmap" ? "none" : "mindmap")}
-                >
-                  {displayText("思维导图")}
-                </button>
-                <button
-                  type="button"
-                  className={deriveView === "quiz" ? "segment-pill segment-pill-active" : "segment-pill"}
-                  onClick={() => setDeriveView(deriveView === "quiz" ? "none" : "quiz")}
-                >
-                  {displayText("随堂测验")}
-                </button>
-              </div>
-            </div>
-
-            {deriveView === "mindmap" && (
+          <article className="card detail-section-card glass-panel detail-section-card-compact">
+            <div className="detail-side-disclosure">
+              <button className="detail-side-disclosure-toggle" type="button" onClick={() => setShowDerivePanel((v) => !v)}>
+                <span>{displayText("派生内容")}</span>
+                <span className="muted-text">{displayText(showDerivePanel ? "收起" : "展开")}</span>
+              </button>
+              {showDerivePanel && (
               <div className="derive-content">
-                {derivedMindmap ? (
-                  <>
-                    <div className="derive-mindmap-tree">
-                      <MindmapNode node={derivedMindmap.data as MindmapNodeData} depth={0} />
-                    </div>
-                    <div className="header-actions" style={{ marginTop: 12 }}>
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() => void handleExportDerived(derivedMindmap.id, `${derivedMindmap.title}.md`)}
-                      >
-                        {displayText("导出 Markdown")}
-                      </button>
-                      <button
-                        type="button"
-                        className="danger-button"
-                        onClick={async () => {
-                          await deleteDerivedMutation.mutateAsync(derivedMindmap.id);
-                          mindmapMutation.mutate();
-                        }}
-                        disabled={deleteDerivedMutation.isPending || mindmapMutation.isPending}
-                      >
-                        {displayText("重新生成")}
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <div className="derive-empty">
-                    <p className="muted-text">{displayText("还没有思维导图，点击生成。")}</p>
+                <div className="derive-panel-head">
+                  <div className="pill-row">
                     <button
                       type="button"
-                      className="primary-button"
-                      disabled={mindmapMutation.isPending}
-                      onClick={() => mindmapMutation.mutate()}
+                      className={deriveView === "mindmap" ? "segment-pill segment-pill-active" : "segment-pill"}
+                      onClick={() => setDeriveView(deriveView === "mindmap" ? "none" : "mindmap")}
                     >
-                      {mindmapMutation.isPending ? displayText("生成中...") : displayText("生成思维导图")}
+                      {displayText("思维导图")}
                     </button>
-                    {mindmapMutation.isError && (
-                      <p className="muted-text" style={{ color: "var(--error)" }}>
-                        {displayText("生成失败，请检查模型配置。")}
-                      </p>
+                    <button
+                      type="button"
+                      className={deriveView === "quiz" ? "segment-pill segment-pill-active" : "segment-pill"}
+                      onClick={() => setDeriveView(deriveView === "quiz" ? "none" : "quiz")}
+                    >
+                      {displayText("随堂测验")}
+                    </button>
+                  </div>
+                </div>
+
+                {deriveView === "mindmap" && (
+                  <div className="derive-content">
+                    {derivedMindmap ? (
+                      <>
+                        <div className="derive-mindmap-tree">
+                          <MindmapNode node={derivedMindmap.data as MindmapNodeData} depth={0} />
+                        </div>
+                        <div className="header-actions" style={{ marginTop: 12 }}>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => void handleExportDerived(derivedMindmap.id, `${derivedMindmap.title}.md`)}
+                          >
+                            {displayText("导出 Markdown")}
+                          </button>
+                          <button
+                            type="button"
+                            className="danger-button"
+                            onClick={async () => {
+                              await deleteDerivedMutation.mutateAsync(derivedMindmap.id);
+                              mindmapMutation.mutate();
+                            }}
+                            disabled={deleteDerivedMutation.isPending || mindmapMutation.isPending}
+                          >
+                            {displayText("重新生成")}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="derive-empty">
+                        <p className="muted-text">{displayText("还没有思维导图，点击生成。")}</p>
+                        <button
+                          type="button"
+                          className="primary-button"
+                          disabled={mindmapMutation.isPending}
+                          onClick={() => mindmapMutation.mutate()}
+                        >
+                          {mindmapMutation.isPending ? displayText("生成中...") : displayText("生成思维导图")}
+                        </button>
+                        {mindmapMutation.isError && (
+                          <p className="muted-text" style={{ color: "var(--error)" }}>
+                            {displayText("生成失败，请检查模型配置。")}
+                          </p>
+                        )}
+                      </div>
                     )}
                   </div>
                 )}
-              </div>
-            )}
 
-            {deriveView === "quiz" && (
-              <div className="derive-content">
-                {derivedQuiz ? (
-                  <>
-                    <div className="derive-quiz-list">
-                      {((derivedQuiz.data as { questions?: QuizQuestion[] }).questions ?? []).map(
-                        (q: QuizQuestion, idx: number) => (
-                          <div key={idx} className="derive-quiz-item card glass-panel">
-                            <p className="derive-quiz-question"><strong>{idx + 1}. {q.question}</strong></p>
-                            <div className="derive-quiz-options">
-                              {q.options.map((opt) => {
-                                const letter = opt.charAt(0);
-                                const isSelected = quizAnswers[idx] === letter;
-                                const isCorrect = letter === q.answer;
-                                const revealed = quizRevealed[idx];
-                                let cls = "derive-quiz-option";
-                                if (revealed && isCorrect) cls += " derive-quiz-correct";
-                                else if (revealed && isSelected && !isCorrect) cls += " derive-quiz-wrong";
-                                else if (isSelected) cls += " derive-quiz-selected";
-                                return (
+                {deriveView === "quiz" && (
+                  <div className="derive-content">
+                    {derivedQuiz ? (
+                      <>
+                        <div className="derive-quiz-list">
+                          {((derivedQuiz.data as { questions?: QuizQuestion[] }).questions ?? []).map(
+                            (q: QuizQuestion, idx: number) => (
+                              <div key={idx} className="derive-quiz-item card glass-panel">
+                                <p className="derive-quiz-question"><strong>{idx + 1}. {q.question}</strong></p>
+                                <div className="derive-quiz-options">
+                                  {q.options.map((opt) => {
+                                    const letter = opt.charAt(0);
+                                    const isSelected = quizAnswers[idx] === letter;
+                                    const isCorrect = letter === q.answer;
+                                    const revealed = quizRevealed[idx];
+                                    let cls = "derive-quiz-option";
+                                    if (revealed && isCorrect) cls += " derive-quiz-correct";
+                                    else if (revealed && isSelected && !isCorrect) cls += " derive-quiz-wrong";
+                                    else if (isSelected) cls += " derive-quiz-selected";
+                                    return (
+                                      <button
+                                        key={opt}
+                                        type="button"
+                                        className={cls}
+                                        onClick={() => setQuizAnswers((prev) => ({ ...prev, [idx]: letter }))}
+                                      >
+                                        {opt}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                                {quizAnswers[idx] && !quizRevealed[idx] && (
                                   <button
-                                    key={opt}
                                     type="button"
-                                    className={cls}
-                                    onClick={() => setQuizAnswers((prev) => ({ ...prev, [idx]: letter }))}
+                                    className="secondary-button"
+                                    onClick={() => setQuizRevealed((prev) => ({ ...prev, [idx]: true }))}
                                   >
-                                    {opt}
+                                    {displayText("查看答案")}
                                   </button>
-                                );
-                              })}
-                            </div>
-                            {quizAnswers[idx] && !quizRevealed[idx] && (
-                              <button
-                                type="button"
-                                className="secondary-button"
-                                onClick={() => setQuizRevealed((prev) => ({ ...prev, [idx]: true }))}
-                              >
-                                {displayText("查看答案")}
-                              </button>
-                            )}
-                            {quizRevealed[idx] && q.explanation && (
-                              <p className="derive-quiz-explanation muted-text">{q.explanation}</p>
-                            )}
-                          </div>
-                        ),
-                      )}
-                    </div>
-                    <div className="header-actions" style={{ marginTop: 12 }}>
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() => void handleExportDerived(derivedQuiz.id, `${derivedQuiz.title}.txt`)}
-                      >
-                        {displayText("导出 Anki")}
-                      </button>
-                      <button
-                        type="button"
-                        className="danger-button"
-                        onClick={async () => {
-                          await deleteDerivedMutation.mutateAsync(derivedQuiz.id);
-                          setQuizAnswers({});
-                          setQuizRevealed({});
-                          quizMutation.mutate();
-                        }}
-                        disabled={deleteDerivedMutation.isPending || quizMutation.isPending}
-                      >
-                        {displayText("重新生成")}
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <div className="derive-empty">
-                    <p className="muted-text">{displayText("还没有测验题，点击生成。")}</p>
-                    <button
-                      type="button"
-                      className="primary-button"
-                      disabled={quizMutation.isPending}
-                      onClick={() => quizMutation.mutate()}
-                    >
-                      {quizMutation.isPending ? displayText("生成中...") : displayText("生成测验")}
-                    </button>
-                    {quizMutation.isError && (
-                      <p className="muted-text" style={{ color: "var(--error)" }}>
-                        {displayText("生成失败，请检查模型配置。")}
-                      </p>
+                                )}
+                                {quizRevealed[idx] && q.explanation && (
+                                  <p className="derive-quiz-explanation muted-text">{q.explanation}</p>
+                                )}
+                              </div>
+                            ),
+                          )}
+                        </div>
+                        <div className="header-actions" style={{ marginTop: 12 }}>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => void handleExportDerived(derivedQuiz.id, `${derivedQuiz.title}.txt`)}
+                          >
+                            {displayText("导出 Anki")}
+                          </button>
+                          <button
+                            type="button"
+                            className="danger-button"
+                            onClick={async () => {
+                              await deleteDerivedMutation.mutateAsync(derivedQuiz.id);
+                              setQuizAnswers({});
+                              setQuizRevealed({});
+                              quizMutation.mutate();
+                            }}
+                            disabled={deleteDerivedMutation.isPending || quizMutation.isPending}
+                          >
+                            {displayText("重新生成")}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="derive-empty">
+                        <p className="muted-text">{displayText("还没有测验题，点击生成。")}</p>
+                        <button
+                          type="button"
+                          className="primary-button"
+                          disabled={quizMutation.isPending}
+                          onClick={() => quizMutation.mutate()}
+                        >
+                          {quizMutation.isPending ? displayText("生成中...") : displayText("生成测验")}
+                        </button>
+                        {quizMutation.isError && (
+                          <p className="muted-text" style={{ color: "var(--error)" }}>
+                            {displayText("生成失败，请检查模型配置。")}
+                          </p>
+                        )}
+                      </div>
                     )}
                   </div>
                 )}
               </div>
-            )}
+              )}
+            </div>
           </article>
 
           <article className="card detail-section-card glass-panel">

@@ -4,6 +4,7 @@ import json
 import base64
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ def run() -> dict:
     from zhiku_api.main import create_app
     from zhiku_api.repositories import LibraryRepository
     from zhiku_api.services import DiagnosticsService, ImportService
+    from zhiku_api.services.bilibili_service import BilibiliService, BilibiliVideo, TranscriptSegment
 
     sample_file = base_dir / 'sample.md'
     sample_file.write_text(
@@ -41,6 +43,10 @@ def run() -> dict:
     app = create_app()
     client = TestClient(app)
     steps: list[dict[str, int | str]] = []
+    static_probe_dir = knowledge_dir / 'static' / 'selftest'
+    static_probe_dir.mkdir(parents=True, exist_ok=True)
+    static_probe_file = static_probe_dir / 'ok.txt'
+    static_probe_file.write_text('ok', encoding='utf-8')
 
     def check(name: str, method: str, url: str, **kwargs) -> dict | str:
         response = client.request(method, url, **kwargs)
@@ -51,7 +57,131 @@ def run() -> dict:
             return response.json()
         return response.text
 
+    def run_bilinote_screenshot_marker_smoke() -> None:
+        service = BilibiliService(settings=settings)
+        source_url = 'https://www.bilibili.com/video/BV1SELFTEST1/?p=1'
+        capture_state = {
+            'label': '已建立时间化正文',
+            'summary': 'selftest marker smoke',
+            'recommended_action': None,
+        }
+        video = BilibiliVideo(
+            bvid='BV1SELFTEST1',
+            cid=1001,
+            title='BiliNote Screenshot Smoke',
+            author='selftest',
+            description='',
+            cover=None,
+            duration=12,
+            view=1,
+            like=1,
+            pubdate=None,
+            tag_name=None,
+        )
+        transcript_segments = [
+            TranscriptSegment(
+                start_ms=1000,
+                end_ms=3500,
+                text='第一段展示重点界面与交互入口，适合作为关键画面示例。',
+                source_kind='subtitle',
+                quality_level='high',
+            ),
+            TranscriptSegment(
+                start_ms=5000,
+                end_ms=7600,
+                text='第二段展示下一步操作和结果反馈，适合作为第二张关键画面。',
+                source_kind='subtitle',
+                quality_level='high',
+            ),
+        ]
+        note_markdown = service._build_bilinote_markdown(
+            video=video,
+            source_url=source_url,
+            summary='自测摘要',
+            key_points=['第一段重点', '第二段重点'],
+            content_text='用于验证截图 marker 替换链路。',
+            transcript_segments=transcript_segments,
+            transcript_source='subtitle',
+            capture_state=capture_state,
+            timestamps_available=True,
+            timestamps_estimated=False,
+            summary_focus='',
+        )
+        if 'Screenshot-[' not in note_markdown:
+            raise RuntimeError('bilinote_screenshot_marker_smoke did not insert screenshot markers')
+
+        stripped_markdown = service._strip_screenshot_markers_from_note_markdown(note_markdown)
+        if 'Screenshot-[' in stripped_markdown:
+            raise RuntimeError('bilinote_screenshot_marker_smoke did not strip screenshot markers')
+
+        ffmpeg_binary = service._resolve_ffmpeg_binary()
+        if not ffmpeg_binary:
+            raise RuntimeError('bilinote_screenshot_marker_smoke missing ffmpeg binary')
+
+        smoke_dir = base_dir / 'bilibili_screenshot_smoke'
+        smoke_dir.mkdir(parents=True, exist_ok=True)
+        smoke_video_path = smoke_dir / 'marker-smoke.mp4'
+        render_result = subprocess.run(
+            [
+                ffmpeg_binary,
+                '-loglevel',
+                'error',
+                '-y',
+                '-f',
+                'lavfi',
+                '-i',
+                'testsrc=size=640x360:rate=24:d=4',
+                '-pix_fmt',
+                'yuv420p',
+                str(smoke_video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        if render_result.returncode != 0 or not smoke_video_path.exists():
+            stderr = (render_result.stderr or '').strip()
+            raise RuntimeError(f'bilinote_screenshot_marker_smoke failed to create source video: {stderr}')
+
+        candidates = service._build_note_screenshot_candidates(
+            source_url=source_url,
+            transcript_segments=transcript_segments,
+            note_markdown=note_markdown,
+        )
+        if not candidates:
+            raise RuntimeError('bilinote_screenshot_marker_smoke did not build screenshot candidates')
+        if not all(candidate.get('marker') for candidate in candidates):
+            raise RuntimeError('bilinote_screenshot_marker_smoke did not preserve marker metadata')
+
+        screenshots = service._generate_note_screenshots(
+            video=video,
+            video_path=smoke_video_path,
+            ffmpeg_binary=ffmpeg_binary,
+            candidates=candidates,
+        )
+        if not screenshots:
+            raise RuntimeError('bilinote_screenshot_marker_smoke did not generate screenshots')
+
+        first_image_path = Path(str(screenshots[0].get('image_path') or ''))
+        if not first_image_path.exists():
+            raise RuntimeError('bilinote_screenshot_marker_smoke screenshot file missing on disk')
+
+        injected_markdown = service._inject_screenshots_into_note_markdown(
+            note_markdown,
+            screenshots=screenshots,
+        )
+        if 'Screenshot-[' in injected_markdown:
+            raise RuntimeError('bilinote_screenshot_marker_smoke left raw screenshot markers in markdown')
+        if '![' not in injected_markdown:
+            raise RuntimeError('bilinote_screenshot_marker_smoke did not inject image markdown')
+
+        steps.append({'name': 'bilinote_screenshot_marker_smoke', 'status': 200})
+
     health = check('health', 'GET', '/api/v1/health')
+    static_asset = check('static_asset', 'GET', '/static/selftest/ok.txt')
+    if str(static_asset).strip() != 'ok':
+        raise RuntimeError('static_asset did not return expected content')
     system_status = check('system_status', 'GET', '/api/v1/system/status')
     if 'asr' not in system_status:
         raise RuntimeError('system_status missing asr payload')
@@ -94,6 +224,34 @@ def run() -> dict:
     search = check('search_contents', 'GET', '/api/v1/contents', params={'q': '盘符医生'})
     if search['total'] < 1:
         raise RuntimeError('search_contents returned no matches')
+
+    reparsed = check(
+        'reparse_content',
+        'POST',
+        f'/api/v1/contents/{content_id}/reparse',
+        json={'note_style': 'brief', 'summary_focus': '自测重解析'},
+    )
+    reparsed_metadata = (reparsed.get('content', {}).get('metadata', {})) or {}
+    reparsed_versions = reparsed_metadata.get('note_versions') or []
+    if not reparsed_versions:
+        raise RuntimeError('reparse_content did not persist note_versions history')
+    first_version = reparsed_versions[0]
+    if first_version.get('note_style') != 'structured':
+        raise RuntimeError('reparse_content note_versions missing previous note_style snapshot')
+    if reparsed_metadata.get('note_style') != 'brief':
+        raise RuntimeError('reparse_content did not apply requested note_style')
+    restored_version = check(
+        'restore_note_version',
+        'POST',
+        f'/api/v1/contents/{content_id}/restore-note-version',
+        json={'version_id': first_version['id']},
+    )
+    restored_metadata = (restored_version.get('content', {}).get('metadata', {})) or {}
+    if restored_metadata.get('note_style') != 'structured':
+        raise RuntimeError('restore_note_version did not restore previous note_style')
+    restored_versions = restored_metadata.get('note_versions') or []
+    if not restored_versions:
+        raise RuntimeError('restore_note_version did not preserve history after restoring')
 
     chat = check('chat_once', 'POST', '/api/v1/chat', json={'query': '盘符医生', 'limit': 3})
     if not chat['citations']:
@@ -316,6 +474,8 @@ def run() -> dict:
         raise RuntimeError('chat_quality_rank did not return both rank test citations')
     if float(ready_citation.get('score', 0)) <= float(blocked_citation.get('score', 0)):
         raise RuntimeError('chat_quality_rank did not prefer ready content over blocked content')
+
+    run_bilinote_screenshot_marker_smoke()
 
     stream = client.post('/api/v1/chat/stream', json={'query': '盘符医生', 'limit': 3})
     if stream.status_code != 200 or 'event: done' not in stream.text:

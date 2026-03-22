@@ -383,6 +383,13 @@ class LlmGateway:
             return None
 
         truncated = source[:8000]
+        style_instruction = ""
+        if note_style == "bilinote":
+            style_instruction = (
+                "当笔记风格为 BiliNote 风格时，请让 summary 更像视频笔记开场摘要，"
+                "让 key_points 更像“看完后最值得记住的几条内容”，"
+                "整体语气偏成品笔记，方便直接阅读和复习。"
+            )
         prompt = (
             "你是产品内的知识笔记整理助手，目标不是复述，而是把原始内容整理成真正对用户有用的笔记。\n"
             "请严格基于给定正文，不要编造原文没有的事实，不要补外部背景设定。\n"
@@ -402,6 +409,7 @@ class LlmGateway:
             "## 可执行建议\n"
             "## 原始信息保留\n"
             "如果正文不足，就明确写“当前正文不足，只能先保留已获取信息”，不要硬编。\n\n"
+            f"{style_instruction}\n"
             f"标题：{title}\n"
             f"作者：{author or '-'}\n"
             f"链接：{source_url}\n"

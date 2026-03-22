@@ -3,11 +3,17 @@
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from html import unescape
+from http.cookies import SimpleCookie
 import json
+import os
+from pathlib import Path
 import re
+import shutil
+import subprocess
+import tempfile
 from typing import Any, Callable
 
-from ..config import AppSettings
+from ..config import AppSettings, REPO_ROOT
 from .asr_gateway import AsrGateway
 from .asr_runtime_service import AsrRuntimeService
 from .bilibili_client import BilibiliHttpClient, BilibiliParseError as _BilibiliParseError
@@ -17,13 +23,40 @@ from .llm_gateway import LlmGateway
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+try:
+    import yt_dlp
+except Exception:  # pragma: no cover - optional runtime dependency
+    yt_dlp = None
+
 
 BVID_PATTERN = re.compile(r"(BV[0-9A-Za-z]+)", re.IGNORECASE)
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+SRT_BLOCK_PATTERN = re.compile(
+    r"(\d+)\s*\n"
+    r"(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})[^\n]*\n"
+    r"(.*?)(?=\n{2,}\d+\s*\n|\Z)",
+    re.DOTALL,
+)
+VTT_BLOCK_PATTERN = re.compile(
+    r"(?:(\d+)\s*\n)?"
+    r"(\d{2}:\d{2}:\d{2}[.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.]\d{3})[^\n]*\n"
+    r"(.*?)(?=\n{2,}(?:\d+\s*\n)?\d{2}:\d{2}:\d{2}[.]\d{3}\s*-->|$)",
+    re.DOTALL,
+)
+YTDLP_SUBTITLE_LANGS = (
+    "zh-Hans",
+    "zh-CN",
+    "zh",
+    "zh-Hant",
+    "ai-zh",
+    "en",
+    "en-US",
+)
 BILIBILI_BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 )
+DEFAULT_BILINOTE_SCREENSHOT_LIMIT = 4
 
 
 class BilibiliParseError(RuntimeError):
@@ -60,6 +93,13 @@ class SubtitleFetchResult:
     subtitle_count: int
     need_login: bool
     preview_toast: str | None
+    strategy: str = "native_api"
+
+
+@dataclass
+class AudioFetchResult:
+    url: str | None
+    strategy: str = "native_api"
 
 
 class BilibiliService:
@@ -121,6 +161,8 @@ class BilibiliService:
         subtitle_error: str | None = None
         asr_error: str | None = None
         audio_source_url: str | None = None
+        subtitle_fetch_strategy = "native_api"
+        audio_fetch_strategy = "native_api"
         subtitle_need_login = False
         subtitle_preview_toast: str | None = None
         video, parse_mode, metadata_fetch_errors = self._resolve_video_metadata(
@@ -131,11 +173,12 @@ class BilibiliService:
         )
 
         try:
-            subtitle_result = self._fetch_subtitle_segments(video.bvid, video.cid)
+            subtitle_result = self._fetch_subtitle_segments(video.bvid, video.cid, page_number=selected_page)
             transcript_segments = subtitle_result.segments
             subtitle_count = subtitle_result.subtitle_count
             subtitle_need_login = subtitle_result.need_login
             subtitle_preview_toast = subtitle_result.preview_toast
+            subtitle_fetch_strategy = subtitle_result.strategy
         except BilibiliParseError as exc:
             transcript_segments, subtitle_count = [], 0
             subtitle_error = str(exc)
@@ -157,7 +200,9 @@ class BilibiliService:
 
         if not transcript_segments:
             try:
-                audio_source_url = self._fetch_audio_url(video.bvid, video.cid)
+                audio_result = self._fetch_audio_url(video.bvid, video.cid, page_number=selected_page)
+                audio_source_url = audio_result.url
+                audio_fetch_strategy = audio_result.strategy
                 if audio_source_url and self.asr_gateway is not None and self.asr_gateway.is_enabled():
                     asr_result = self._transcribe_bilibili_audio(
                         audio_source_url,
@@ -298,7 +343,39 @@ class BilibiliService:
         if llm_enhanced is not None:
             summary = llm_enhanced.get("summary") or summary
             key_points = llm_enhanced.get("key_points") or key_points
-            note_markdown = llm_enhanced.get("note_markdown") or note_markdown
+            if note_style == "bilinote":
+                note_markdown = self._build_note_markdown(
+                    video,
+                    canonical_source_url,
+                    summary,
+                    key_points,
+                    content_text,
+                    transcript_segments=transcript_segments,
+                    note_style=note_style,
+                    summary_focus=summary_focus,
+                    transcript_source=transcript_source,
+                    capture_state=capture_state,
+                    timestamps_available=timestamps_available,
+                    timestamps_estimated=timestamps_estimated,
+                )
+            else:
+                note_markdown = llm_enhanced.get("note_markdown") or note_markdown
+
+        screenshot_bundle = self._build_note_screenshot_bundle(
+            video=video,
+            source_url=canonical_source_url,
+            transcript_segments=transcript_segments,
+            note_style=note_style,
+            note_markdown=note_markdown,
+        )
+        note_screenshots = screenshot_bundle["items"]
+        if note_screenshots:
+            note_markdown = self._inject_screenshots_into_note_markdown(
+                note_markdown,
+                screenshots=note_screenshots,
+            )
+        else:
+            note_markdown = self._strip_screenshot_markers_from_note_markdown(note_markdown)
 
         return {
             "source_type": "url",
@@ -331,10 +408,14 @@ class BilibiliService:
                 "subtitle_error": subtitle_error,
                 "subtitle_login_required": subtitle_need_login,
                 "subtitle_preview_toast": subtitle_preview_toast,
+                "subtitle_fetch_strategy": subtitle_fetch_strategy,
+                "subtitle_ytdlp_fallback_used": subtitle_fetch_strategy == "yt_dlp",
                 "asr_error": asr_error,
                 "asr_used": asr_used,
                 "audio_source_url": audio_source_url,
                 "audio_available": audio_available,
+                "audio_fetch_strategy": audio_fetch_strategy,
+                "audio_ytdlp_fallback_used": audio_fetch_strategy == "yt_dlp",
                 "asr_configured": asr_configured,
                 "asr_selected": asr_status["selected"],
                 "asr_config_mode": self.settings.asr_config_mode if self.settings is not None else "disabled",
@@ -374,6 +455,10 @@ class BilibiliService:
                 "capture_summary": capture_state["summary"],
                 "capture_recommended_action": capture_state["recommended_action"],
                 "capture_blocked_reason": capture_state["blocked_reason"],
+                "note_screenshots": note_screenshots,
+                "note_screenshots_count": len(note_screenshots),
+                "note_screenshots_status": screenshot_bundle["status"],
+                "note_screenshots_summary": screenshot_bundle["summary"],
                 "model_provider": self.settings.model_provider if self.settings is not None else "builtin",
                 "cookie_enabled": cookie_enabled,
                 "cookie_active": cookie_active,
@@ -385,6 +470,7 @@ class BilibiliService:
                 "browser_bridge_enabled": auth_state.browser_bridge_enabled,
                 "browser_bridge_active": auth_state.browser_bridge_active,
                 "browser_bridge_source_label": auth_state.browser_bridge_source_label,
+                "yt_dlp_available": yt_dlp is not None,
                 "semantic_transcript_ready": bool(semantic_transcript_segments),
                 "semantic_transcript_segments": [
                     self._serialize_segment(item, canonical_source_url) for item in semantic_transcript_segments
@@ -417,6 +503,7 @@ class BilibiliService:
         subtitle_need_login = False
         subtitle_preview_toast: str | None = None
         subtitle_error: str | None = None
+        subtitle_fetch_strategy = "native_api"
         timestamps_available = False
         if video.cid:
             try:
@@ -427,12 +514,28 @@ class BilibiliService:
                 timestamps_available = subtitle_count > 0
             except BilibiliParseError as exc:
                 subtitle_error = str(exc)
+            if subtitle_count == 0:
+                try:
+                    subtitle_result = self._fetch_subtitle_segments(video.bvid, video.cid, page_number=selected_page)
+                    if subtitle_result.segments:
+                        subtitle_count = max(subtitle_count, subtitle_result.subtitle_count, 1)
+                        subtitle_need_login = bool(subtitle_result.need_login)
+                        subtitle_preview_toast = subtitle_result.preview_toast or subtitle_preview_toast
+                        subtitle_fetch_strategy = subtitle_result.strategy
+                        timestamps_available = True
+                        subtitle_error = None
+                except BilibiliParseError as exc:
+                    if subtitle_error is None:
+                        subtitle_error = str(exc)
 
         audio_available = False
         audio_error: str | None = None
+        audio_fetch_strategy = "native_api"
         if video.cid:
             try:
-                audio_available = bool(self._fetch_audio_url(video.bvid, video.cid))
+                audio_result = self._fetch_audio_url(video.bvid, video.cid, page_number=selected_page)
+                audio_available = bool(audio_result.url)
+                audio_fetch_strategy = audio_result.strategy
             except BilibiliParseError as exc:
                 audio_error = str(exc)
 
@@ -473,8 +576,12 @@ class BilibiliService:
             "subtitle_login_required": subtitle_need_login,
             "subtitle_preview_toast": subtitle_preview_toast,
             "subtitle_error": subtitle_error,
+            "subtitle_fetch_strategy": subtitle_fetch_strategy,
+            "subtitle_ytdlp_fallback_used": subtitle_fetch_strategy == "yt_dlp",
             "audio_available": audio_available,
             "audio_error": audio_error,
+            "audio_fetch_strategy": audio_fetch_strategy,
+            "audio_ytdlp_fallback_used": audio_fetch_strategy == "yt_dlp",
             "cookie_enabled": cookie_enabled,
             "cookie_active": cookie_active,
             "cookie_stored": cookie_stored,
@@ -494,6 +601,7 @@ class BilibiliService:
             "asr_local_engine": asr_status["local_engine"],
             "asr_runtime_summary": asr_status["runtime_summary"],
             "timestamps_available": timestamps_available,
+            "yt_dlp_available": yt_dlp is not None,
             "predicted_status": predicted_status,
             "predicted_quality": predicted_quality,
             "predicted_summary": predicted_summary,
@@ -872,23 +980,36 @@ class BilibiliService:
             pubdate=None,
             tag_name=None,
         )
-
-
-    def _fetch_audio_url(self, bvid: str, cid: int) -> str | None:
+    def _fetch_audio_url(self, bvid: str, cid: int, *, page_number: int | None = None) -> AudioFetchResult:
         if not cid:
             raise BilibiliParseError("当前视频缺少 cid，无法获取音频地址")
 
-        payload = self._json_fetcher(
-            f"https://api.bilibili.com/x/player/playurl?{urlencode({'bvid': bvid, 'cid': cid, 'fnval': 16})}"
-        )
-        data = payload.get("data") or {}
-        dash = data.get("dash") or {}
-        audio_items = dash.get("audio") or []
-        if not audio_items:
-            raise BilibiliParseError("当前视频未返回可用音频流")
+        native_error: BilibiliParseError | None = None
+        try:
+            payload = self._json_fetcher(
+                f"https://api.bilibili.com/x/player/playurl?{urlencode({'bvid': bvid, 'cid': cid, 'fnval': 16})}"
+            )
+            data = payload.get("data") or {}
+            dash = data.get("dash") or {}
+            audio_items = dash.get("audio") or []
+            if audio_items:
+                primary_audio = audio_items[0]
+                audio_url = primary_audio.get("baseUrl") or primary_audio.get("base_url")
+                if isinstance(audio_url, str) and audio_url.strip():
+                    return AudioFetchResult(url=audio_url.strip(), strategy="native_api")
+            native_error = BilibiliParseError("当前视频未返回可用音频流")
+        except BilibiliParseError as exc:
+            native_error = exc
 
-        primary_audio = audio_items[0]
-        return primary_audio.get("baseUrl") or primary_audio.get("base_url")
+        fallback_url = self._fetch_audio_url_via_ytdlp(
+            self._build_canonical_video_url(bvid, page_number),
+        )
+        if fallback_url:
+            return AudioFetchResult(url=fallback_url, strategy="yt_dlp")
+
+        if native_error is not None:
+            raise native_error
+        raise BilibiliParseError("当前视频未返回可用音频流")
 
     def _fetch_subtitle_overview(self, bvid: str, cid: int) -> dict[str, Any]:
         if not cid:
@@ -912,10 +1033,27 @@ class BilibiliService:
             "preview_toast": str(preview_toast).strip() if isinstance(preview_toast, str) and preview_toast.strip() else None,
         }
 
-    def _fetch_subtitle_segments(self, bvid: str, cid: int) -> SubtitleFetchResult:
+    def _fetch_subtitle_segments(self, bvid: str, cid: int, *, page_number: int | None = None) -> SubtitleFetchResult:
         if not cid:
             return SubtitleFetchResult(segments=[], subtitle_count=0, need_login=False, preview_toast=None)
 
+        native_result = self._fetch_native_subtitle_segments(bvid, cid)
+        if native_result.segments:
+            return native_result
+
+        fallback_result = self._fetch_subtitle_segments_via_ytdlp(
+            self._build_canonical_video_url(bvid, page_number),
+            need_login=native_result.need_login,
+            preview_toast=native_result.preview_toast,
+        )
+        if fallback_result is not None and fallback_result.segments:
+            if fallback_result.subtitle_count <= 0:
+                fallback_result.subtitle_count = max(native_result.subtitle_count, 1)
+            return fallback_result
+
+        return native_result
+
+    def _fetch_native_subtitle_segments(self, bvid: str, cid: int) -> SubtitleFetchResult:
         subtitle_overview = self._fetch_subtitle_overview(bvid, cid)
         subtitle_items = subtitle_overview["items"]
         need_login = bool(subtitle_overview["need_login"])
@@ -956,6 +1094,7 @@ class BilibiliService:
             subtitle_count=len(subtitle_items),
             need_login=need_login,
             preview_toast=preview_toast,
+            strategy="native_api",
         )
 
     def _pick_preferred_subtitle(self, subtitle_items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -966,6 +1105,386 @@ class BilibiliService:
             return chinese_score, manual_score
 
         return max(subtitle_items, key=score)
+
+    def _fetch_subtitle_segments_via_ytdlp(
+        self,
+        video_url: str,
+        *,
+        need_login: bool,
+        preview_toast: str | None,
+    ) -> SubtitleFetchResult | None:
+        if yt_dlp is None:
+            return None
+
+        with tempfile.TemporaryDirectory(prefix="zhiku-ytdlp-subtitle-") as temp_dir:
+            runtime_dir = Path(temp_dir)
+            ydl_opts: dict[str, Any] = {
+                "skip_download": True,
+                "outtmpl": str(runtime_dir / "%(id)s.%(ext)s"),
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "http_headers": self._http.build_headers(),
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": list(YTDLP_SUBTITLE_LANGS),
+                "subtitlesformat": "srt/json3/best",
+            }
+            cookiefile = self._resolve_ytdlp_cookiefile(runtime_dir)
+            if cookiefile:
+                ydl_opts["cookiefile"] = cookiefile
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=True)
+            except Exception:
+                return None
+
+            if not isinstance(info, dict):
+                return None
+
+            requested_subtitles = info.get("requested_subtitles")
+            subtitle_pool = requested_subtitles if isinstance(requested_subtitles, dict) else {}
+            if not subtitle_pool:
+                subtitle_pool = self._collect_ytdlp_subtitle_candidates(info)
+            if not subtitle_pool:
+                return None
+
+            selected_lang, selected_subtitle = self._pick_preferred_ytdlp_subtitle(subtitle_pool)
+            if not isinstance(selected_subtitle, dict):
+                return None
+
+            subtitle_text = self._read_ytdlp_subtitle_content(
+                selected_subtitle,
+                video_id=str(info.get("id") or "").strip(),
+                language=selected_lang,
+                runtime_dir=runtime_dir,
+            )
+            if not subtitle_text:
+                return None
+
+            subtitle_ext = str(selected_subtitle.get("ext") or "").strip().lower()
+            if subtitle_ext == "json3":
+                segments = self._parse_json3_segments(subtitle_text)
+            elif subtitle_ext == "vtt":
+                segments = self._parse_vtt_segments(subtitle_text)
+            else:
+                segments = self._parse_srt_segments(subtitle_text)
+            if not segments:
+                return None
+
+            return SubtitleFetchResult(
+                segments=segments,
+                subtitle_count=max(len(subtitle_pool), 1),
+                need_login=need_login,
+                preview_toast=preview_toast,
+                strategy="yt_dlp",
+            )
+
+    def _fetch_audio_url_via_ytdlp(self, video_url: str) -> str | None:
+        info = self._extract_ytdlp_video_info(
+            video_url,
+            download=False,
+            options={
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+            },
+        )
+        if not isinstance(info, dict):
+            return None
+        return self._pick_ytdlp_audio_url(info)
+
+    def _extract_ytdlp_video_info(
+        self,
+        video_url: str,
+        *,
+        download: bool,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if yt_dlp is None:
+            return None
+
+        with tempfile.TemporaryDirectory(prefix="zhiku-ytdlp-") as temp_dir:
+            runtime_dir = Path(temp_dir)
+            ydl_opts: dict[str, Any] = {
+                "skip_download": True,
+                "outtmpl": str(runtime_dir / "%(id)s.%(ext)s"),
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "http_headers": self._http.build_headers(),
+            }
+            if options:
+                ydl_opts.update(options)
+
+            cookiefile = self._resolve_ytdlp_cookiefile(runtime_dir)
+            if cookiefile:
+                ydl_opts["cookiefile"] = cookiefile
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(video_url, download=download)
+            except Exception:
+                return None
+
+    def _resolve_ytdlp_cookiefile(self, runtime_dir: Path) -> str | None:
+        configured_cookie_file = self.settings.bilibili_cookie_file.strip() if self.settings is not None else ""
+        if configured_cookie_file:
+            candidate = Path(configured_cookie_file)
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+
+        cookie_header = (self._http.cookie or "").strip()
+        if not cookie_header:
+            return None
+
+        cookies = SimpleCookie()
+        try:
+            cookies.load(cookie_header)
+        except Exception:
+            return None
+        if not cookies:
+            return None
+
+        cookie_path = runtime_dir / "bilibili.cookies.txt"
+        lines = ["# Netscape HTTP Cookie File", ""]
+        for morsel in cookies.values():
+            lines.append(
+                "\t".join(
+                    [
+                        ".bilibili.com",
+                        "TRUE",
+                        "/",
+                        "FALSE",
+                        "0",
+                        morsel.key,
+                        morsel.value,
+                    ]
+                )
+            )
+        cookie_path.write_text("\n".join(lines), encoding="utf-8")
+        return str(cookie_path)
+
+    def _collect_ytdlp_subtitle_candidates(self, info: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        collected: dict[str, dict[str, Any]] = {}
+        for key in ("subtitles", "automatic_captions"):
+            group = info.get(key)
+            if not isinstance(group, dict):
+                continue
+            for language, items in group.items():
+                if language == "danmaku" or not isinstance(items, list) or not items:
+                    continue
+                preferred_item = max(
+                    (item for item in items if isinstance(item, dict)),
+                    key=lambda item: self._score_ytdlp_subtitle_candidate(language, item),
+                    default=None,
+                )
+                if preferred_item is not None:
+                    collected[language] = preferred_item
+        return collected
+
+    def _pick_preferred_ytdlp_subtitle(
+        self,
+        subtitle_pool: dict[str, dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        def score(entry: tuple[str, dict[str, Any]]) -> tuple[int, int]:
+            language, item = entry
+            return (
+                self._score_subtitle_language(language),
+                self._score_ytdlp_subtitle_candidate(language, item),
+            )
+
+        return max(subtitle_pool.items(), key=score)
+
+    def _score_ytdlp_subtitle_candidate(self, language: str, item: dict[str, Any]) -> int:
+        ext = str(item.get("ext") or "").strip().lower()
+        ext_score = {"json3": 3, "srt": 2, "vtt": 1}.get(ext, 0)
+        language_score = self._score_subtitle_language(language)
+        return language_score * 10 + ext_score
+
+    def _score_subtitle_language(self, value: str) -> int:
+        normalized = value.lower()
+        if any(token in normalized for token in ("zh-hans", "zh-cn", "zh", "中文", "汉")):
+            return 4
+        if "hant" in normalized:
+            return 3
+        if normalized.startswith("en"):
+            return 1
+        return 0
+
+    def _read_ytdlp_subtitle_content(
+        self,
+        subtitle_info: dict[str, Any],
+        *,
+        video_id: str,
+        language: str,
+        runtime_dir: Path | None = None,
+    ) -> str:
+        inline_data = subtitle_info.get("data")
+        if isinstance(inline_data, str) and inline_data.strip():
+            return inline_data
+
+        requested_path = subtitle_info.get("filepath")
+        if isinstance(requested_path, str) and requested_path.strip():
+            path = Path(requested_path)
+            if not path.is_absolute() and runtime_dir is not None:
+                path = runtime_dir / path
+            if path.exists() and path.is_file():
+                return path.read_text(encoding="utf-8", errors="ignore")
+
+        ext = str(subtitle_info.get("ext") or "").strip()
+        if video_id and ext:
+            sibling_value = str(subtitle_info.get("_filename") or "").strip()
+            sibling = Path(sibling_value) if sibling_value else None
+            candidates = []
+            if sibling is not None:
+                if not sibling.is_absolute() and runtime_dir is not None:
+                    sibling = runtime_dir / sibling
+                candidates.extend(
+                    [
+                        sibling.with_name(f"{video_id}.{language}.{ext}"),
+                        sibling.with_name(f"{video_id}.{ext}"),
+                    ]
+                )
+            if runtime_dir is not None:
+                candidates.extend(
+                    [
+                        runtime_dir / f"{video_id}.{language}.{ext}",
+                        runtime_dir / f"{video_id}.{ext}",
+                    ]
+                )
+            for candidate in candidates:
+                if candidate.exists() and candidate.is_file():
+                    return candidate.read_text(encoding="utf-8", errors="ignore")
+        return ""
+
+    def _pick_ytdlp_audio_url(self, info: dict[str, Any]) -> str | None:
+        direct_url = str(info.get("url") or "").strip()
+        if direct_url:
+            return direct_url
+
+        for key in ("requested_downloads", "requested_formats", "formats"):
+            items = info.get(key)
+            if not isinstance(items, list):
+                continue
+            audio_item = max(
+                (item for item in items if isinstance(item, dict) and self._is_ytdlp_audio_candidate(item)),
+                key=self._score_ytdlp_audio_candidate,
+                default=None,
+            )
+            if audio_item is not None:
+                audio_url = str(audio_item.get("url") or "").strip()
+                if audio_url:
+                    return audio_url
+        return None
+
+    def _is_ytdlp_audio_candidate(self, item: dict[str, Any]) -> bool:
+        audio_url = str(item.get("url") or "").strip()
+        if not audio_url:
+            return False
+        vcodec = str(item.get("vcodec") or "").strip().lower()
+        acodec = str(item.get("acodec") or "").strip().lower()
+        if vcodec == "none" and acodec not in {"", "none"}:
+            return True
+        return bool(item.get("abr"))
+
+    def _score_ytdlp_audio_candidate(self, item: dict[str, Any]) -> tuple[int, int, float, float]:
+        vcodec = str(item.get("vcodec") or "").strip().lower()
+        acodec = str(item.get("acodec") or "").strip().lower()
+        ext = str(item.get("ext") or "").strip().lower()
+        audio_only = 2 if vcodec == "none" and acodec not in {"", "none"} else 0
+        ext_score = 1 if ext in {"m4a", "aac", "mp3"} else 0
+        abr = float(item.get("abr") or 0)
+        preference = float(item.get("preference") or 0)
+        return audio_only, ext_score, abr, preference
+
+    def _parse_srt_segments(self, subtitle_text: str) -> list[TranscriptSegment]:
+        segments: list[TranscriptSegment] = []
+        for match in SRT_BLOCK_PATTERN.finditer(subtitle_text.strip()):
+            text = self._clean_subtitle_text(match.group(4))
+            if not text:
+                continue
+            segments.append(
+                TranscriptSegment(
+                    start_ms=self._parse_subtitle_timestamp(match.group(2)),
+                    end_ms=self._parse_subtitle_timestamp(match.group(3)),
+                    text=text,
+                    source_kind="subtitle",
+                    quality_level="high",
+                )
+            )
+        return self._compact_segments(self._dedupe_segments(segments))
+
+    def _parse_vtt_segments(self, subtitle_text: str) -> list[TranscriptSegment]:
+        segments: list[TranscriptSegment] = []
+        normalized_text = subtitle_text.replace("\r\n", "\n").replace("\r", "\n")
+        for match in VTT_BLOCK_PATTERN.finditer(normalized_text.strip()):
+            text = self._clean_subtitle_text(match.group(4))
+            if not text:
+                continue
+            segments.append(
+                TranscriptSegment(
+                    start_ms=self._parse_subtitle_timestamp(match.group(2)),
+                    end_ms=self._parse_subtitle_timestamp(match.group(3)),
+                    text=text,
+                    source_kind="subtitle",
+                    quality_level="high",
+                )
+            )
+        return self._compact_segments(self._dedupe_segments(segments))
+
+    def _parse_json3_segments(self, subtitle_text: str) -> list[TranscriptSegment]:
+        try:
+            payload = json.loads(subtitle_text)
+        except Exception:
+            return []
+
+        events = payload.get("events") if isinstance(payload, dict) else None
+        if not isinstance(events, list):
+            return []
+
+        segments: list[TranscriptSegment] = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            segs = event.get("segs")
+            if not isinstance(segs, list):
+                continue
+            text = self._clean_subtitle_text("".join(str(seg.get("utf8") or "") for seg in segs if isinstance(seg, dict)))
+            if not text:
+                continue
+            start_ms = self._coerce_milliseconds(event.get("tStartMs"))
+            duration_ms = self._coerce_milliseconds(event.get("dDurationMs")) or 0
+            end_ms = start_ms + duration_ms if start_ms is not None else None
+            segments.append(
+                TranscriptSegment(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    text=text,
+                    source_kind="subtitle",
+                    quality_level="high",
+                )
+            )
+        return self._compact_segments(self._dedupe_segments(segments))
+
+    def _clean_subtitle_text(self, value: str) -> str:
+        cleaned = re.sub(r"<[^>]+>", "", value)
+        cleaned = cleaned.replace("&nbsp;", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _parse_subtitle_timestamp(self, value: str) -> int | None:
+        candidate = value.strip().replace(",", ".")
+        parts = candidate.split(":")
+        if len(parts) != 3:
+            return None
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+        except ValueError:
+            return None
+        total_seconds = hours * 3600 + minutes * 60 + seconds
+        return int(total_seconds * 1000)
 
     def _transcribe_bilibili_audio(
         self,
@@ -1022,7 +1541,9 @@ class BilibiliService:
         ]
 
         duration_seconds = int(video.duration or 0)
-        is_long_form = duration_seconds >= 22 * 60
+        # 对本地 CPU 转写来说，8 分钟以上的视频如果跑双策略，用户会明显感觉“卡住”。
+        # 这类场景优先保证有结果和可感知速度，再在短视频上保留第二轮兜底策略。
+        is_long_form = duration_seconds >= 8 * 60
         if not is_long_form:
             strategies.append(
                 {
@@ -1716,6 +2237,21 @@ class BilibiliService:
         timestamps_available: bool,
         timestamps_estimated: bool,
     ) -> str:
+        if note_style == "bilinote":
+            return self._build_bilinote_markdown(
+                video=video,
+                source_url=source_url,
+                summary=summary,
+                key_points=key_points,
+                content_text=content_text,
+                transcript_segments=transcript_segments,
+                transcript_source=transcript_source,
+                capture_state=capture_state,
+                timestamps_available=timestamps_available,
+                timestamps_estimated=timestamps_estimated,
+                summary_focus=summary_focus,
+            )
+
         summary_title = "一句话总结"
         points_title = "核心要点"
         body_title = "视频笔记"
@@ -1796,6 +2332,694 @@ class BilibiliService:
         ])
         return "\n".join(lines)
 
+    def _build_bilinote_markdown(
+        self,
+        *,
+        video: BilibiliVideo,
+        source_url: str,
+        summary: str,
+        key_points: list[str],
+        content_text: str,
+        transcript_segments: list[TranscriptSegment],
+        transcript_source: str,
+        capture_state: dict[str, str | None],
+        timestamps_available: bool,
+        timestamps_estimated: bool,
+        summary_focus: str,
+    ) -> str:
+        timeline_lines = self._build_bilinote_timeline_lines(source_url, transcript_segments)
+        clip_sections = self._build_bilinote_clip_sections(source_url, transcript_segments)
+        capture_label = "已建立估算时间戳" if timestamps_estimated else "已建立时间戳" if timestamps_available else "未建立时间定位"
+
+        lines = [
+            f"# {video.title}",
+            "",
+            "> BiliNote 风格笔记",
+            f"> [打开原视频]({source_url})",
+            f"> 作者：{video.author or '-'} ｜ 时长：{video.duration or '-'} 秒 ｜ 正文来源：{self._label_transcript_source(transcript_source)}",
+            "",
+            "## 视频速览",
+            "",
+            f"- BVID：{video.bvid}",
+            f"- 播放：{video.view or '-'}",
+            f"- 点赞：{video.like or '-'}",
+            f"- 当前状态：{capture_state['label']}",
+            f"- 时间定位：{capture_label}",
+            "",
+        ]
+
+        if summary_focus.strip():
+            lines.extend([
+                "## 本次关注",
+                "",
+                summary_focus.strip(),
+                "",
+            ])
+
+        lines.extend([
+            "## 核心结论",
+            "",
+            summary or "当前还没有足够正文，只能先保留已获取信息。",
+            "",
+            "## 值得记住的内容",
+            "",
+        ])
+
+        if key_points:
+            lines.extend([f"- {item}" for item in key_points])
+        else:
+            lines.append("- 当前没有提炼出稳定要点。")
+
+        if timeline_lines:
+            lines.extend([
+                "",
+                "## 时间线笔记",
+                "",
+                *timeline_lines,
+            ])
+
+        if clip_sections:
+            lines.extend([
+                "",
+                "## 片段整理",
+                "",
+                *clip_sections,
+            ])
+
+        lines.extend([
+            "",
+            "## 实用整理",
+            "",
+            content_text or "当前正文不足，只能先保留已获取信息。",
+            "",
+            "## 原始信息保留",
+            "",
+            f"- 当前说明：{capture_state['summary']}",
+        ])
+        if capture_state["recommended_action"]:
+            lines.append(f"- 建议下一步：{capture_state['recommended_action']}")
+        return "\n".join(lines)
+
+    def _build_bilinote_timeline_lines(
+        self,
+        source_url: str,
+        transcript_segments: list[TranscriptSegment],
+        *,
+        limit: int = 8,
+    ) -> list[str]:
+        if not transcript_segments:
+            return []
+
+        timestamped_segments = [item for item in transcript_segments if item.start_ms is not None]
+        selected_segments = (
+            self._sample_timeline_segments(timestamped_segments, limit=limit)
+            if timestamped_segments
+            else transcript_segments[: min(limit, len(transcript_segments))]
+        )
+
+        lines: list[str] = []
+        for index, segment in enumerate(selected_segments, start=1):
+            label = self._format_segment_range(segment.start_ms, segment.end_ms) or self._format_timestamp(segment.start_ms) or f"片段 {index}"
+            snippet = re.sub(r"\s+", " ", segment.text).strip()
+            if len(snippet) > 72:
+                snippet = snippet[:72].rstrip() + "..."
+            seek_url = build_seek_url(source_url, segment.start_ms)
+            if seek_url and segment.start_ms is not None:
+                lines.append(f"- [{label}]({seek_url}) {snippet}")
+            else:
+                lines.append(f"- {label}：{snippet}")
+        return lines
+
+    def _build_bilinote_clip_sections(
+        self,
+        source_url: str,
+        transcript_segments: list[TranscriptSegment],
+        *,
+        limit: int = 6,
+    ) -> list[str]:
+        if not transcript_segments:
+            return []
+
+        timestamped_segments = [item for item in transcript_segments if item.start_ms is not None]
+        selected_segments = (
+            self._sample_timeline_segments(timestamped_segments, limit=limit)
+            if timestamped_segments
+            else transcript_segments[: min(limit, len(transcript_segments))]
+        )
+
+        lines: list[str] = []
+        for index, segment in enumerate(selected_segments, start=1):
+            label = self._format_segment_range(segment.start_ms, segment.end_ms) or self._format_timestamp(segment.start_ms) or f"片段 {index}"
+            seek_url = build_seek_url(source_url, segment.start_ms)
+            heading = f"### [{label}]({seek_url})" if seek_url and segment.start_ms is not None else f"### {label}"
+            capture_marker = self._build_screenshot_marker(self._select_capture_timestamp_ms(segment))
+            lines.extend([
+                heading,
+                "",
+            ])
+            segment_text = segment.text.strip() or "当前片段暂无正文。"
+            lines.append(segment_text)
+            if capture_marker:
+                lines.extend([
+                    "",
+                    capture_marker,
+                ])
+            lines.append("")
+        return lines
+
+    def _build_note_screenshot_bundle(
+        self,
+        *,
+        video: BilibiliVideo,
+        source_url: str,
+        transcript_segments: list[TranscriptSegment],
+        note_style: str,
+        note_markdown: str,
+    ) -> dict[str, Any]:
+        timestamped_segments = [
+            item
+            for item in transcript_segments
+            if item.start_ms is not None and str(item.text or "").strip()
+        ]
+        if not timestamped_segments:
+            return {
+                "status": "skipped",
+                "summary": "当前没有可用于截图的时间片段，先保留文字笔记。",
+                "items": [],
+            }
+
+        ffmpeg_binary = self._resolve_ffmpeg_binary()
+        if not ffmpeg_binary:
+            return {
+                "status": "ffmpeg_missing",
+                "summary": "当前机器还没有可用的 ffmpeg，关键画面暂时无法生成。",
+                "items": [],
+            }
+
+        if yt_dlp is None:
+            return {
+                "status": "yt_dlp_missing",
+                "summary": "当前环境缺少 yt-dlp，暂时无法为视频拉取截图源文件。",
+                "items": [],
+            }
+
+        video_path = self._download_video_snapshot_source(
+            source_url,
+            video=video,
+        )
+        if video_path is None:
+            return {
+                "status": "download_failed",
+                "summary": "视频画面源文件拉取失败，关键画面暂时无法生成。",
+                "items": [],
+            }
+
+        screenshot_candidates = self._build_note_screenshot_candidates(
+            source_url=source_url,
+            transcript_segments=timestamped_segments,
+            note_markdown=note_markdown,
+        )
+        if not screenshot_candidates:
+            return {
+                "status": "skipped",
+                "summary": "当前没有筛出适合展示的关键时间点。",
+                "items": [],
+            }
+
+        screenshot_items = self._generate_note_screenshots(
+            video=video,
+            video_path=video_path,
+            ffmpeg_binary=ffmpeg_binary,
+            candidates=screenshot_candidates,
+        )
+        if not screenshot_items:
+            return {
+                "status": "capture_failed",
+                "summary": "画面截图步骤执行失败，当前先保留文字与时间线。",
+                "items": [],
+            }
+
+        return {
+            "status": "ready",
+            "summary": f"已生成 {len(screenshot_items)} 张关键画面，可直接配合时间线回看。",
+            "items": screenshot_items,
+        }
+
+    def _build_note_screenshot_candidates(
+        self,
+        *,
+        source_url: str,
+        transcript_segments: list[TranscriptSegment],
+        note_markdown: str,
+        limit: int = DEFAULT_BILINOTE_SCREENSHOT_LIMIT,
+    ) -> list[dict[str, Any]]:
+        marker_candidates = self._build_note_screenshot_candidates_from_markers(
+            source_url=source_url,
+            transcript_segments=transcript_segments,
+            note_markdown=note_markdown,
+            limit=limit,
+        )
+        if marker_candidates:
+            return marker_candidates
+
+        selected_segments = self._sample_timeline_segments(
+            transcript_segments,
+            limit=min(limit, len(transcript_segments)),
+        )
+        if not selected_segments:
+            return []
+
+        candidates: list[dict[str, Any]] = []
+        seen_seconds: set[int] = set()
+        for index, segment in enumerate(selected_segments, start=1):
+            capture_ms = self._select_capture_timestamp_ms(segment)
+            if capture_ms is None:
+                continue
+            capture_seconds = max(0, int(capture_ms // 1000))
+            if capture_seconds in seen_seconds:
+                continue
+            seen_seconds.add(capture_seconds)
+
+            range_label = (
+                self._format_segment_range(segment.start_ms, segment.end_ms)
+                or self._format_timestamp(segment.start_ms)
+                or f"片段 {index}"
+            )
+            timestamp_label = self._format_timestamp(capture_ms) or range_label
+            summary = re.sub(r"\s+", " ", segment.text).strip()
+            if len(summary) > 96:
+                summary = summary[:96].rstrip() + "..."
+            candidates.append(
+                {
+                    "id": f"shot-{capture_seconds}-{index}",
+                    "index": index,
+                    "timestamp_ms": capture_ms,
+                    "timestamp_seconds": capture_seconds,
+                    "timestamp_label": timestamp_label,
+                    "range_label": range_label,
+                    "seek_url": build_seek_url(source_url, capture_ms),
+                    "caption": summary or f"{timestamp_label} 关键画面",
+                    "source_text": segment.text.strip(),
+                }
+            )
+        return candidates
+
+    def _build_note_screenshot_candidates_from_markers(
+        self,
+        *,
+        source_url: str,
+        transcript_segments: list[TranscriptSegment],
+        note_markdown: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        markers = self._extract_screenshot_markers(note_markdown)
+        if not markers:
+            return []
+
+        candidates: list[dict[str, Any]] = []
+        seen_seconds: set[int] = set()
+        for index, marker in enumerate(markers[:limit], start=1):
+            capture_seconds = int(marker["timestamp_seconds"])
+            if capture_seconds in seen_seconds:
+                continue
+            seen_seconds.add(capture_seconds)
+            capture_ms = capture_seconds * 1000
+            matched_segment = self._find_nearest_segment_for_timestamp(
+                transcript_segments,
+                capture_ms=capture_ms,
+            )
+            range_label = (
+                self._format_segment_range(
+                    matched_segment.start_ms if matched_segment is not None else capture_ms,
+                    matched_segment.end_ms if matched_segment is not None else None,
+                )
+                or marker["timestamp_label"]
+            )
+            caption_source = matched_segment.text.strip() if matched_segment is not None else ""
+            caption = re.sub(r"\s+", " ", caption_source).strip()
+            if len(caption) > 96:
+                caption = caption[:96].rstrip() + "..."
+            candidates.append(
+                {
+                    "id": f"shot-{capture_seconds}-{index}",
+                    "marker": marker["marker"],
+                    "index": index,
+                    "timestamp_ms": capture_ms,
+                    "timestamp_seconds": capture_seconds,
+                    "timestamp_label": marker["timestamp_label"],
+                    "range_label": range_label or marker["timestamp_label"],
+                    "seek_url": build_seek_url(source_url, capture_ms),
+                    "caption": caption or f"{marker['timestamp_label']} 关键画面",
+                    "source_text": caption_source,
+                }
+            )
+        return candidates
+
+    def _extract_screenshot_markers(self, markdown: str) -> list[dict[str, Any]]:
+        pattern = r"(\*?Screenshot-(?:\[(\d{2}):(\d{2})\]|(\d{2}):(\d{2})))"
+        results: list[dict[str, Any]] = []
+        for match in re.finditer(pattern, markdown):
+            minutes = match.group(2) or match.group(4)
+            seconds = match.group(3) or match.group(5)
+            if minutes is None or seconds is None:
+                continue
+            total_seconds = int(minutes) * 60 + int(seconds)
+            results.append(
+                {
+                    "marker": match.group(1),
+                    "timestamp_seconds": total_seconds,
+                    "timestamp_label": f"{int(minutes):02d}:{int(seconds):02d}",
+                }
+            )
+        return results
+
+    def _find_nearest_segment_for_timestamp(
+        self,
+        transcript_segments: list[TranscriptSegment],
+        *,
+        capture_ms: int,
+    ) -> TranscriptSegment | None:
+        if not transcript_segments:
+            return None
+
+        best_segment: TranscriptSegment | None = None
+        best_distance: int | None = None
+        for segment in transcript_segments:
+            start_ms = segment.start_ms
+            end_ms = segment.end_ms
+            if start_ms is None:
+                continue
+            if end_ms is not None and start_ms <= capture_ms <= end_ms:
+                return segment
+            distance = abs(start_ms - capture_ms)
+            if best_distance is None or distance < best_distance:
+                best_segment = segment
+                best_distance = distance
+        return best_segment
+
+    def _build_screenshot_marker(self, capture_ms: int | None) -> str:
+        timestamp_label = self._format_timestamp(capture_ms)
+        if not timestamp_label:
+            return ""
+        return f"*Screenshot-[{timestamp_label}]"
+
+    def _select_capture_timestamp_ms(self, segment: TranscriptSegment) -> int | None:
+        start_ms = segment.start_ms
+        end_ms = segment.end_ms
+        if start_ms is None:
+            return None
+        if end_ms is None or end_ms <= start_ms:
+            return start_ms + 800
+        offset = max(350, min(1500, int((end_ms - start_ms) * 0.35)))
+        return min(end_ms, start_ms + offset)
+
+    def _generate_note_screenshots(
+        self,
+        *,
+        video: BilibiliVideo,
+        video_path: Path,
+        ffmpeg_binary: str,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        screenshot_dir, relative_dir = self._resolve_screenshot_output_dir(video)
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+
+        items: list[dict[str, Any]] = []
+        for candidate in candidates:
+            timestamp_seconds = int(candidate.get("timestamp_seconds") or 0)
+            filename = f"shot_{timestamp_seconds:06d}_{int(candidate.get('index') or 0):02d}.jpg"
+            output_path = screenshot_dir / filename
+
+            if not output_path.exists():
+                captured = self._capture_video_frame(
+                    ffmpeg_binary=ffmpeg_binary,
+                    video_path=video_path,
+                    output_path=output_path,
+                    timestamp_seconds=timestamp_seconds,
+                )
+                if not captured:
+                    continue
+
+            image_relative_path = f"/static/{relative_dir.as_posix()}/{filename}"
+            image_url = self._build_static_asset_url(image_relative_path)
+            items.append(
+                {
+                    "id": str(candidate.get("id") or filename),
+                    "marker": str(candidate.get("marker") or "").strip() or None,
+                    "timestamp_ms": int(candidate.get("timestamp_ms") or 0),
+                    "timestamp_seconds": timestamp_seconds,
+                    "timestamp_label": str(candidate.get("timestamp_label") or "").strip(),
+                    "range_label": str(candidate.get("range_label") or "").strip(),
+                    "seek_url": str(candidate.get("seek_url") or "").strip() or None,
+                    "caption": str(candidate.get("caption") or "").strip(),
+                    "source_text": str(candidate.get("source_text") or "").strip(),
+                    "image_path": str(output_path),
+                    "image_url": image_url,
+                    "image_relative_url": image_relative_path,
+                }
+            )
+        return items
+
+    def _capture_video_frame(
+        self,
+        *,
+        ffmpeg_binary: str,
+        video_path: Path,
+        output_path: Path,
+        timestamp_seconds: int,
+    ) -> bool:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            ffmpeg_binary,
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            str(max(timestamp_seconds, 0)),
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(output_path),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
+
+    def _resolve_screenshot_output_dir(self, video: BilibiliVideo) -> tuple[Path, Path]:
+        if self.settings is None:
+            root = REPO_ROOT / ".tmp_bilinote_screenshots"
+        else:
+            root = self.settings.knowledge_base_dir / "static" / "generated" / "screenshots" / "bilibili"
+        folder_name = self._build_video_asset_folder_name(video)
+        relative_dir = Path("generated") / "screenshots" / "bilibili" / folder_name
+        return root / folder_name, relative_dir
+
+    def _download_video_snapshot_source(
+        self,
+        source_url: str,
+        *,
+        video: BilibiliVideo,
+    ) -> Path | None:
+        if yt_dlp is None:
+            return None
+
+        cache_dir = self._resolve_video_cache_dir(video)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        existing_path = self._find_cached_video_path(cache_dir)
+        if existing_path is not None:
+            return existing_path
+
+        runtime_dir = cache_dir / ".runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        ydl_opts: dict[str, Any] = {
+            "format": "bestvideo[ext=mp4]/bestvideo/best[ext=mp4]/best",
+            "outtmpl": str(cache_dir / "source.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "http_headers": self._http.build_headers(),
+        }
+        cookiefile = self._resolve_ytdlp_cookiefile(runtime_dir)
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(source_url, download=True)
+        except Exception:
+            return None
+
+        return self._find_cached_video_path(cache_dir)
+
+    def _resolve_video_cache_dir(self, video: BilibiliVideo) -> Path:
+        if self.settings is None:
+            root = REPO_ROOT / ".tmp_bilibili_video_cache"
+        else:
+            root = self.settings.knowledge_base_dir / "cache" / "bilibili-video"
+        return root / self._build_video_asset_folder_name(video)
+
+    def _build_video_asset_folder_name(self, video: BilibiliVideo) -> str:
+        cid = int(video.cid or 0)
+        return f"{video.bvid.lower()}-cid{cid}"
+
+    def _find_cached_video_path(self, cache_dir: Path) -> Path | None:
+        candidates = sorted(
+            path
+            for path in cache_dir.glob("source.*")
+            if path.is_file() and path.suffix.lower() not in {".part", ".ytdl"}
+        )
+        for candidate in candidates:
+            try:
+                if candidate.stat().st_size > 0:
+                    return candidate
+            except OSError:
+                continue
+        return None
+
+    def _resolve_ffmpeg_binary(self) -> str | None:
+        env_candidates = [
+            os.getenv("ZHIKU_FFMPEG_PATH", "").strip(),
+            os.getenv("FFMPEG_BIN_PATH", "").strip(),
+        ]
+        for candidate in env_candidates:
+            resolved = self._normalize_ffmpeg_candidate(candidate)
+            if resolved:
+                return resolved
+
+        binary_from_path = shutil.which("ffmpeg")
+        if binary_from_path:
+            return binary_from_path
+
+        repo_candidates = [
+            REPO_ROOT / "tools" / "ffmpeg" / "bin" / "ffmpeg.exe",
+            REPO_ROOT / "bin" / "ffmpeg.exe",
+            REPO_ROOT / "ffmpeg" / "bin" / "ffmpeg.exe",
+        ]
+        for candidate in repo_candidates:
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+
+        try:
+            discovered = next((path for path in REPO_ROOT.rglob("ffmpeg.exe") if path.is_file()), None)
+        except Exception:
+            discovered = None
+        return str(discovered) if discovered is not None else None
+
+    def _normalize_ffmpeg_candidate(self, value: str) -> str | None:
+        if not value:
+            return None
+        candidate = Path(value)
+        if candidate.is_dir():
+            exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+            candidate = candidate / exe_name
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+        return None
+
+    def _build_static_asset_url(self, relative_path: str) -> str:
+        normalized = relative_path if relative_path.startswith("/") else f"/{relative_path}"
+        if self.settings is None:
+            return normalized
+        return f"http://{self.settings.host}:{self.settings.port}{normalized}"
+
+    def _inject_screenshots_into_note_markdown(
+        self,
+        note_markdown: str,
+        *,
+        screenshots: list[dict[str, Any]],
+    ) -> str:
+        if not screenshots:
+            return self._strip_screenshot_markers_from_note_markdown(note_markdown)
+
+        updated_markdown = note_markdown
+        replaced_any_marker = False
+        for item in screenshots:
+            marker = str(item.get("marker") or "").strip()
+            if not marker:
+                continue
+            replacement = self._build_inline_screenshot_markdown(item)
+            updated_markdown, replaced = self._replace_screenshot_marker(
+                updated_markdown,
+                marker=marker,
+                replacement=replacement,
+            )
+            replaced_any_marker = replaced_any_marker or replaced
+
+        updated_markdown = self._strip_screenshot_markers_from_note_markdown(updated_markdown)
+        if replaced_any_marker:
+            return updated_markdown
+
+        if "## 关键画面" in updated_markdown:
+            return updated_markdown
+
+        section_lines = ["## 关键画面", ""]
+        for item in screenshots:
+            label = str(item.get("timestamp_label") or item.get("range_label") or "关键画面").strip()
+            image_url = str(item.get("image_url") or "").strip()
+            seek_url = str(item.get("seek_url") or "").strip()
+            caption = str(item.get("caption") or "").strip()
+            if seek_url:
+                section_lines.append(f"### [{label}]({seek_url})")
+            else:
+                section_lines.append(f"### {label}")
+            section_lines.append("")
+            if image_url:
+                section_lines.append(self._build_inline_screenshot_markdown(item))
+                section_lines.append("")
+            if caption:
+                section_lines.append(caption)
+                section_lines.append("")
+
+        section = "\n".join(section_lines).strip()
+        anchor = "\n## 实用整理"
+        if anchor in updated_markdown:
+            return updated_markdown.replace(anchor, f"\n\n{section}\n\n## 实用整理", 1)
+        return updated_markdown.rstrip() + "\n\n" + section + "\n"
+
+    def _build_inline_screenshot_markdown(self, screenshot: dict[str, Any]) -> str:
+        image_url = str(screenshot.get("image_url") or "").strip()
+        label = str(screenshot.get("timestamp_label") or screenshot.get("range_label") or "关键画面").strip()
+        alt_text = f"{label} 关键画面".strip()
+        return f"![{alt_text}]({image_url})" if image_url else alt_text
+
+    def _replace_screenshot_marker(
+        self,
+        note_markdown: str,
+        *,
+        marker: str,
+        replacement: str,
+    ) -> tuple[str, bool]:
+        if not marker or not replacement:
+            return note_markdown, False
+
+        standalone_pattern = re.compile(rf"(?m)^[ \t]*{re.escape(marker)}[ \t]*$")
+        if standalone_pattern.search(note_markdown):
+            return standalone_pattern.sub(lambda _: replacement, note_markdown, count=1), True
+        if marker in note_markdown:
+            return note_markdown.replace(marker, replacement, 1), True
+        return note_markdown, False
+
+    def _strip_screenshot_markers_from_note_markdown(self, note_markdown: str) -> str:
+        if not note_markdown.strip():
+            return note_markdown
+
+        marker_pattern = r"\*?Screenshot-(?:\[\d{2}:\d{2}\]|\d{2}:\d{2})"
+        cleaned = re.sub(rf"(?m)^[ \t]*{marker_pattern}[ \t]*\n?", "", note_markdown)
+        cleaned = re.sub(marker_pattern, "", cleaned)
+        cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
 
     def _enhance_with_llm(
         self,
@@ -2581,7 +3805,3 @@ class BilibiliService:
             "当前只能拿到基础元数据，直接导入大概率无法形成完整视频笔记。",
             "建议优先更换样本，或检查视频是否受平台权限限制。",
         )
-
-
-
-

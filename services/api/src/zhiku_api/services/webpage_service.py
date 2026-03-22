@@ -117,7 +117,18 @@ class WebpageService:
         if llm_enhanced is not None:
             summary = llm_enhanced.get("summary") or summary
             key_points = llm_enhanced.get("key_points") or key_points
-            note_markdown = llm_enhanced.get("note_markdown") or note_markdown
+            if note_style == "bilinote":
+                note_markdown = self._build_note_markdown(
+                    title=title,
+                    url=url,
+                    summary=summary,
+                    key_points=key_points,
+                    content_text=content_text,
+                    note_style=note_style,
+                    summary_focus=summary_focus,
+                )
+            else:
+                note_markdown = llm_enhanced.get("note_markdown") or note_markdown
 
         return {
             "source_type": "url",
@@ -259,6 +270,42 @@ class WebpageService:
         note_style: str,
         summary_focus: str,
     ) -> str:
+        if note_style == "bilinote":
+            lines = [
+                f"# {title}",
+                "",
+                "> BiliNote 风格笔记",
+                f"> [打开原文]({url})",
+                "",
+                "## 网页速览",
+                "",
+                f"- 链接：{url}",
+                "- 类型：网页正文整理",
+                "",
+            ]
+            if summary_focus.strip():
+                lines.extend(["## 本次关注", "", summary_focus.strip(), ""])
+            lines.extend([
+                "## 核心结论",
+                "",
+                summary or "当前正文不足，只能先保留已获取信息。",
+                "",
+                "## 值得记住的内容",
+                "",
+            ])
+            lines.extend([f"- {item}" for item in key_points] or ["- 当前未提炼出稳定要点。"])
+            lines.extend([
+                "",
+                "## 实用整理",
+                "",
+                content_text,
+                "",
+                "## 原始信息保留",
+                "",
+                f"- 来源链接：{url}",
+            ])
+            return "\n".join(lines)
+
         lines = [
             f"# {title}",
             "",

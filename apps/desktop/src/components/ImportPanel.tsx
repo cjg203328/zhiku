@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import ImportCapabilityCard from "./import/ImportCapabilityCard";
+import FailureGuideCard from "./import/FailureGuideCard";
 import ImportInputSection from "./import/ImportInputSection";
 import ImportProbeResultCard from "./import/ImportProbeResultCard";
 import ImportProgressCard from "./import/ImportProgressCard";
@@ -20,10 +21,17 @@ import {
   type ImportJob,
   type ImportResponse,
   type NoteQuality,
+  type ReparseContentResponse,
   type SystemStatus,
   retryImportJob,
   uploadFileImport,
 } from "../lib/api";
+import {
+  getImportJobStepMeta,
+  getImportStageItems,
+  isImportJobTerminal,
+  resolveImportStageIndex,
+} from "../lib/importProgress";
 import { useLanguage } from "../lib/language";
 import { isTauriRuntime } from "../lib/runtime";
 
@@ -63,9 +71,10 @@ function isBilibiliLink(value: string) {
 }
 
 function getNoteStyleLabel(value: string) {
-  if (value === "qa") return "问答导向";
-  if (value === "brief") return "精简速记";
-  return "结构化笔记";
+  if (value === "bilinote") return "阅读版";
+  if (value === "qa") return "问答版";
+  if (value === "brief") return "速览版";
+  return "结构版";
 }
 
 function getMetadata(result: ImportResponse | null) {
@@ -83,11 +92,11 @@ function getNoteQuality(metadata: Record<string, unknown>): NoteQuality | null {
 
 function getStatusTone(status: string) {
   if (status === "ready") return { label: "结果完整", tone: "success", hint: "已经形成可读笔记和可追问证据。" };
-  if (status === "ready_estimated") return { label: "正文已恢复", tone: "info", hint: "当前正文来自转写，建议核对关键片段。" };
+  if (status === "ready_estimated") return { label: "正文已恢复", tone: "info", hint: "当前正文来自转写，可结合证据层核对。" };
   if (status === "needs_cookie") return { label: "待补 Cookie", tone: "warning", hint: "当前只有基础档案，字幕层还不完整。" };
   if (status === "needs_asr") return { label: "待补转写", tone: "warning", hint: "当前没有正文，补转写后成功率会更高。" };
-  if (status === "asr_failed") return { label: "转写异常", tone: "warning", hint: "需要先检查转写服务，再重新导入。" };
-  return { label: "基础建档", tone: "warning", hint: "当前结果还不适合直接拿来做问答。" };
+  if (status === "asr_failed") return { label: "转写异常", tone: "warning", hint: "需检查转写服务后重新导入。" };
+  return { label: "基础建档", tone: "warning", hint: "当前结果以基础材料为主。" };
 }
 
 function getProbeTone(status: string) {
@@ -95,11 +104,39 @@ function getProbeTone(status: string) {
   if (status === "ready_estimated") return { label: "可走转写回退", tone: "info", hint: "没有字幕也能继续尝试恢复正文。" };
   if (status === "needs_cookie") return { label: "需补 Cookie", tone: "warning", hint: "不补登录态，大概率只能拿到基础档案。" };
   if (status === "needs_asr") return { label: "需补转写", tone: "warning", hint: "当前音频可用，但还没有可直接使用的正文。" };
-  return { label: "仅基础预检", tone: "warning", hint: "当前只确认了元数据，还不建议当稳定样本。" };
+  return { label: "仅基础预检", tone: "warning", hint: "当前仅确认元数据与基础链路。" };
 }
 
 function preflightNeedsConfirmation(status: string) {
   return status !== "ready" && status !== "ready_estimated";
+}
+
+function resolveImportPollTimeoutMs(job: ImportJob | null) {
+  if (!job) {
+    return 3 * 60 * 1000;
+  }
+
+  const previewPlatform = job.preview?.platform?.trim().toLowerCase() || "";
+  if (previewPlatform === "bilibili") {
+    return 15 * 60 * 1000;
+  }
+
+  if (job.source_kind === "file" || job.source_kind === "file_upload") {
+    return 6 * 60 * 1000;
+  }
+
+  return 4 * 60 * 1000;
+}
+
+function buildImportTimeoutMessage(job: ImportJob | null) {
+  const previewPlatform = job?.preview?.platform?.trim().toLowerCase() || "";
+  if (previewPlatform === "bilibili") {
+    return "导入超时（超过 15 分钟）。这类 B 站视频可能正在走本地转写，请检查小助手、Cookie 或转写运行时后重试。";
+  }
+  if (job?.source_kind === "file" || job?.source_kind === "file_upload") {
+    return "导入超时（超过 6 分钟），请检查文件内容和服务状态后重试。";
+  }
+  return "导入超时（超过 4 分钟），请检查服务状态后重试。";
 }
 
 function buildSettingsLink(focus?: "model" | "asr" | "bilibili") {
@@ -126,6 +163,33 @@ function getTranscriptSourceLabel(value: string) {
   if (value === "asr") return "音频转写";
   if (value === "description") return "简介补全";
   return "仅基础档案";
+}
+
+function getCaptureStrategyLabel(value: unknown) {
+  if (value === "yt_dlp") return "yt-dlp 兜底";
+  if (value === "native_api") return "原生接口";
+  return "未确定";
+}
+
+function buildCaptureRouteSummary(options: {
+  subtitleStrategy: unknown;
+  audioStrategy: unknown;
+  subtitleAvailable: boolean;
+  audioAvailable: boolean;
+}) {
+  const subtitleStrategy = getCaptureStrategyLabel(options.subtitleStrategy);
+  const audioStrategy = getCaptureStrategyLabel(options.audioStrategy);
+
+  if (!options.subtitleAvailable && !options.audioAvailable) {
+    return "仅元数据预检";
+  }
+  if (options.subtitleAvailable && options.audioAvailable) {
+    return `字幕 ${subtitleStrategy} / 音频 ${audioStrategy}`;
+  }
+  if (options.subtitleAvailable) {
+    return `字幕 ${subtitleStrategy}`;
+  }
+  return `音频 ${audioStrategy}`;
 }
 
 function buildProbeDiagnostics(probe: ProbeResult): DiagnosticItem[] {
@@ -155,6 +219,18 @@ function buildProbeDiagnostics(probe: ProbeResult): DiagnosticItem[] {
         : probe.subtitle_login_required
           ? "warning"
           : "info";
+  const captureRouteValue = buildCaptureRouteSummary({
+    subtitleStrategy: probe.subtitle_fetch_strategy,
+    audioStrategy: probe.audio_fetch_strategy,
+    subtitleAvailable: probe.subtitle_available,
+    audioAvailable: probe.audio_available,
+  });
+  const captureRouteTone: DiagnosticItem["tone"] =
+    probe.subtitle_ytdlp_fallback_used || probe.audio_ytdlp_fallback_used
+      ? "info"
+      : probe.subtitle_available || probe.audio_available
+        ? "success"
+        : "warning";
 
   return [
     {
@@ -176,6 +252,11 @@ function buildProbeDiagnostics(probe: ProbeResult): DiagnosticItem[] {
       label: "登录态",
       value: cookieValue,
       tone: cookieTone,
+    },
+    {
+      label: "抓取链路",
+      value: captureRouteValue,
+      tone: captureRouteTone,
     },
   ];
 }
@@ -204,6 +285,18 @@ function buildImportDiagnostics(options: {
     : metadata.timestamps_available
       ? "已定位待补全"
       : "待补全";
+  const captureRouteValue = buildCaptureRouteSummary({
+    subtitleStrategy: metadata.subtitle_fetch_strategy,
+    audioStrategy: metadata.audio_fetch_strategy,
+    subtitleAvailable: metadata.transcript_source === "subtitle" || metadata.subtitle_ytdlp_fallback_used === true,
+    audioAvailable: metadata.audio_available === true || metadata.audio_ytdlp_fallback_used === true || metadata.transcript_source === "asr",
+  });
+  const captureRouteTone: DiagnosticItem["tone"] =
+    metadata.subtitle_ytdlp_fallback_used === true || metadata.audio_ytdlp_fallback_used === true
+      ? "info"
+      : metadata.transcript_source === "subtitle" || metadata.transcript_source === "asr"
+        ? "success"
+        : "warning";
 
   return [
     { label: "正文来源", value: transcriptSource, tone: transcriptSource === "仅基础档案" ? "warning" : "success" },
@@ -214,6 +307,7 @@ function buildImportDiagnostics(options: {
     },
     { label: "证据层", value: evidenceValue, tone: transcriptSegmentCount > 0 ? "success" : "warning" },
     { label: "时间回看", value: timelineValue, tone: noteQuality?.time_jump_ready ? "success" : metadata.timestamps_available ? "info" : "warning" },
+    { label: "抓取链路", value: captureRouteValue, tone: captureRouteTone },
   ] satisfies DiagnosticItem[];
 }
 
@@ -253,7 +347,7 @@ function buildCapabilityReadiness(options: {
     },
     {
       label: "ffmpeg",
-      value: ffmpegReady ? "可用" : asrLocalReady ? "建议补齐" : "非关键",
+      value: ffmpegReady ? "可用" : asrLocalReady ? "待补齐" : "非关键",
       detail: ffmpegReady
         ? "音频切片和本地转写链路更稳定。"
         : asrLocalReady
@@ -280,8 +374,8 @@ function buildCapabilityReadiness(options: {
     warningCount === 0
       ? "当前这台机器已经具备比较完整的导入和问答能力。"
       : warningCount === 1
-        ? "主链路基本可用，但还有 1 个关键能力建议先补齐。"
-        : `导入前还有 ${warningCount} 个关键能力建议先补齐，不然更容易出现弱材料。`;
+        ? "主链路基本可用，还有 1 个能力会影响内容完整度。"
+        : `当前有 ${warningCount} 个能力会影响导入完整度。`;
 
   return { summary, items };
 }
@@ -309,8 +403,8 @@ function buildRecoveryHints(options: {
       label: "B站登录态",
       value: cookieActive ? "已启用，可重试" : cookieStored ? "已保存待启用" : "未启用",
       detail: cookieActive
-        ? "当前最值得做的是重新整理这条内容，让系统重新尝试字幕层。"
-        : "这条视频的字幕需要登录态，不补这一步大概率只能停留在基础建档。",
+        ? "当前可重新整理这条内容，让系统再次尝试字幕层。"
+        : "这条视频的字幕需要登录态，不补这一步通常只能停留在基础建档。",
       tone: cookieActive ? "info" : "warning",
       focus: "bilibili",
     });
@@ -319,7 +413,7 @@ function buildRecoveryHints(options: {
   if (status === "needs_asr" || status === "asr_failed" || transcriptSegmentCount === 0) {
     hints.push({
       label: "音频转写",
-      value: asrConfigured ? "已配置，建议重试" : "未配置",
+      value: asrConfigured ? "已配置，可重试" : "未配置",
       detail: asrConfigured
         ? "系统已经有转写能力，但这条内容还需要重新整理一遍才能补正文。"
         : "当前还没有稳定的转写能力，长视频和无字幕视频会明显受影响。",
@@ -343,8 +437,8 @@ function buildRecoveryHints(options: {
   const captureAction = getMetadataText(metadata, "capture_recommended_action");
   if (captureAction && !hints.some((item) => item.detail === captureAction)) {
     hints.push({
-      label: "当前建议",
-      value: "优先处理",
+      label: "采集状态",
+      value: "查看说明",
       detail: captureAction,
       tone: "info",
       focus: status === "needs_cookie" ? "bilibili" : status === "needs_asr" || status === "asr_failed" ? "asr" : "model",
@@ -361,6 +455,27 @@ function buildRecoveryHints(options: {
     if (deduped.length >= 4) break;
   }
   return deduped;
+}
+
+function buildImportIssueList(
+  metadata: Record<string, unknown>,
+  noteQuality: NoteQuality | null,
+  enabled: boolean,
+) {
+  if (!enabled) return [] as string[];
+
+  return [
+    metadata.noisy_asr_detected === true ? "检测到转写噪声，当前更适合围绕时间片段继续提问并核对原视频。" : "",
+    getMetadataText(metadata, "asr_model_used") ? `本次转写模型：${getMetadataText(metadata, "asr_model_used")}` : "",
+    metadata.asr_model_auto_upgraded === true && getMetadataText(metadata, "asr_model_used")
+      ? `已自动抬升本地模型到 ${getMetadataText(metadata, "asr_model_used")} 尝试保底。`
+      : "",
+    getMetadataText(metadata, "capture_blocked_reason"),
+    ...getStringList(metadata.metadata_fetch_errors),
+    getMetadataText(metadata, "subtitle_error") ? `字幕获取：${getMetadataText(metadata, "subtitle_error")}` : "",
+    getMetadataText(metadata, "asr_error") ? `转写过程：${getMetadataText(metadata, "asr_error")}` : "",
+    !noteQuality?.time_jump_ready && getMetadataText(metadata, "capture_recommended_action"),
+  ].filter((item): item is string => Boolean(item));
 }
 
 function plainText(value: string) {
@@ -419,6 +534,29 @@ function buildImportResultFromContent(content: ContentDetail): ImportResponse {
   };
 }
 
+function buildImportResultFromReparseResponse(result: ReparseContentResponse): ImportResponse | null {
+  if (result.job) {
+    return {
+      job: result.job,
+      content: result.content
+        ? {
+            id: result.content.id,
+            title: result.content.title,
+            summary: result.content.summary,
+            tags: result.content.tags,
+            status: result.content.status,
+          }
+        : null,
+    };
+  }
+
+  if (result.content) {
+    return buildImportResultFromContent(result.content);
+  }
+
+  return null;
+}
+
 function buildImportFirstQuestions(options: {
   preview: ImportResponse["job"]["preview"];
   metadata: Record<string, unknown>;
@@ -450,46 +588,6 @@ function buildImportFirstQuestions(options: {
     if (deduped.length >= 4) break;
   }
   return deduped;
-}
-
-function isImportJobTerminal(status: string | undefined) {
-  return status === "completed" || status === "failed" || status === "cancelled";
-}
-
-function getImportJobStepMeta(step: string | undefined) {
-  if (step === "queued") return { label: "已接收任务", description: "任务已经进入队列，马上开始处理。" };
-  if (step === "detecting_source") return { label: "识别来源", description: "正在判断链接类型与可用抓取路径。" };
-  if (step === "reading_file") return { label: "读取文件", description: "正在检查文件内容并提取可解析文本。" };
-  if (step === "parsing_content") return { label: "提取正文", description: "正在抓取正文、字幕或可用证据层。" };
-  if (step === "saving_content") return { label: "整理入库", description: "正在整理笔记、计算质量并写入知识库。" };
-  if (step === "done") return { label: "导入完成", description: "内容已经完成建档，可以继续查看或提问。" };
-  if (step === "failed") return { label: "导入失败", description: "这次没有成功产出可用内容，请按提示调整后重试。" };
-  return { label: "处理中", description: "系统正在继续处理当前导入任务。" };
-}
-
-function getImportStageItems(sourceKind?: string) {
-  if (sourceKind === "file" || sourceKind === "file_upload") {
-    return [
-      { key: "queued", label: "接收任务" },
-      { key: "reading_file", label: "读取文件" },
-      { key: "parsing_content", label: "提取正文" },
-      { key: "saving_content", label: "整理入库" },
-    ];
-  }
-
-  return [
-    { key: "queued", label: "接收任务" },
-    { key: "detecting_source", label: "识别来源" },
-    { key: "parsing_content", label: "提取正文" },
-    { key: "saving_content", label: "整理入库" },
-  ];
-}
-
-function resolveImportStageIndex(step: string | undefined, sourceKind?: string) {
-  const stages = getImportStageItems(sourceKind);
-  if (step === "done") return stages.length - 1;
-  const index = stages.findIndex((item) => item.key === step);
-  return index >= 0 ? index : 0;
 }
 
 function buildImportResultFromJob(job: ImportJob): ImportResponse {
@@ -524,6 +622,8 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
   const [awaitingImportConfirmation, setAwaitingImportConfirmation] = useState(false);
   const [activeImportJobId, setActiveImportJobId] = useState("");
   const [activeImportJob, setActiveImportJob] = useState<ImportJob | null>(null);
+  const [reparseFeedbackMessage, setReparseFeedbackMessage] = useState("");
+  const [retryingImportJobId, setRetryingImportJobId] = useState("");
   const systemStatusQuery = useQuery({
     queryKey: ["system-status"],
     queryFn: getSystemStatus,
@@ -568,10 +668,16 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
     });
   }
 
-  function acceptImportResponse(data: ImportResponse, options?: { clearUrl?: boolean; clearFilePath?: boolean; clearSelectedFile?: boolean }) {
+  function acceptImportResponse(
+    data: ImportResponse,
+    options?: { clearUrl?: boolean; clearFilePath?: boolean; clearSelectedFile?: boolean; preserveReparseFeedback?: boolean },
+  ) {
     if (options?.clearUrl) setUrlValue("");
     if (options?.clearFilePath) setFilePathValue("");
     if (options?.clearSelectedFile) setSelectedFile(null);
+    if (!options?.preserveReparseFeedback) {
+      setReparseFeedbackMessage("");
+    }
     setLastProbeResult(null);
     setLastProbedUrl("");
     setAwaitingImportConfirmation(false);
@@ -630,18 +736,23 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
       reparseContent(contentId, {
         note_style: noteStyle,
         summary_focus: summaryFocus,
+        async_mode: true,
       }),
+    onMutate: () => {
+      setReparseFeedbackMessage("");
+    },
     onSuccess: async (result) => {
-      const payload = buildImportResultFromContent(result.content);
-      setLastResult(payload);
-      setActiveImportJobId("");
-      setActiveImportJob(null);
-      const metadata =
-        payload.job.preview.metadata && typeof payload.job.preview.metadata === "object"
-          ? (payload.job.preview.metadata as Record<string, unknown>)
-          : {};
-      reportImportCompleted(payload.job.preview, metadata, getNoteQuality(metadata));
-      await queryClient.invalidateQueries({ queryKey: ["contents"] });
+      const payload = buildImportResultFromReparseResponse(result);
+      if (!payload) {
+        return;
+      }
+      if (!result.job || isImportJobTerminal(result.job.status)) {
+        setReparseFeedbackMessage(result.message || "系统已经按当前设置重新处理材料，下面的预览已更新。");
+      }
+      acceptImportResponse(payload);
+      if (!result.job || isImportJobTerminal(result.job.status)) {
+        await queryClient.invalidateQueries({ queryKey: ["contents"] });
+      }
     },
   });
 
@@ -652,13 +763,13 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
 
     let cancelled = false;
     let timer: number | undefined;
-    const POLL_TIMEOUT_MS = 3 * 60 * 1000; // 3 分钟超时
+    const pollTimeoutMs = resolveImportPollTimeoutMs(activeImportJob);
     const startedAt = Date.now();
 
     const poll = async () => {
       try {
         // 超时检测
-        if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+        if (Date.now() - startedAt > pollTimeoutMs) {
           if (!cancelled) {
             setActiveImportJobId("");
             setActiveImportJob((current) =>
@@ -668,7 +779,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
                     status: "failed",
                     progress: 100,
                     step: "failed",
-                    error_message: "导入超时（超过 3 分钟），请检查服务状态后重试。",
+                    error_message: buildImportTimeoutMessage(current),
                   }
                 : null,
             );
@@ -698,7 +809,15 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
         if (isImportJobTerminal(job.status)) {
           setActiveImportJobId("");
           if (job.status === "completed") {
-            acceptImportResponse(buildImportResultFromJob(job));
+            const metadata =
+              job.preview.metadata && typeof job.preview.metadata === "object"
+                ? (job.preview.metadata as Record<string, unknown>)
+                : {};
+            const jobMessage = typeof metadata.job_message === "string" ? metadata.job_message.trim() : "";
+            if (jobMessage) {
+              setReparseFeedbackMessage(jobMessage);
+            }
+            acceptImportResponse(buildImportResultFromJob(job), { preserveReparseFeedback: Boolean(jobMessage) });
             setActiveImportJob(null);
           } else {
             setActiveImportJob(null);
@@ -795,21 +914,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
       !probe.asr_configured && probe.asr_runtime_summary ? `转写能力：${probe.asr_runtime_summary}` : "",
     ].filter((item): item is string => Boolean(item));
   }, [probe]);
-  const importIssues = useMemo(() => {
-    if (!preview) return [];
-    return [
-      metadata.noisy_asr_detected === true ? "检测到转写噪声，当前更适合围绕时间片段继续提问并核对原视频。" : "",
-      getMetadataText(metadata, "asr_model_used") ? `本次转写模型：${getMetadataText(metadata, "asr_model_used")}` : "",
-      metadata.asr_model_auto_upgraded === true && getMetadataText(metadata, "asr_model_used")
-        ? `已自动抬升本地模型到 ${getMetadataText(metadata, "asr_model_used")} 尝试保底。`
-        : "",
-      getMetadataText(metadata, "capture_blocked_reason"),
-      ...getStringList(metadata.metadata_fetch_errors),
-      getMetadataText(metadata, "subtitle_error") ? `字幕获取：${getMetadataText(metadata, "subtitle_error")}` : "",
-      getMetadataText(metadata, "asr_error") ? `转写过程：${getMetadataText(metadata, "asr_error")}` : "",
-      !noteQuality?.time_jump_ready && getMetadataText(metadata, "capture_recommended_action"),
-    ].filter((item): item is string => Boolean(item));
-  }, [metadata, noteQuality?.time_jump_ready, preview]);
+  const importIssues = useMemo(() => buildImportIssueList(metadata, noteQuality, Boolean(preview)), [metadata, noteQuality, preview]);
   const probeNeedsSettings = Boolean(
     probe &&
       (probe.predicted_status === "needs_cookie" ||
@@ -859,6 +964,54 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
       }),
     [settingsQuery.data, systemStatusQuery.data],
   );
+  const failedPreview = useMemo(
+    () => (!preview && activeImportJob?.status === "failed" ? activeImportJob.preview : null),
+    [activeImportJob, preview],
+  );
+  const failedMetadata = useMemo(() => {
+    const raw = failedPreview?.metadata;
+    return raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  }, [failedPreview]);
+  const failedNoteQuality = useMemo(() => getNoteQuality(failedMetadata), [failedMetadata]);
+  const failedTranscriptSegmentCount = useMemo(() => {
+    if (typeof failedNoteQuality?.transcript_segments === "number") {
+      return failedNoteQuality.transcript_segments;
+    }
+    return Array.isArray(failedMetadata.transcript_segments) ? failedMetadata.transcript_segments.length : 0;
+  }, [failedMetadata.transcript_segments, failedNoteQuality?.transcript_segments]);
+  const failedImportIssues = useMemo(
+    () => [
+      activeImportJob?.error_code ? `错误代码：${activeImportJob.error_code}` : "",
+      ...buildImportIssueList(failedMetadata, failedNoteQuality, Boolean(failedPreview)),
+    ].filter((item): item is string => Boolean(item)),
+    [activeImportJob?.error_code, failedMetadata, failedNoteQuality, failedPreview],
+  );
+  const failedRecoveryHints = useMemo(
+    () =>
+      buildRecoveryHints({
+        preview: failedPreview,
+        metadata: failedMetadata,
+        noteQuality: failedNoteQuality,
+        transcriptSegmentCount: failedTranscriptSegmentCount,
+        systemStatus: systemStatusQuery.data,
+        settings: settingsQuery.data,
+      }),
+    [failedMetadata, failedNoteQuality, failedPreview, failedTranscriptSegmentCount, settingsQuery.data, systemStatusQuery.data],
+  );
+  const probeFailureHints = useMemo(
+    () =>
+      capabilityReadiness.items
+        .filter((item) => item.tone !== "success")
+        .slice(0, 3)
+        .map((item) => ({
+          label: item.label,
+          value: item.value,
+          detail: item.detail,
+          tone: item.tone,
+          focus: item.focus,
+        })),
+    [capabilityReadiness.items],
+  );
 
   async function handleUrlImportStart() {
     const trimmedUrl = urlValue.trim();
@@ -893,6 +1046,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
     setFilePathValue("");
     setSelectedFile(null);
     setSummaryFocus("");
+    setReparseFeedbackMessage("");
     setLastResult(null);
     setLastProbeResult(null);
     setLastProbedUrl("");
@@ -912,11 +1066,6 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
         <div>
           <p className="eyebrow">{displayText("智能导入")}</p>
           <h3>{displayText("导入内容")}</h3>
-          <p className="muted-text">{displayText("贴链接后，系统会自动尝试字幕、正文和转写。")}</p>
-        </div>
-        <div className="pill-row">
-          <span className="pill">{displayText("B站优先")}</span>
-          <span className="pill">{displayText("自动回退")}</span>
         </div>
       </div>
 
@@ -950,10 +1099,24 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
       />
 
       {probeMutation.error && (
-        <article className="preview-card smart-status-card">
-          <p className="eyebrow">{displayText("预检失败")}</p>
-          <p className="error-text">{(probeMutation.error as Error).message}</p>
-        </article>
+        <FailureGuideCard
+          eyebrow="预检失败"
+          title="这次没能顺利拿到预检结果"
+          description="补齐相关能力后再重新预检，结果会更稳定。"
+          message={(probeMutation.error as Error).message}
+          hints={probeFailureHints}
+          issues={urlValue.trim() ? [`当前链接：${urlValue.trim()}`] : []}
+          actions={(
+            <>
+              <button className="secondary-button" type="button" onClick={() => probeMutation.reset()}>
+                {displayText("收起提示")}
+              </button>
+              <Link className="secondary-button button-link" to="/settings">
+                {displayText("打开设置")}
+              </Link>
+            </>
+          )}
+        />
       )}
 
       {probe && (
@@ -982,34 +1145,44 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
       )}
 
       {Boolean(activeError) && (
-        <article className="preview-card smart-status-card">
-          <p className="eyebrow">{displayText("这次没有顺利完成")}</p>
-          <p className="error-text">{activeError}</p>
-          <p className="muted-text">{displayText(urlValue.trim() ? "先换一条公开链接验证链路，成功后再回头优化难样本。" : "先用 TXT、MD、DOCX 这类稳定文件验证流程。")}</p>
-          <div className="header-actions">
-            <button className="secondary-button" type="button" onClick={resetPanel}>
-              {displayText("重新开始")}
-            </button>
-            {activeImportJob?.status === "failed" && activeImportJob.id && (
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={async () => {
-                  try {
-                    const result = await retryImportJob(activeImportJob.id);
-                    setActiveImportJob(result.job);
-                    setActiveImportJobId(result.job.id);
-                  } catch {}
-                }}
-              >
-                {displayText("重试导入")}
+        <FailureGuideCard
+          eyebrow="导入失败"
+          title="这次没有顺利完成"
+          description={urlValue.trim() ? "补齐相关能力后再重试，结果通常更稳定。" : "重新开始前可确认当前能力链路。"}
+          message={activeError}
+          hints={failedRecoveryHints}
+          issues={failedImportIssues}
+          actions={(
+            <>
+              <button className="secondary-button" type="button" onClick={resetPanel} disabled={retryingImportJobId === activeImportJob?.id}>
+                {displayText("重新开始")}
               </button>
-            )}
-            <Link className="secondary-button button-link" to="/settings">
-              {displayText("打开设置")}
-            </Link>
-          </div>
-        </article>
+              {activeImportJob?.status === "failed" && activeImportJob.id && (
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={retryingImportJobId === activeImportJob.id}
+                  onClick={async () => {
+                    setRetryingImportJobId(activeImportJob.id);
+                    try {
+                      const result = await retryImportJob(activeImportJob.id);
+                      setActiveImportJob(result.job);
+                      setActiveImportJobId(result.job.id);
+                    } catch {}
+                    finally {
+                      setRetryingImportJobId("");
+                    }
+                  }}
+                >
+                  {displayText(retryingImportJobId === activeImportJob.id ? "正在重试..." : "重试导入")}
+                </button>
+              )}
+              <Link className="secondary-button button-link" to="/settings">
+                {displayText("打开设置")}
+              </Link>
+            </>
+          )}
+        />
       )}
 
       {preview && (
@@ -1028,11 +1201,11 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
           transcriptSegmentCount={transcriptSegmentCount}
           evidenceSnippet={evidenceSnippet}
           summaryFocus={summaryFocus}
-          isReparsePending={reparseMutation.isPending}
-          isReparseSuccess={reparseMutation.isSuccess}
-          reparseMessage={reparseMutation.data?.message}
-          isReparseError={reparseMutation.isError}
-          reparseErrorMessage={(reparseMutation.error as Error | null)?.message}
+          isReparsePending={reparseMutation.isPending || Boolean(runningImportJob)}
+          isReparseSuccess={Boolean(reparseFeedbackMessage) && !Boolean(runningImportJob)}
+          reparseMessage={reparseFeedbackMessage}
+          isReparseError={reparseMutation.isError || activeImportJob?.status === "failed"}
+          reparseErrorMessage={(reparseMutation.error as Error | null)?.message || activeImportJob?.error_message || undefined}
           onReparse={() => reparseMutation.mutate({ contentId: preview.content_id!, noteStyle, summaryFocus: summaryFocus.trim() })}
           onReset={resetPanel}
         />

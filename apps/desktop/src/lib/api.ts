@@ -244,8 +244,12 @@ export type BilibiliProbeResult = {
   subtitle_login_required: boolean;
   subtitle_preview_toast: string | null;
   subtitle_error: string | null;
+  subtitle_fetch_strategy?: string;
+  subtitle_ytdlp_fallback_used?: boolean;
   audio_available: boolean;
   audio_error: string | null;
+  audio_fetch_strategy?: string;
+  audio_ytdlp_fallback_used?: boolean;
   browser_bridge_enabled?: boolean;
   browser_bridge_active?: boolean;
   browser_bridge_source_label?: string;
@@ -263,6 +267,7 @@ export type BilibiliProbeResult = {
   asr_local_engine?: string;
   asr_runtime_summary?: string;
   timestamps_available: boolean;
+  yt_dlp_available?: boolean;
   predicted_status: string;
   predicted_quality: string;
   predicted_summary: string;
@@ -525,6 +530,11 @@ export type UpdateContentPayload = {
 export type ReparseContentPayload = {
   note_style?: string;
   summary_focus?: string;
+  async_mode?: boolean;
+};
+
+export type RestoreNoteVersionPayload = {
+  version_id: string;
 };
 
 export type UpgradeContentsPayload = {
@@ -579,6 +589,13 @@ export type ImportResponse = {
 export type ActionContentResponse = {
   ok: boolean;
   content: ContentDetail;
+  message: string;
+};
+
+export type ReparseContentResponse = {
+  ok: boolean;
+  content?: ContentDetail | null;
+  job?: ImportJob | null;
   message: string;
 };
 
@@ -682,9 +699,16 @@ export function updateContent(contentId: string, payload: UpdateContentPayload) 
 }
 
 export function reparseContent(contentId: string, payload?: ReparseContentPayload) {
-  return readJson<ActionContentResponse>(`/api/v1/contents/${contentId}/reparse`, {
+  return readJson<ReparseContentResponse>(`/api/v1/contents/${contentId}/reparse`, {
     method: "POST",
     body: JSON.stringify(payload ?? {}),
+  });
+}
+
+export function restoreNoteVersion(contentId: string, payload: RestoreNoteVersionPayload) {
+  return readJson<ActionContentResponse>(`/api/v1/contents/${contentId}/restore-note-version`, {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
 }
 
@@ -1172,5 +1196,3 @@ export async function exportDerivedItem(itemId: string): Promise<string> {
   if (!resp.ok) throw new Error(`导出失败：${resp.status}`);
   return resp.text();
 }
-
-

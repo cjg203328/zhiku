@@ -24,12 +24,18 @@ type Props = {
 
 export default function ImportCapabilityCard({ readiness }: Props) {
   const { displayText } = useLanguage();
+  const visibleItems = readiness.items.filter((item) => item.tone !== "success");
+
+  if (!visibleItems.length) {
+    return null;
+  }
+
   return (
-    <article className="preview-card smart-status-card capability-readiness-card">
+    <article className="preview-card smart-status-card capability-readiness-card capability-readiness-card-compact">
       <div className="panel-heading">
         <div>
           <p className="eyebrow">{displayText("当前能力")}</p>
-          <h4>{displayText("导入前先看这 4 项")}</h4>
+          <h4>{displayText("导入前检查")}</h4>
           <p className="muted-text">{displayText(readiness.summary)}</p>
         </div>
         <Link className="secondary-button button-link" to="/settings">
@@ -37,13 +43,12 @@ export default function ImportCapabilityCard({ readiness }: Props) {
         </Link>
       </div>
       <div className="capability-grid">
-        {readiness.items.map((item) => (
+        {visibleItems.map((item) => (
           <article className={`smart-diagnostic-card smart-diagnostic-card-${item.tone} capability-card`} key={item.label}>
             <span>{displayText(item.label)}</span>
             <strong>{displayText(item.value)}</strong>
-            <p>{displayText(item.detail)}</p>
             <Link className="text-link-inline" to={buildSettingsLink(item.focus)}>
-              {displayText("去设置")}
+              {displayText("处理")}
             </Link>
           </article>
         ))}

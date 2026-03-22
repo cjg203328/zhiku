@@ -176,13 +176,15 @@ class AppSettings(BaseSettings):
     @property
     def asr_effective_provider(self) -> str:
         provider = self.asr_provider.strip()
+        if provider.lower() in {"disabled", "off", "none"}:
+            return ""
         if provider:
             return provider
         if self.asr_model.strip() and self.llm_enabled:
             return "openai_compatible"
         if self.llm_shared_asr_supported:
             return "openai_compatible"
-        return ""
+        return LOCAL_ASR_PROVIDER
 
     @property
     def asr_effective_model(self) -> str:
@@ -220,6 +222,8 @@ class AppSettings(BaseSettings):
     @property
     def asr_config_mode(self) -> str:
         provider = self.asr_provider.strip()
+        if provider.lower() in {"disabled", "off", "none"}:
+            return "disabled"
         if provider == LOCAL_ASR_PROVIDER:
             return "local"
 
@@ -230,11 +234,13 @@ class AppSettings(BaseSettings):
             self.asr_api_key.strip(),
         ]
         explicit_count = sum(1 for value in explicit_fields if value)
+        if explicit_count == 0:
+            if self.llm_shared_asr_supported:
+                return "inherited"
+            return "auto_local"
         if explicit_count == 4:
             return "explicit"
         if self.asr_effectively_enabled:
-            if explicit_count == 0:
-                return "inherited"
             return "hybrid"
         return "disabled"
 

@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$progressDoc = 'docs/product/知库_开发变更日志.md'
+$progressRoot = 'docs/product/'
 
 Set-Location $repoRoot
 
@@ -40,32 +40,27 @@ foreach ($line in $statusLines) {
   }
 
   if ($file) {
-    $changedFiles += $file
+    $changedFiles += $file.Replace('\', '/')
   }
 }
 
 $uniqueFiles = @($changedFiles | Sort-Object -Unique)
 $progressTouched = $false
 foreach ($item in $uniqueFiles) {
-  if ($item -eq $progressDoc) {
+  if ($item.StartsWith($progressRoot)) {
     $progressTouched = $true
     break
   }
-  if ($item.EndsWith('/') -or $item.EndsWith('\')) {
-    if ($progressDoc.StartsWith($item.Replace('\', '/'))) {
-      $progressTouched = $true
-      break
-    }
-  }
 }
-$nonProgressChanges = @($uniqueFiles | Where-Object { $_ -ne $progressDoc })
+
+$nonProgressChanges = @($uniqueFiles | Where-Object { -not $_.StartsWith($progressRoot) })
 
 Write-Host 'Changed files:'
 $uniqueFiles | ForEach-Object { Write-Host " - $_" }
 Write-Host ''
 
 if ($nonProgressChanges.Count -gt 0 -and -not $progressTouched) {
-  Write-Warning "Progress doc not updated: $progressDoc"
+  Write-Warning "Progress docs under $progressRoot were not updated"
 } else {
   Write-Host 'Progress doc check: OK'
 }

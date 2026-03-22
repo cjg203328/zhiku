@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { emptyTrash, getTrashContents, permanentDeleteContent, restoreContent } from "../lib/api";
 import { useLanguage } from "../lib/language";
+import { splitStageDigestText } from "../lib/stageDigest";
 
 export default function RecycleBinPage() {
   const { displayText } = useLanguage();
@@ -107,6 +108,7 @@ export default function RecycleBinPage() {
         {trashQuery.data?.items.map((item) => {
           const isRestoring = restoringIds.has(item.id);
           const isDeleting = deletingIds.has(item.id);
+          const summaryLines = splitStageDigestText(item.summary || "", 2);
           return (
             <article className="card detail-section-card" key={item.id}>
               <div className="pill-row">
@@ -114,7 +116,15 @@ export default function RecycleBinPage() {
                 <span className="pill">{displayText(`删除于 ${item.deleted_at}`)}</span>
               </div>
               <h3>{displayText(item.title)}</h3>
-              <p className="muted-text">{displayText(item.summary || "当前没有摘要。")}</p>
+              {summaryLines.length > 0 ? (
+                <div className="trash-summary-points">
+                  {summaryLines.map((line) => (
+                    <p key={`${item.id}-${line}`}>{displayText(line)}</p>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted-text">{displayText("当前没有摘要。")}</p>
+              )}
               <div className="pill-row">
                 {item.tags.map((tag) => (
                   <span className="pill" key={tag}>{displayText(tag)}</span>
