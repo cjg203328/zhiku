@@ -27,6 +27,7 @@ import {
 } from "../lib/importProgress";
 import { useLanguage } from "../lib/language";
 import { formatMilliseconds, formatTimeRange } from "../lib/utils";
+import MarkdownNoteView, { cleanNoteMarkdownForDisplay } from "../components/MarkdownNoteView";
 import RichNoteEditor from "../components/RichNoteEditor";
 import ImportProgressCard from "../components/import/ImportProgressCard";
 import StageDigest from "../components/StageDigest";
@@ -136,10 +137,21 @@ function getImportJobStepMeta(step: string | undefined) {
   if (step === "detecting_source") return { label: "识别来源", description: "正在确认当前内容的重解析来源，并选择合适的抓取方式。" };
   if (step === "reading_file") return { label: "读取文件", description: "正在重新读取原始文件内容，并准备生成新的结构化笔记。" };
   if (step === "parsing_content") return { label: "提取内容", description: "正在重新整理正文、字幕、截图和可回看的证据层。" };
+  if (step === "fetching_subtitle") return { label: "检查字幕", description: "正在确认当前视频是否有可直接使用的字幕与时间轴。" };
+  if (step === "fetching_audio") return { label: "检查音频", description: "当前没有公开字幕，正在确认是否能回退到音频正文。" };
+  if (step === "transcribing_audio") return { label: "音频转写", description: "正在执行本地转写，这一步通常最久，请耐心等待。" };
+  if (step === "capturing_screenshots") return { label: "整理片段", description: "正在生成关键片段、截图与回看线索。" };
   if (step === "saving_content") return { label: "刷新当前内容", description: "正在保存版本历史，并用新的结果刷新当前内容。" };
   if (step === "done") return { label: "重解析完成", description: "当前内容已经刷新完成，现在可以继续阅读或回看。" };
   if (step === "failed") return { label: "重解析失败", description: "这次没有顺利刷新当前内容，请按提示调整后再试一次。" };
   return { label: "处理中", description: "系统正在继续整理当前重解析任务。" };
+}
+
+function normalizeImportStageStep(step: string | undefined) {
+  if (step === "fetching_subtitle" || step === "fetching_audio" || step === "transcribing_audio" || step === "capturing_screenshots") {
+    return "parsing_content";
+  }
+  return step;
 }
 
 function getImportStageItems(sourceKind?: string) {
@@ -163,7 +175,8 @@ function getImportStageItems(sourceKind?: string) {
 function resolveImportStageIndex(step: string | undefined, sourceKind?: string) {
   const stages = getImportStageItems(sourceKind);
   if (step === "done") return stages.length - 1;
-  const index = stages.findIndex((item) => item.key === step);
+  const normalizedStep = normalizeImportStageStep(step);
+  const index = stages.findIndex((item) => item.key === normalizedStep);
   return index >= 0 ? index : 0;
 }
 
@@ -272,7 +285,7 @@ function parseNoteVersions(value: unknown) {
     .map((item) => {
       if (!item || typeof item !== "object") return null;
       const entry = item as Record<string, unknown>;
-      const noteMarkdown = typeof entry.note_markdown === "string" ? entry.note_markdown.trim() : "";
+      const noteMarkdown = typeof entry.note_markdown === "string" ? cleanNoteMarkdownForDisplay(entry.note_markdown) : "";
       const summary = typeof entry.summary === "string" ? entry.summary.trim() : "";
       const keyPoints = readStringList(entry.key_points);
       if (!noteMarkdown && !summary && !keyPoints.length) return null;
@@ -302,7 +315,7 @@ function getNoteVersionSourceLabel(value: string) {
 }
 
 function buildMarkdownPreviewText(markdown: string, limit = 520) {
-  const compact = markdown
+  const compact = cleanNoteMarkdownForDisplay(markdown)
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, "$1")
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
     .replace(/^#{1,6}\s+/gm, "")
@@ -749,7 +762,7 @@ export default function ContentDetailPage() {
     const refined = (contentQuery.data.metadata as Record<string,unknown> | null)?.refined_note_markdown;
     const note = (contentQuery.data.metadata as Record<string,unknown> | null)?.note_markdown;
     const raw = typeof refined === "string" ? refined : typeof note === "string" ? note : contentQuery.data.summary;
-    setRichNoteContent(raw || "");
+    setRichNoteContent(cleanNoteMarkdownForDisplay(raw || ""));
   }, [contentQuery.data]);
 
   const metadata = useMemo<Record<string, unknown> | null>(() => {
@@ -758,8 +771,8 @@ export default function ContentDetailPage() {
   }, [contentQuery.data]);
   const refinedNote = useMemo(() => {
     const refined = metadata?.refined_note_markdown;
-    if (typeof refined === "string" && refined.trim()) return refined;
-    return typeof metadata?.note_markdown === "string" ? metadata.note_markdown : "";
+    if (typeof refined === "string" && refined.trim()) return cleanNoteMarkdownForDisplay(refined);
+    return typeof metadata?.note_markdown === "string" ? cleanNoteMarkdownForDisplay(metadata.note_markdown) : "";
   }, [metadata]);
   const noteStyleValue = useMemo(() => (typeof metadata?.note_style === "string" ? metadata.note_style.trim() : ""), [metadata]);
   const historicalNoteVersions = useMemo(() => parseNoteVersions(metadata?.note_versions), [metadata]);
@@ -905,7 +918,7 @@ export default function ContentDetailPage() {
   const materialSeedQueries = useMemo(() => readStringList(metadata?.material_seed_queries), [metadata]);
   const materialSeedSummary = useMemo(() => (typeof metadata?.material_seed_summary === "string" ? metadata.material_seed_summary.trim() : ""), [metadata]);
   const sourceDescription = useMemo(() => (typeof metadata?.source_description === "string" ? metadata.source_description.trim() : ""), [metadata]);
-  const fullNoteContent = richNoteContent || refinedNote || contentQuery.data?.summary || "";
+  const fullNoteContent = cleanNoteMarkdownForDisplay(richNoteContent || refinedNote || contentQuery.data?.summary || "");
   const hasSupplementPanel = Boolean(practicalDigest || originItems.length > 0 || (contentQuery.data?.key_points.length ?? 0) > 0);
   const hasDerivedOutputs = Boolean(derivedMindmap || derivedQuiz);
   const savedFrom = useMemo(() => (typeof metadata?.saved_from === "string" ? metadata.saved_from.trim() : ""), [metadata]);
@@ -1358,19 +1371,19 @@ export default function ContentDetailPage() {
     restoreNoteVersionMutation.mutate(selectedNoteVersion.id);
   }
 
-  const heroFacts = [
-    { label: "完整度", value: typeof noteQuality?.score === "number" ? `${noteQuality.score} 分` : qualityInfo.label, hint: noteQuality?.label || "当前解析状态" },
-    { label: "笔记结构", value: noteQuality?.double_note_ready ? "双层完成" : "继续补齐", hint: noteQuality?.llm_enhanced ? "模型重整 + 证据保留" : "精炼内容 + 原始证据" },
-    { label: "时间锚点", value: noteQuality?.time_jump_ready ? "可回跳" : timestampsAvailable ? "部分可用" : "未提供", hint: timestampsEstimated ? "含估算定位" : "支持原链接回看" },
-    { label: "证据片段", value: transcriptSegments.length ? `${transcriptSegments.length} 段` : String(contentQuery.data.chunks.length), hint: noteQuality?.question_answer_ready ? "问答可用" : qaModeStatus.label },
+  const heroMetaItems = [
+    { label: "完整度", value: typeof noteQuality?.score === "number" ? `${noteQuality.score} 分` : qualityInfo.label },
+    { label: "结构", value: noteQuality?.double_note_ready ? "双层完成" : "继续补齐" },
+    { label: "时间", value: noteQuality?.time_jump_ready ? "可回跳" : timestampsAvailable ? "部分可用" : "未提供" },
+    { label: "证据", value: transcriptSegments.length ? `${transcriptSegments.length} 段` : String(contentQuery.data.chunks.length) },
   ];
 
   const activeViewMeta =
     activeView === "refined"
-      ? { title: "精炼层", summary: "聚合结论、要点与可直接复用的表达。" }
+      ? { title: "精炼层" }
       : activeView === "transcript"
-      ? { title: "证据层", summary: "保留原始正文、时间锚点与回看入口。" }
-      : { title: "检索层", summary: "展示问答优先命中的片段与上下文。" };
+      ? { title: "证据层" }
+      : { title: "检索层" };
   return (
     <section className="page note-workbench-page">
       <article className="card detail-hero glass-hero product-detail-hero compact-detail-hero">
@@ -1459,29 +1472,19 @@ export default function ContentDetailPage() {
             </div>
           )}
 
-          <div className="detail-fact-grid">
-            {heroFacts.map((item) => (
-              <article className="detail-fact-card" key={item.label}>
+          <div className="detail-hero-meta-strip" aria-label={displayText("当前状态")}>
+            {heroMetaItems.map((item) => (
+              <article className="detail-hero-meta-item" key={item.label}>
                 <span>{displayText(item.label)}</span>
                 <strong>{displayText(item.value)}</strong>
-                <small>{displayText(item.hint)}</small>
               </article>
             ))}
           </div>
 
           {!!featuredNoteScreenshots.length && (
             <section className="detail-shot-preview-card" id="detail-note-screenshots">
-              <div className="panel-heading">
-                <div>
-                  <p className="eyebrow">{displayText("关键画面")}</p>
-                  <h3>{displayText("画面摘录")}</h3>
-                  <p className="muted-text">
-                    {displayText(
-                      noteScreenshotSummary ||
-                        "已抽取与笔记对应的关键帧，可直接回到原视频核对。",
-                    )}
-                  </p>
-                </div>
+              <div className="panel-heading detail-shot-preview-head">
+                <h3>{displayText("关键画面")}</h3>
                 <div className="pill-row">
                   <span className="pill">{displayText(`${noteScreenshots.length} 帧画面`)}</span>
                 </div>
@@ -1500,8 +1503,7 @@ export default function ContentDetailPage() {
                         <span className="detail-shot-preview-badge">{displayText(item.timestampLabel || item.rangeLabel || "关键画面")}</span>
                       </div>
                       <div className="detail-shot-preview-copy">
-                        <strong>{displayText(item.rangeLabel || item.timestampLabel || "关键画面")}</strong>
-                        <p>{displayText(shortenText(item.caption || item.sourceText || "已生成关键画面，可直接继续回看。", 88))}</p>
+                        <p>{displayText(shortenText(item.caption || item.sourceText || item.rangeLabel || item.timestampLabel || "关键画面", 72))}</p>
                       </div>
                     </>
                   );
@@ -1522,8 +1524,16 @@ export default function ContentDetailPage() {
           <div className="detail-hero-actions">
             <div className="detail-hero-primary-actions">
               <Link className="primary-button button-link" to={buildScopedChatLink("请基于这条笔记，给我一版更适合复盘的结论整理", { contentId: contentQuery.data.id, title: contentQuery.data.title })}>
-                {displayText("围绕这条内容提问")}
+                {displayText("继续提问")}
               </Link>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => reparseMutation.mutate()}
+                disabled={reparseMutation.isPending || Boolean(runningReparseJob)}
+              >
+                {reparseMutation.isPending || runningReparseJob ? displayText("重解析中...") : displayText("重新解析")}
+              </button>
               {contentQuery.data.source_url && (
                 <a className="secondary-button button-link" href={contentQuery.data.source_url} target="_blank" rel="noreferrer">
                   {displayText("打开原链接")}
@@ -1532,21 +1542,13 @@ export default function ContentDetailPage() {
             </div>
 
             <details className="detail-hero-more-actions">
-              <summary>{displayText("更多操作")}</summary>
+              <summary>{displayText("更多")}</summary>
               <div className="detail-hero-more-grid">
                 {!!noteScreenshots.length && (
                   <a className="secondary-button button-link" href="#detail-note-screenshots-gallery">
-                    {displayText("查看全部画面")}
+                    {displayText("全部画面")}
                   </a>
                 )}
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={() => reparseMutation.mutate()}
-                  disabled={reparseMutation.isPending || Boolean(runningReparseJob)}
-                >
-                  {reparseMutation.isPending || runningReparseJob ? displayText("重解析中...") : displayText("重新解析")}
-                </button>
                 <button className="secondary-button" type="button" onClick={() => exportMutation.mutate(false)} disabled={exportMutation.isPending}>
                   {exportMutation.isPending ? displayText("导出中...") : displayText("导出 Markdown")}
                 </button>
@@ -1567,21 +1569,18 @@ export default function ContentDetailPage() {
             />
           )}
           {!!reparseFailureMessage && (
-            <div className="glass-callout">
-              <strong>{displayText("重新解析没有顺利完成")}</strong>
-              <p className="muted-text">{displayText(reparseFailureMessage)}</p>
+            <div className="detail-inline-error-strip" role="status">
+              <strong>{displayText("解析失败")}</strong>
+              <p>{displayText(reparseFailureMessage)}</p>
             </div>
           )}
         </div>
       </article>
 
       <article className="card detail-section-card glass-panel layer-switch-card">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">{displayText("内容层级")}</p>
-            <h3>{displayText(activeViewMeta.title)}</h3>
-            <p className="muted-text">{displayText(activeViewMeta.summary)}</p>
-          </div>
+        <div className="layer-switch-head">
+          <p className="eyebrow">{displayText("内容层")}</p>
+          <span className="pill">{displayText(activeViewMeta.title)}</span>
         </div>
         <div className="segment-rail">
           {VIEW_ITEMS.map((item) => (
@@ -1701,9 +1700,8 @@ export default function ContentDetailPage() {
 
                   {!!stageDigestItems.length && (
                     <StageDigest
-                      eyebrow="阶段总结"
-                      title="按阶段看重点"
-                      description="片段与画面已按阶段归并。"
+                      eyebrow="阶段"
+                      title="重点"
                       items={stageDigestItems}
                       className="detail-stage-digest"
                     />
@@ -1969,9 +1967,10 @@ export default function ContentDetailPage() {
                   </div>
                 </div>
                 {(showFullNote || isEditingNote || !isBiliNoteStyle) && (
-                  <RichNoteEditor
+                  isEditingNote ? (
+                    <RichNoteEditor
                     content={fullNoteContent}
-                    editable={isEditingNote}
+                    editable
                     onChange={setRichNoteContent}
                     onSave={(html) => {
                       updateContent(contentId, { summary: contentQuery.data?.summary ?? "" }).catch(() => {});
@@ -1980,7 +1979,10 @@ export default function ContentDetailPage() {
                       void html;
                     }}
                     placeholder="在这里写精炼笔记，支持标题、加粗、列表、高亮..."
-                  />
+                    />
+                  ) : (
+                    <MarkdownNoteView markdown={fullNoteContent} />
+                  )
                 )}
               </section>
             </article>
@@ -2242,9 +2244,8 @@ export default function ContentDetailPage() {
 
                   {!!selectedVersionStageDigestItems.length && (
                     <StageDigest
-                      eyebrow="版本摘要"
-                      title="这一版的重点"
-                      description={selectedNoteVersion.id === "current" ? "当前版本重点。" : "历史版本重点。"}
+                      eyebrow="版本"
+                      title="重点"
                       items={selectedVersionStageDigestItems}
                       compact
                       className="detail-version-stage-digest"

@@ -152,6 +152,15 @@ def get_bilibili_status(request: Request) -> dict:
     }
 
 
+@router.post("/dedupe-contents")
+def dedupe_contents(request: Request, dry_run: bool = False) -> dict:
+    """将同源重复内容（保留最新）软删除，返回操作结果。dry_run=true 时只预览不执行。"""
+    settings = request.app.state.container.settings
+    repository = LibraryRepository(settings.db_path)
+    result = repository.cleanup_duplicate_contents(dry_run=dry_run)
+    return {"ok": True, **result}
+
+
 @router.post("/init-samples")
 def init_samples(request: Request) -> dict:
     """插入示例内容，帮助用户在首次引导时验证知识库基本功能。"""

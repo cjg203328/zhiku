@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 from urllib.parse import urlparse
 import re
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from .bilibili_service import BilibiliParseError, BilibiliService, TranscriptSegment
@@ -33,6 +33,14 @@ class ImportErrorCode(str, Enum):
 
 
 def _classify_error(exc: BaseException) -> ImportErrorCode:
+    # 优先按异常类型分类
+    import urllib.error
+    if isinstance(exc, TimeoutError) or isinstance(exc, urllib.error.URLError) and "timed out" in str(exc).lower():
+        return ImportErrorCode.NETWORK_TIMEOUT
+    if isinstance(exc, OSError) and any(k in str(exc).lower() for k in ("no space", "disk full", "enospc", "磁盘")):
+        return ImportErrorCode.DISK_FULL
+
+    # 再按消息关键字兜底（避免宽泛词误匹配）
     msg = str(exc).lower()
     if any(k in msg for k in ("timeout", "timed out", "connection reset", "read timeout")):
         return ImportErrorCode.NETWORK_TIMEOUT
@@ -40,9 +48,9 @@ def _classify_error(exc: BaseException) -> ImportErrorCode:
         return ImportErrorCode.AUTH_REQUIRED
     if any(k in msg for k in ("subtitle", "subtitles", "caption", "transcript", "asr", "字幕", "转写")):
         return ImportErrorCode.SUBTITLE_UNAVAILABLE
-    if any(k in msg for k in ("rate limit", "429", "too many requests", "quota")):
+    if any(k in msg for k in ("rate limit", "429", "too many requests", "quota exceeded")):
         return ImportErrorCode.LLM_RATE_LIMIT
-    if any(k in msg for k in ("connection refused", "llm", "openai", "api", "model")):
+    if any(k in msg for k in ("connection refused", "llm unavailable", "model not found", "no models")):
         return ImportErrorCode.LLM_UNAVAILABLE
     if any(k in msg for k in ("no space", "disk full", "enospc", "磁盘")):
         return ImportErrorCode.DISK_FULL
@@ -75,11 +83,23 @@ class ImportService:
         self.initial_material_service = InitialMaterialService()
         self.note_quality_service = NoteQualityService()
 
-    def import_url(self, url: str, *, note_style: str = "structured", summary_focus: str = "") -> dict:
+    def import_url(
+        self,
+        url: str,
+        *,
+        note_style: str = "structured",
+        summary_focus: str = "",
+        progress_callback: Callable[[str, int, str | None, dict[str, Any] | None], None] | None = None,
+    ) -> dict:
         platform = self._detect_platform(url)
         if platform == "bilibili":
             try:
-                parsed = self.bilibili_service.parse(url, note_style=note_style, summary_focus=summary_focus)
+                parsed = self.bilibili_service.parse(
+                    url,
+                    note_style=note_style,
+                    summary_focus=summary_focus,
+                    progress_callback=progress_callback,
+                )
                 return self._attach_import_metadata(parsed, import_mode="parsed", note_style=note_style, summary_focus=summary_focus)
             except BilibiliParseError as exc:
                 preview = self.build_url_preview(url)
@@ -371,6 +391,11 @@ class ImportService:
             note_style=note_style,
             summary_focus=summary_focus,
         )
+        self._refresh_refined_note_markdown(
+            payload,
+            note_style=note_style,
+            summary_focus=summary_focus,
+        )
         payload["metadata"]["content_terms"] = self.content_term_service.extract(payload)
         quality = self.note_quality_service.evaluate(payload)
         payload["metadata"]["note_quality"] = quality
@@ -442,6 +467,497 @@ class ImportService:
         metadata["llm_enhanced"] = True
         metadata["llm_enhanced_source"] = "import_service"
         payload["metadata"] = metadata
+
+    def _refresh_refined_note_markdown(
+        self,
+        payload: dict[str, Any],
+        *,
+        note_style: str,
+        summary_focus: str,
+    ) -> None:
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        payload["metadata"] = metadata
+
+        clean_note = self._build_refined_note_markdown(
+            payload,
+            note_style=note_style,
+            summary_focus=summary_focus,
+        )
+        if not clean_note:
+            return
+
+        existing_note = str(metadata.get("refined_note_markdown") or metadata.get("note_markdown") or "").strip()
+        if existing_note and existing_note != clean_note and not metadata.get("baseline_note_markdown"):
+            metadata["baseline_note_markdown"] = existing_note
+        metadata["note_markdown"] = clean_note
+        metadata["refined_note_markdown"] = clean_note
+
+    def _build_refined_note_markdown(
+        self,
+        payload: dict[str, Any],
+        *,
+        note_style: str,
+        summary_focus: str,
+    ) -> str:
+        platform = str(payload.get("platform") or "").strip().lower()
+        if note_style == "bilinote" and platform == "bilibili":
+            return self._build_bilibili_reading_note(payload, summary_focus=summary_focus)
+        if note_style == "bilinote" and platform == "webpage":
+            return self._build_webpage_reading_note(payload, summary_focus=summary_focus)
+        return self._build_compact_note(payload, note_style=note_style, summary_focus=summary_focus)
+
+    def _build_bilibili_reading_note(self, payload: dict[str, Any], *, summary_focus: str) -> str:
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        author = self._clean_note_line(payload.get("author"), max_length=48) or "-"
+        duration = payload.get("duration") or metadata.get("duration")
+        duration_text = f"{duration} 秒" if str(duration or "").strip() else "未知"
+        transcript_source = self._describe_transcript_source(metadata.get("transcript_source"))
+        timeline_label = self._describe_timeline_state(metadata)
+        summary = self._clean_note_line(payload.get("summary"), max_length=160) or "当前正文不足，只能先保留已获取信息。"
+        key_points = self._normalize_note_points(payload.get("key_points"))
+        practical_lines = self._build_practical_digest_lines(payload)
+        timeline_lines = self._build_timeline_digest_lines(metadata)
+        clip_sections = self._build_clip_digest_sections(metadata)
+        origin_lines = self._build_origin_digest_lines(payload, metadata, include_host=False)
+
+        lines = [
+            "## 视频速览",
+            "",
+            f"- 作者：{author}",
+            f"- 时长：{duration_text}",
+            f"- 正文来源：{transcript_source}",
+            f"- 时间定位：{timeline_label}",
+            "",
+            "## 核心结论",
+            "",
+            summary,
+        ]
+
+        if summary_focus.strip():
+            lines[7:7] = [
+                "## 本次关注",
+                "",
+                self._clean_note_line(summary_focus, max_length=120),
+                "",
+            ]
+
+        if key_points:
+            lines.extend([
+                "",
+                "## 值得记住的内容",
+                "",
+                *[f"- {item}" for item in key_points],
+            ])
+
+        if timeline_lines:
+            lines.extend([
+                "",
+                "## 时间线笔记",
+                "",
+                *timeline_lines,
+            ])
+
+        if clip_sections:
+            lines.extend([
+                "",
+                "## 片段整理",
+                "",
+                *clip_sections,
+            ])
+
+        if practical_lines:
+            lines.extend([
+                "",
+                "## 实用整理",
+                "",
+                *practical_lines,
+            ])
+
+        if origin_lines:
+            lines.extend([
+                "",
+                "## 原始信息保留",
+                "",
+                *origin_lines,
+            ])
+        return self._join_note_lines(lines)
+
+    def _build_webpage_reading_note(self, payload: dict[str, Any], *, summary_focus: str) -> str:
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        host = self._clean_note_line(urlparse(str(payload.get("source_url") or "")).netloc.replace("www.", ""), max_length=48) or "网页来源"
+        summary = self._clean_note_line(payload.get("summary"), max_length=160) or "当前正文不足，只能先保留已获取信息。"
+        key_points = self._normalize_note_points(payload.get("key_points"))
+        practical_lines = self._build_practical_digest_lines(payload)
+        origin_lines = self._build_origin_digest_lines(payload, metadata, include_host=True)
+
+        lines = [
+            "## 网页速览",
+            "",
+            f"- 来源站点：{host}",
+            f"- 内容来源：{self._clean_note_line(metadata.get('content_source') or '网页正文抽取', max_length=48)}",
+            "",
+            "## 核心结论",
+            "",
+            summary,
+        ]
+
+        if summary_focus.strip():
+            lines[5:5] = [
+                "## 本次关注",
+                "",
+                self._clean_note_line(summary_focus, max_length=120),
+                "",
+            ]
+
+        if key_points:
+            lines.extend([
+                "",
+                "## 值得记住的内容",
+                "",
+                *[f"- {item}" for item in key_points],
+            ])
+
+        if practical_lines:
+            lines.extend([
+                "",
+                "## 实用整理",
+                "",
+                *practical_lines,
+            ])
+
+        if origin_lines:
+            lines.extend([
+                "",
+                "## 原始信息保留",
+                "",
+                *origin_lines,
+            ])
+        return self._join_note_lines(lines)
+
+    def _build_compact_note(
+        self,
+        payload: dict[str, Any],
+        *,
+        note_style: str,
+        summary_focus: str,
+    ) -> str:
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        summary = self._clean_note_line(payload.get("summary"), max_length=160) or "当前正文不足，只能先保留已获取信息。"
+        key_points = self._normalize_note_points(payload.get("key_points"))
+        practical_lines = self._build_practical_digest_lines(payload)
+        action_lines = self._build_action_lines(payload, metadata, summary_focus=summary_focus)
+        origin_lines = self._build_origin_digest_lines(payload, metadata, include_host=True)
+
+        summary_title = "核心结论"
+        points_title = "内容结构"
+        useful_title = "对用户有用的信息"
+        action_title = "可执行建议"
+        if note_style == "qa":
+            summary_title = "问题结论"
+            points_title = "关键答案"
+            useful_title = "可直接参考的信息"
+            action_title = "下一步建议"
+        elif note_style == "brief":
+            summary_title = "快速摘要"
+            points_title = "重点列表"
+            useful_title = "简版整理"
+            action_title = "下一步建议"
+
+        lines = [
+            f"## {summary_title}",
+            "",
+            summary,
+        ]
+
+        if key_points:
+            lines.extend([
+                "",
+                f"## {points_title}",
+                "",
+                *[f"- {item}" for item in key_points],
+            ])
+
+        if practical_lines:
+            lines.extend([
+                "",
+                f"## {useful_title}",
+                "",
+                *practical_lines,
+            ])
+
+        if action_lines:
+            lines.extend([
+                "",
+                f"## {action_title}",
+                "",
+                *action_lines,
+            ])
+
+        if origin_lines:
+            lines.extend([
+                "",
+                "## 原始信息保留",
+                "",
+                *origin_lines,
+            ])
+        return self._join_note_lines(lines)
+
+    def _build_timeline_digest_lines(self, metadata: dict[str, Any], *, limit: int = 6) -> list[str]:
+        segments = self._sample_note_segments(metadata, limit=limit)
+        lines: list[str] = []
+        for index, item in enumerate(segments, start=1):
+            text = self._clean_note_line(item.get("text"), max_length=88)
+            if not text or self._is_low_signal_note_line(text):
+                continue
+            label = self._format_note_timestamp(item.get("start_ms")) or f"片段 {index}"
+            lines.append(f"- {label}：{text}")
+        return lines
+
+    def _build_clip_digest_sections(self, metadata: dict[str, Any], *, limit: int = 4) -> list[str]:
+        segments = self._sample_note_segments(metadata, limit=limit)
+        lines: list[str] = []
+        for index, item in enumerate(segments, start=1):
+            text = self._clean_note_line(item.get("text"), max_length=140)
+            if not text or self._is_low_signal_note_line(text):
+                continue
+            label = self._format_note_timestamp(item.get("start_ms")) or f"片段 {index}"
+            lines.extend([f"### {label}", "", text, ""])
+        return lines
+
+    def _build_practical_digest_lines(self, payload: dict[str, Any], *, limit: int = 3) -> list[str]:
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        candidates: list[str] = []
+
+        for item in self._sample_note_segments(metadata, limit=limit):
+            text = self._clean_note_line(item.get("text"), max_length=140)
+            if text and not self._is_low_signal_note_line(text):
+                candidates.append(text)
+
+        if not candidates:
+            content_text = str(payload.get("content_text") or "").strip()
+            raw_parts = re.split(r"\n{2,}|\r?\n|(?<=[。！？!?])\s+", content_text)
+            for part in raw_parts:
+                text = self._clean_note_line(part, max_length=140)
+                if text and not self._is_low_signal_note_line(text):
+                    candidates.append(text)
+                if len(candidates) >= limit:
+                    break
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            normalized = re.sub(r"\s+", "", item.lower())
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(item)
+        return deduped[:limit]
+
+    def _build_action_lines(self, payload: dict[str, Any], metadata: dict[str, Any], *, summary_focus: str) -> list[str]:
+        status = str(payload.get("status") or "").strip().lower()
+        needs_guidance = status in {"ready_estimated", "needs_cookie", "needs_asr", "asr_failed", "limited"}
+        if metadata.get("noisy_asr_detected") is True:
+            needs_guidance = True
+        if not needs_guidance:
+            return []
+
+        candidates = [
+            f"优先围绕“{self._clean_note_line(summary_focus, max_length=48)}”继续核对关键片段。"
+            if summary_focus.strip()
+            else "",
+            self._clean_note_line(metadata.get("quality_recommended_action"), max_length=88),
+            self._clean_note_line(metadata.get("capture_recommended_action"), max_length=88),
+        ]
+        if metadata.get("noisy_asr_detected") is True:
+            candidates.append("当前正文主要来自音频转写，重要结论建议结合证据层逐段核对。")
+
+        lines: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            text = self._clean_note_line(item, max_length=96)
+            if self._is_low_signal_note_line(text):
+                continue
+            normalized = re.sub(r"\s+", "", text.lower())
+            if not text or normalized in seen:
+                continue
+            seen.add(normalized)
+            lines.append(f"- {text}")
+        return lines[:3]
+
+    def _build_origin_digest_lines(
+        self,
+        payload: dict[str, Any],
+        metadata: dict[str, Any],
+        *,
+        include_host: bool,
+    ) -> list[str]:
+        lines: list[str] = []
+        if include_host:
+            source_url = str(payload.get("source_url") or "").strip()
+            host = self._clean_note_line(urlparse(source_url).netloc.replace("www.", ""), max_length=48)
+            if host:
+                lines.append(f"- 来源站点：{host}")
+
+        transcript_source = self._describe_transcript_source(metadata.get("transcript_source"))
+        if transcript_source and transcript_source != "原始正文":
+            lines.append(f"- 正文来源：{transcript_source}")
+
+        timeline_label = self._describe_timeline_state(metadata)
+        if timeline_label and timeline_label != "未建立时间定位":
+            lines.append(f"- 时间定位：{timeline_label}")
+
+        capture_summary = self._clean_note_line(metadata.get("capture_summary"), max_length=88)
+        if capture_summary:
+            lines.append(f"- 当前说明：{capture_summary}")
+
+        return lines[:4]
+
+    def _sample_note_segments(self, metadata: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
+        raw_segments = metadata.get("semantic_transcript_segments")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raw_segments = metadata.get("transcript_segments")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            return []
+
+        usable = [
+            item
+            for item in raw_segments
+            if (
+                isinstance(item, dict)
+                and self._clean_note_line(item.get("text"), max_length=220)
+                and not self._is_low_signal_note_line(self._clean_note_line(item.get("text"), max_length=220))
+            )
+        ]
+        if len(usable) <= limit:
+            return usable
+
+        selected: list[dict[str, Any]] = []
+        last_index = len(usable) - 1
+        for slot in range(limit):
+            index = round(slot * last_index / max(limit - 1, 1))
+            candidate = usable[index]
+            if candidate not in selected:
+                selected.append(candidate)
+        return selected[:limit]
+
+    def _normalize_note_points(self, value: Any, *, limit: int = 5) -> list[str]:
+        if not isinstance(value, list):
+            return []
+
+        skip_prefixes = (
+            "当前状态",
+            "建议下一步",
+            "笔记风格",
+            "播放",
+            "点赞",
+            "链接",
+        )
+        points: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            text = self._clean_note_line(item, max_length=88)
+            if not text:
+                continue
+            if self._is_low_signal_note_line(text):
+                continue
+            if any(text.startswith(prefix) for prefix in skip_prefixes):
+                continue
+            normalized = re.sub(r"\s+", "", text.lower())
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            points.append(text)
+            if len(points) >= limit:
+                break
+        return points
+
+    def _describe_transcript_source(self, value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized == "subtitle":
+            return "字幕正文"
+        if normalized.startswith("asr"):
+            return "音频转写"
+        if normalized == "description":
+            return "简介补全"
+        return "原始正文"
+
+    def _describe_timeline_state(self, metadata: dict[str, Any]) -> str:
+        if metadata.get("timestamps_estimated"):
+            return "已建立估算时间定位"
+        if metadata.get("timestamps_available"):
+            return "已建立时间定位"
+        return "未建立时间定位"
+
+    def _format_note_timestamp(self, value: Any) -> str:
+        try:
+            milliseconds = int(value)
+        except (TypeError, ValueError):
+            return ""
+        if milliseconds < 0:
+            milliseconds = 0
+        total_seconds = milliseconds // 1000
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _clean_note_line(self, value: Any, *, max_length: int | None = None) -> str:
+        cleaned = str(value or "")
+        if not cleaned.strip():
+            return ""
+        cleaned = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1", cleaned)
+        cleaned = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", cleaned)
+        cleaned = re.sub(r"https?://127\.0\.0\.1:\d+/static/[^\s)]+", "", cleaned)
+        cleaned = re.sub(r"https?://[^\s)]+", "", cleaned)
+        cleaned = re.sub(r"\*?Screenshot-(?:\[\d{2}:\d{2}(?::\d{2})?\]|\d{2}:\d{2}(?::\d{2})?)", "", cleaned)
+        cleaned = cleaned.replace("BiliNote 风格笔记", "")
+        cleaned = cleaned.replace("BiliNote", "")
+        cleaned = cleaned.replace("**", "")
+        cleaned = cleaned.replace("__", "")
+        cleaned = cleaned.replace("`", "")
+        cleaned = re.sub(r"\bBV[0-9A-Za-z]+\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bav\d+\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^#{1,6}\s*", "", cleaned)
+        cleaned = re.sub(r"^\s*>\s*", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -|：:")
+        if max_length is not None and len(cleaned) > max_length:
+            cleaned = cleaned[:max_length].rstrip() + "..."
+        return cleaned
+
+    def _is_low_signal_note_line(self, text: str) -> bool:
+        if not text.strip():
+            return True
+
+        low_signal_prefixes = (
+            "当前正文还不够稳定",
+            "当前正文不足",
+            "当前仅保留了基础",
+            "当前只保留了基础",
+            "当前只保留了较弱材料",
+            "当前还没有提炼出稳定要点",
+            "当前没有提炼出稳定要点",
+            "这条视频还没有拿到可直接使用的正文",
+            "内容仍需继续补齐",
+        )
+        if any(text.startswith(prefix) for prefix in low_signal_prefixes):
+            return True
+
+        if re.search(r"(?:播放|点赞|投币|收藏|转发)\s*[：:]\s*\d+", text):
+            return True
+
+        if re.search(r"\b(?:BV[0-9A-Za-z]+|av\d+)\b", text, flags=re.IGNORECASE):
+            return True
+
+        if re.match(r"^(?:打开原视频|原视频链接|源视频链接)", text):
+            return True
+
+        return False
+
+    def _join_note_lines(self, lines: list[str]) -> str:
+        merged = "\n".join(lines)
+        merged = re.sub(r"\n{3,}", "\n\n", merged)
+        return merged.strip()
 
     def _derive_semantic_transcript_segments(
         self,

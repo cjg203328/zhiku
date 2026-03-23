@@ -15,15 +15,15 @@ if ($hasNonAsciiPath) {
   $webCommand = "Set-Location '$repoRoot'; npm.cmd run dev:web"
 }
 
-Write-Host '==> 启动本地网页原型'
-Write-Host '==> 将在新窗口分别启动 API 和 Web'
+Write-Host '==> Starting local web preview'
+Write-Host '==> API and Web will open in separate windows'
 if ($hasNonAsciiPath) {
-  Write-Host '==> 检测到仓库路径包含非 ASCII 字符，Web 端将切换到稳定预览模式'
-  Write-Host '==> 稳定预览模式将使用项目内置代理服务，不再依赖 vite preview'
+  Write-Host '==> Non-ASCII path detected, switching Web to stable preview mode'
+  Write-Host '==> Stable preview uses the built-in proxy server instead of vite preview'
   if (Test-Path $distIndex) {
-    Write-Host '==> 检测到已有前端构建产物，本次将直接复用，避免后台构建卡住'
+    Write-Host '==> Existing web build found, reusing it directly'
   } else {
-    Write-Host '==> 尚未找到前端构建产物，将先执行一次 build 再启动预览'
+    Write-Host '==> Web build not found, building once before preview starts'
   }
 }
 
@@ -43,4 +43,4 @@ Start-Process powershell.exe -ArgumentList @(
   $webCommand
 )
 
-Write-Host '==> 访问地址：http://127.0.0.1:4173'
+Write-Host '==> Open http://127.0.0.1:4173'

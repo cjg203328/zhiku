@@ -354,6 +354,8 @@ def update_settings(payload: SettingsUpdate, request: Request) -> SettingsRespon
     _apply_runtime_settings(request, payload)
     _save_ui_snapshot(request, payload)
     _write_env_file(request)
+    from ..config import get_settings
+    get_settings.cache_clear()
     return _build_response(request)
 
 
@@ -373,3 +375,5 @@ def open_bilibili_bridge_helper(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"打开浏览器小助手失败：{exc}") from exc
+
+

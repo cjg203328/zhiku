@@ -502,7 +502,86 @@ class LibraryRepository:
 
         return self.get_content(content_id)
 
-    def list_contents(self, query: str | None = None, collection_id: str | None = None) -> dict[str, Any]:
+    def upsert_content_by_source(self, *, content: dict[str, Any]) -> dict[str, Any]:
+        existing = self.find_active_content_by_source(content=content)
+        if existing is None:
+            return self.create_content(content=content)
+
+        updated = self.replace_content(existing["id"], content=content)
+        return updated or existing
+
+    def find_active_content_by_source(self, *, content: dict[str, Any]) -> dict[str, Any] | None:
+        source_url = str(content.get("source_url") or "").strip()
+        source_file = str(content.get("source_file") or "").strip()
+        metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
+        bvid = str(metadata.get("bvid") or "").strip()
+        page_number_raw = metadata.get("page_number")
+        page_number = 1
+        try:
+            if page_number_raw not in (None, ""):
+                page_number = max(1, int(page_number_raw))
+        except (TypeError, ValueError):
+            page_number = 1
+
+        connection = self._connect()
+        try:
+            if source_url:
+                row = connection.execute(
+                    """
+                    SELECT id
+                    FROM contents
+                    WHERE deleted_at IS NULL
+                      AND source_url = ?
+                    ORDER BY datetime(updated_at) DESC
+                    LIMIT 1
+                    """,
+                    (source_url,),
+                ).fetchone()
+                if row is not None:
+                    return self.get_content(str(row["id"]))
+
+            if source_file:
+                row = connection.execute(
+                    """
+                    SELECT id
+                    FROM contents
+                    WHERE deleted_at IS NULL
+                      AND source_file = ?
+                    ORDER BY datetime(updated_at) DESC
+                    LIMIT 1
+                    """,
+                    (source_file,),
+                ).fetchone()
+                if row is not None:
+                    return self.get_content(str(row["id"]))
+
+            if bvid:
+                row = connection.execute(
+                    """
+                    SELECT id
+                    FROM contents
+                    WHERE deleted_at IS NULL
+                      AND json_extract(metadata_json, '$.bvid') = ?
+                      AND CAST(COALESCE(json_extract(metadata_json, '$.page_number'), 1) AS INTEGER) = ?
+                    ORDER BY datetime(updated_at) DESC
+                    LIMIT 1
+                    """,
+                    (bvid, page_number),
+                ).fetchone()
+                if row is not None:
+                    return self.get_content(str(row["id"]))
+        finally:
+            connection.close()
+
+        return None
+
+    def list_contents(
+        self,
+        query: str | None = None,
+        collection_id: str | None = None,
+        *,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         connection = self._connect()
         try:
             params: list[Any] = []
@@ -517,7 +596,7 @@ class LibraryRepository:
             where_sql = " AND ".join(where_clauses)
             rows = connection.execute(
                 f"""
-                SELECT id, title, platform, source_type, summary, tags_json, category,
+                SELECT id, title, platform, source_type, source_url, source_file, summary, tags_json, category,
                        collection_id, metadata_json, created_at, updated_at, status
                 FROM contents
                 WHERE {where_sql}
@@ -529,16 +608,119 @@ class LibraryRepository:
             connection.close()
 
         items = []
+        seen_source_keys: set[str] = set()
         for row in rows:
             item = dict(row)
             item["tags"] = json.loads(item.pop("tags_json") or "[]")
             metadata = json.loads(item.pop("metadata_json") or "{}")
+            source_key = self._build_content_source_key(item, metadata)
+            if source_key and source_key in seen_source_keys:
+                continue
+            if source_key:
+                seen_source_keys.add(source_key)
             item["cover_url"] = metadata.get("cover")
             item["parse_mode"] = metadata.get("parse_mode")
             item["note_style"] = metadata.get("note_style")
             item["collection_id"] = item.get("collection_id")
             items.append(item)
+        if limit is not None:
+            items = items[: max(limit, 0)]
+
         return {"items": items, "total": len(items)}
+
+    def cleanup_duplicate_contents(
+        self,
+        *,
+        limit: int | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        if limit is not None and limit <= 0:
+            return {
+                "ok": True,
+                "dry_run": dry_run,
+                "duplicate_groups": 0,
+                "duplicates_archived": 0,
+                "items": [],
+            }
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT id, title, source_url, source_file, status, content_text, summary,
+                       metadata_json, created_at, updated_at
+                FROM contents
+                WHERE deleted_at IS NULL
+                ORDER BY
+                    CASE status
+                        WHEN 'ready' THEN 0
+                        WHEN 'ready_estimated' THEN 1
+                        WHEN 'limited' THEN 2
+                        WHEN 'completed' THEN 3
+                        WHEN 'needs_asr' THEN 4
+                        WHEN 'needs_cookie' THEN 5
+                        WHEN 'asr_failed' THEN 6
+                        WHEN 'import_pending' THEN 7
+                        WHEN 'import_failed' THEN 8
+                        ELSE 9
+                    END ASC,
+                    LENGTH(COALESCE(content_text, '')) DESC,
+                    LENGTH(COALESCE(summary, '')) DESC,
+                    datetime(updated_at) DESC,
+                    datetime(created_at) DESC
+                """
+            ).fetchall()
+
+            kept_by_source: dict[str, dict[str, str]] = {}
+            duplicate_groups: set[str] = set()
+            archived_items: list[dict[str, str]] = []
+
+            for row in rows:
+                item = dict(row)
+                metadata = json.loads(item.pop("metadata_json") or "{}")
+                source_key = self._build_content_source_key(item, metadata)
+                if not source_key:
+                    continue
+
+                title = str(item.get("title") or "").strip() or "未命名内容"
+                existing = kept_by_source.get(source_key)
+                if existing is None:
+                    kept_by_source[source_key] = {
+                        "id": str(item.get("id") or "").strip(),
+                        "title": title,
+                    }
+                    continue
+
+                duplicate_groups.add(source_key)
+                archived_items.append(
+                    {
+                        "duplicate_id": str(item.get("id") or "").strip(),
+                        "duplicate_title": title,
+                        "kept_id": existing["id"],
+                        "kept_title": existing["title"],
+                        "source_key": source_key,
+                    }
+                )
+                if limit is not None and len(archived_items) >= limit:
+                    break
+
+            if archived_items and not dry_run:
+                now = datetime.now(UTC).isoformat()
+                connection.executemany(
+                    "UPDATE contents SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+                    [(now, now, item["duplicate_id"]) for item in archived_items],
+                )
+                connection.commit()
+        finally:
+            connection.close()
+
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "duplicate_groups": len(duplicate_groups),
+            "duplicates_archived": len(archived_items),
+            "items": archived_items,
+        }
 
     def search_content_chunks(
         self,
@@ -1165,6 +1347,26 @@ class LibraryRepository:
             "updated_at": updated_at,
             "deleted_at": deleted_at,
         }
+
+    def _build_content_source_key(self, item: dict[str, Any], metadata: dict[str, Any]) -> str | None:
+        source_url = str(item.get("source_url") or "").strip()
+        if source_url:
+            return f"url:{source_url}"
+
+        source_file = str(item.get("source_file") or "").strip()
+        if source_file:
+            return f"file:{source_file}"
+
+        bvid = str(metadata.get("bvid") or "").strip()
+        if bvid:
+            page_number_raw = metadata.get("page_number")
+            try:
+                page_number = max(1, int(page_number_raw)) if page_number_raw not in (None, "") else 1
+            except (TypeError, ValueError):
+                page_number = 1
+            return f"bilibili:{bvid}:{page_number}"
+
+        return None
 
     def _build_transcript_chunks(self, metadata: dict[str, Any]) -> list[dict[str, Any]]:
         semantic_segments = metadata.get("semantic_transcript_segments")

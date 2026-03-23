@@ -6,3 +6,4 @@
 - `services/api`：本地 sidecar 服务
 - 前后端通过 `HTTP + SSE` 通信
 - 数据最终写入本地知识库目录
+- 可选外部研究引擎接入见 `docs/architecture/deerflow_local_integration.md`

@@ -21,6 +21,10 @@ class ContentUpgradeService:
         retry_incomplete: bool = True,
         dry_run: bool = False,
     ) -> dict[str, Any]:
+        duplicate_cleanup = repository.cleanup_duplicate_contents(dry_run=dry_run)
+        duplicates_archived = int(duplicate_cleanup.get("duplicates_archived") or 0)
+        duplicate_groups = int(duplicate_cleanup.get("duplicate_groups") or 0)
+
         listing = repository.list_contents()
         rows = listing.get("items") if isinstance(listing, dict) else []
         if not isinstance(rows, list):
@@ -120,6 +124,8 @@ class ContentUpgradeService:
                 "fallback_repaired": fallback_repaired,
                 "skipped": skipped,
                 "failed": failed,
+                "duplicate_groups": duplicate_groups,
+                "duplicates_archived": duplicates_archived,
                 "dry_run": dry_run,
                 "limit": limit,
             },
@@ -132,6 +138,8 @@ class ContentUpgradeService:
                 reimported=reimported,
                 fallback_repaired=fallback_repaired,
                 failed=failed,
+                duplicate_groups=duplicate_groups,
+                duplicates_archived=duplicates_archived,
             ),
         }
 
@@ -308,10 +316,16 @@ class ContentUpgradeService:
         reimported: int,
         fallback_repaired: int,
         failed: int,
+        duplicate_groups: int,
+        duplicates_archived: int,
     ) -> str:
         if dry_run:
+            if duplicate_groups > 0:
+                return f"本次识别出 {targeted} 条可升级内容，并发现 {duplicate_groups} 组同源重复项。"
             return f"本次共识别出 {targeted} 条可升级内容。"
         if targeted == 0:
+            if duplicates_archived > 0:
+                return f"当前没有发现需要升级的旧内容，但已整理 {duplicate_groups} 组同源重复项，并回收到回收站 {duplicates_archived} 条。"
             return "当前没有发现需要升级的旧内容。"
 
         parts = [f"本次已处理 {upgraded} 条旧内容"]
@@ -323,4 +337,6 @@ class ContentUpgradeService:
             parts.append(f"重抓失败后回退本地修复 {fallback_repaired} 条")
         if failed:
             parts.append(f"失败 {failed} 条")
-        return "，".join(parts) + "。"
+        if duplicates_archived:
+            parts.append(f"并将 {duplicate_groups} 组同源重复项共 {duplicates_archived} 条移入回收站")
+        return "；".join(parts) + "。"

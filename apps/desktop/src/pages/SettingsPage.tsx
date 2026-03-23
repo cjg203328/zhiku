@@ -3,13 +3,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import {
   createBackup,
+  dedupeContents,
+  dedupeContentsPreview,
+  type DedupeResult,
   exportDiagnostics,
   fetchModelCatalog,
   getBilibiliStatus,
   getModelStatus,
   getSettings,
-  openBilibiliBridgeHelper,
   getSystemStatus,
+  openBilibiliBridgeHelper,
   probeModelConnection,
   triggerReindex,
   updateSettings,
@@ -161,10 +164,27 @@ export default function SettingsPage() {
       setLocalMessage("索引重建已触发，后台执行中，稍后刷新状态即可。");
     },
   });
+  const dedupePreviewMutation = useMutation({
+    mutationFn: dedupeContentsPreview,
+    onSuccess: (result) => setDedupePreview(result),
+  });
+  const dedupeMutation = useMutation({
+    mutationFn: dedupeContents,
+    onSuccess: (result) => {
+      void queryClient.invalidateQueries({ queryKey: ["contents"] });
+      void queryClient.invalidateQueries({ queryKey: ["trash"] });
+      setDedupePreview(null);
+      const msg = result.duplicates_archived > 0
+        ? `已将 ${result.duplicates_archived} 条重复内容移至回收站（${result.duplicate_groups} 组）。`
+        : "没有发现重复内容。";
+      setLocalMessage(msg);
+    },
+  });
   const saveMutation = useMutation({
     mutationFn: updateSettings,
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["settings"] });
+      await queryClient.invalidateQueries({ queryKey: ["system-status"] });
       await queryClient.invalidateQueries({ queryKey: ["bilibili-status"] });
       setLocalMessage("配置已保存。");
       pageTopRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -185,7 +205,7 @@ export default function SettingsPage() {
   const [cookieEnabled, setCookieEnabled] = useState(false);
   const [cookieFile, setCookieFile] = useState("");
   const [cookieInline, setCookieInline] = useState("");
-
+  const [dedupePreview, setDedupePreview] = useState<DedupeResult | null>(null);
   useEffect(() => {
     if (!settingsQuery.data) return;
     const matchedPreset = findMatchingPreset(
@@ -269,7 +289,6 @@ export default function SettingsPage() {
     ? "已保存手动登录状态"
     : "当前只读取公开内容";
   const bilibiliCookieSource = bilibiliSettings?.cookie_source ?? "none";
-
   const chatModelSuggestions = useMemo(
     () => uniqueValues([...(activePreset.chatOptions ?? []), ...modelCatalog, chatModel]),
     [activePreset.chatOptions, chatModel, modelCatalog],
@@ -312,7 +331,6 @@ export default function SettingsPage() {
       asrSettings?.local_runtime_ready,
     ],
   );
-
   function applyProviderPreset(nextPreset: ProviderPreset) {
     setProviderId(nextPreset.id);
     modelCatalogMutation.reset();
@@ -456,7 +474,6 @@ export default function SettingsPage() {
       : asrModeChoice === "local"
       ? Boolean(asrModel.trim())
       : Boolean(asrBaseUrl.trim() && asrModel.trim() && (asrApiKey.trim() || currentAsrHasDedicatedKey));
-
   const requestedFocus = (searchParams.get("focus")?.trim() || "") as "" | "model" | "asr" | "bilibili";
 
   useEffect(() => {
@@ -486,7 +503,7 @@ export default function SettingsPage() {
         <div className="page-header">
           <div>
             <p className="eyebrow">{displayText("设置")}</p>
-            <h2>{displayText("模型与采集")}</h2>
+            <h2>{displayText("连接与采集")}</h2>
           </div>
         </div>
 
@@ -501,19 +518,19 @@ export default function SettingsPage() {
 
         <div className="header-actions settings-top-actions">
           <button
-            className="primary-button"
+            className="secondary-button"
             type="button"
             onClick={() => openBilibiliHelperMutation.mutate()}
             disabled={openBilibiliHelperMutation.isPending}
           >
-            {openBilibiliHelperMutation.isPending ? displayText("打开中...") : displayText("打开桥接")}
+            {openBilibiliHelperMutation.isPending ? displayText("打开中...") : displayText("桥接")}
           </button>
           <button
             className="secondary-button"
             type="button"
             onClick={jumpToBilibiliSection}
           >
-            {displayText("B站模块")}
+            {displayText("B站")}
           </button>
           <button
             className="secondary-button"
@@ -525,8 +542,8 @@ export default function SettingsPage() {
           </button>
         </div>
 
-        {settingsQuery.isLoading && <p className="muted-text">{displayText("正在读取设置...")}</p>}
-        {settingsQuery.isError && <p className="error-text">{displayText("当前还没读到设置，请确认本地服务已启动。")}</p>}
+        {settingsQuery.isLoading && <p className="muted-text">{displayText("读取中...")}</p>}
+        {settingsQuery.isError && <p className="error-text">{displayText("暂时读不到设置，请确认本地服务已启动。")}</p>}
         {localMessage && <p className="success-text">{displayText(localMessage)}</p>}
         {saveMutation.isError && <p className="error-text">{displayText("保存失败，请确认本地服务仍在运行。")}</p>}
         {diagnosticsMutation.isSuccess && <p className="success-text">{displayText(`排查信息已导出：${diagnosticsMutation.data.path}`)}</p>}
@@ -545,7 +562,7 @@ export default function SettingsPage() {
           <div className="panel-heading">
             <div>
               <p className="eyebrow">{displayText("主模型")}</p>
-              <h3>{displayText("主模型连接")}</h3>
+              <h3>{displayText("主模型")}</h3>
             </div>
           </div>
 
@@ -671,7 +688,7 @@ export default function SettingsPage() {
           </div>
 
           <details className="metadata-details advanced-details">
-            <summary>{displayText("高级设置")}</summary>
+            <summary>{displayText("高级")}</summary>
             <div className="form-grid">
               <label className="form-block">
                 <span className="field-label">{displayText("接口地址")}</span>
@@ -693,7 +710,7 @@ export default function SettingsPage() {
                 {statusQuery.data?.models.embedding_model_mismatch && (
                   <div className="field-hint field-hint-warning" style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
                     <span style={{ flex: 1 }}>
-                      ⚠ 当前向量模型（{embeddingModel}）与建立索引时的模型（{statusQuery.data.models.index_embedding_model}）不一致，检索质量可能受影响。
+                      ⚠ 当前向量模型（{embeddingModel}）与建索引时的模型（{statusQuery.data.models.index_embedding_model}）不一致，检索可能偏移。
                     </span>
                     <button
                       type="button"
@@ -702,7 +719,7 @@ export default function SettingsPage() {
                       disabled={reindexMutation.isPending}
                       style={{ flexShrink: 0 }}
                     >
-                      {reindexMutation.isPending ? "重建中…" : "立即重建"}
+                      {reindexMutation.isPending ? "重建中…" : "重建索引"}
                     </button>
                   </div>
                 )}
@@ -712,12 +729,12 @@ export default function SettingsPage() {
 
           {(modelCatalogMutation.isPending || modelCatalogMutation.isError || modelCatalog.length > 0) && (
             <article className="advanced-sheet settings-advanced-sheet">
-              {modelCatalogMutation.isPending && <p className="muted-text">{displayText("正在读取厂商可用模型，请稍候。")}</p>}
+              {modelCatalogMutation.isPending && <p className="muted-text">{displayText("读取模型中...")}</p>}
               {modelCatalogMutation.isError && <p className="error-text">{displayText((modelCatalogMutation.error as Error).message)}</p>}
               {modelCatalog.length > 0 && (
                 <p className="muted-text">
                   {displayText(
-                    modelCatalogUsesSavedKey ? "本次读取使用的是已保存 Key。" : "本次读取使用的是你刚刚填写的 Key。",
+                    modelCatalogUsesSavedKey ? "使用已保存 Key。" : "使用刚填写的 Key。",
                   )}
                 </p>
               )}
@@ -726,7 +743,7 @@ export default function SettingsPage() {
 
           {(modelProbeMutation.isPending || modelProbeMutation.isError || modelProbeResult) && (
             <article className="advanced-sheet settings-advanced-sheet">
-              {modelProbeMutation.isPending && <p className="muted-text">{displayText("正在发起真实请求，请稍候。")}</p>}
+              {modelProbeMutation.isPending && <p className="muted-text">{displayText("测试中...")}</p>}
               {modelProbeMutation.isError && <p className="error-text">{displayText((modelProbeMutation.error as Error).message)}</p>}
               {modelProbeResult && (
                 <div className="simple-health-grid">
@@ -742,9 +759,7 @@ export default function SettingsPage() {
                     <span className="metric-label">{displayText("实际模型")}</span>
                     <strong>{displayText(modelProbeResult.model || "未返回")}</strong>
                   </article>
-                  {modelProbeUsesSavedKey && (
-                    <p className="muted-text settings-inline-note">{displayText("这次连通性测试使用的是已保存 Key。")}</p>
-                  )}
+                  {modelProbeUsesSavedKey && <p className="muted-text settings-inline-note">{displayText("使用已保存 Key。")}</p>}
                 </div>
               )}
             </article>
@@ -764,7 +779,7 @@ export default function SettingsPage() {
           <div className="panel-heading">
             <div>
               <p className="eyebrow">{displayText("转写")}</p>
-              <h3>{displayText("补正文方式")}</h3>
+              <h3>{displayText("转写")}</h3>
             </div>
           </div>
 
@@ -779,7 +794,7 @@ export default function SettingsPage() {
                     : "当前未启用转写",
                 )}
               </strong>
-              <p className="muted-text">{displayText(asrSettings?.summary?.trim() || "没有字幕时，系统会在这里决定如何恢复正文。")}</p>
+              <p className="muted-text">{displayText(asrSettings?.summary?.trim() || "没有字幕时再补正文。")}</p>
             </div>
             <span className="subtle-pill">{displayText(getAsrChoiceLabel(asrModeChoice))}</span>
           </div>
@@ -869,7 +884,7 @@ export default function SettingsPage() {
           <div className="panel-heading">
             <div>
               <p className="eyebrow">{displayText("B 站登录状态")}</p>
-              <h3>{displayText("B 站连接")}</h3>
+              <h3>{displayText("B站")}</h3>
             </div>
           </div>
 
@@ -928,8 +943,8 @@ export default function SettingsPage() {
                 <strong>
                   {displayText(
                     browserBridgeActive
-                      ? `当前来源：${browserBridgeSourceLabel || "浏览器小助手"}`
-                      : "还没有收到浏览器登录状态",
+                      ? `来源 ${browserBridgeSourceLabel || "浏览器小助手"}`
+                      : "等待浏览器同步",
                   )}
                 </strong>
                 {!!browserBridgeLastSeen && (
@@ -942,12 +957,12 @@ export default function SettingsPage() {
           )}
 
           <details className="metadata-details advanced-details">
-            <summary>{displayText("手动登录态")}</summary>
+            <summary>{displayText("手动来源")}</summary>
 
             <div className="segment-rail">
               {[
-                { value: false, label: "关闭手动来源" },
-                { value: true, label: "启用手动来源" },
+                { value: false, label: "关闭手动" },
+                { value: true, label: "启用手动" },
               ].map((item) => (
                 <button
                   key={item.label}
@@ -971,11 +986,11 @@ export default function SettingsPage() {
                 />
               </label>
               <label className="form-block form-block-full">
-                <span className="field-label">{displayText("或直接粘贴完整内容")}</span>
+                <span className="field-label">{displayText("或粘贴完整内容")}</span>
                 <textarea
                   className="text-area"
                   rows={4}
-                  placeholder={displayText("仅供你自己的本地验证使用。")}
+                  placeholder={displayText("仅限本地自用。")}
                   value={cookieInline}
                   onChange={(event) => setCookieInline(event.target.value)}
                 />
@@ -984,12 +999,12 @@ export default function SettingsPage() {
 
             {!cookieReady && cookieEnabled && (
               <p className="muted-text settings-inline-note">
-                {displayText("自动桥接不可用时，再填写 Cookie 文件路径或完整内容。")}
+                {displayText("桥接不可用时再填手动来源。")}
               </p>
             )}
             {bilibiliCookieStored && !cookieEnabled && (
               <p className="muted-text settings-inline-note">
-                {displayText("当前已保存手动登录状态，但默认不会参与采集。")}
+                {displayText("已保存手动来源，当前未启用。")}
               </p>
             )}
           </details>
@@ -1004,7 +1019,7 @@ export default function SettingsPage() {
               onClick={() => openBilibiliHelperMutation.mutate()}
               disabled={openBilibiliHelperMutation.isPending}
             >
-              {openBilibiliHelperMutation.isPending ? displayText("打开中...") : displayText("打开桥接")}
+              {openBilibiliHelperMutation.isPending ? displayText("打开中...") : displayText("桥接")}
             </button>
             <button
               className="secondary-button"
@@ -1020,7 +1035,7 @@ export default function SettingsPage() {
                 type="button"
                 onClick={() => void handleCopy(browserBridgeExtensionDir, "浏览器小助手目录")}
               >
-                {displayText("复制小助手目录")}
+                {displayText("复制扩展目录")}
               </button>
             )}
             {!!browserBridgeInstallDoc && (
@@ -1029,7 +1044,7 @@ export default function SettingsPage() {
                 type="button"
                 onClick={() => void handleCopy(browserBridgeInstallDoc, "安装说明路径")}
               >
-                {displayText("复制安装说明")}
+                {displayText("复制安装文档")}
               </button>
             )}
           </div>
@@ -1041,26 +1056,100 @@ export default function SettingsPage() {
 
         <article className="backup-status-card">
           <div className="backup-status-info">
-            <strong>{displayText("知识库备份")}</strong>
+            <strong>{displayText("备份")}</strong>
             {backupMutation.isSuccess ? (
               <p className="muted-text">
                 {displayText("上次备份")}：{new Date(backupMutation.data.created_at).toLocaleString()}<br />
                 <span className="backup-path">{backupMutation.data.archive_path}</span>
               </p>
             ) : (
-              <p className="muted-text">{displayText("暂无备份记录。")}</p>
+              <p className="muted-text">{displayText("还没有备份。")}</p>
             )}
             {backupMutation.isError && <p className="error-text">{displayText("备份失败，请稍后再试。")}</p>}
           </div>
           <button className="secondary-button" type="button" onClick={() => backupMutation.mutate()} disabled={backupMutation.isPending}>
-            {backupMutation.isPending ? displayText("备份中...") : displayText("立即备份")}
+            {backupMutation.isPending ? displayText("备份中...") : displayText("备份")}
           </button>
         </article>
+
+        <article className="backup-status-card">
+          <div className="backup-status-info">
+            <strong>{displayText("重复内容整理")}</strong>
+            {dedupeMutation.isSuccess ? (
+              <p className="muted-text">{displayText(
+                dedupeMutation.data.duplicates_archived > 0
+                  ? `已归档 ${dedupeMutation.data.duplicates_archived} 条重复内容（${dedupeMutation.data.duplicate_groups} 组）。`
+                  : "没有发现重复内容。"
+              )}</p>
+            ) : (
+              <p className="muted-text">{displayText("将同源重复内容归并到回收站，保留最新版本。")}</p>
+            )}
+            {dedupePreviewMutation.isError && <p className="error-text">{displayText("预检失败，请稍后再试。")}</p>}
+            {dedupeMutation.isError && <p className="error-text">{displayText("整理失败，请稍后再试。")}</p>}
+          </div>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => { setDedupePreview(null); dedupePreviewMutation.mutate(); }}
+            disabled={dedupePreviewMutation.isPending || dedupeMutation.isPending}
+          >
+            {dedupePreviewMutation.isPending ? displayText("检查中...") : displayText("检查重复")}
+          </button>
+        </article>
+
+        {dedupePreview && (
+          <article className="dedupe-preview-card card">
+            <div className="backup-status-info">
+              <strong>{displayText(
+                dedupePreview.duplicate_groups > 0
+                  ? `发现 ${dedupePreview.duplicate_groups} 组重复内容（${dedupePreview.duplicates_archived} 条将被归档）`
+                  : "没有发现重复内容"
+              )}</strong>
+              {dedupePreview.duplicate_groups > 0 && (
+                <div className="dedupe-preview-list">
+                  {dedupePreview.items.slice(0, 8).map((item) => (
+                    <div key={item.duplicate_id} className="dedupe-preview-row">
+                      <span className="pill pill-sm">{displayText("重复")}</span>
+                      <span className="dedupe-preview-title muted-text">{displayText(item.duplicate_title)}</span>
+                      <span className="dedupe-preview-arrow">→</span>
+                      <span className="dedupe-preview-title">{displayText(item.kept_title)}</span>
+                    </div>
+                  ))}
+                  {dedupePreview.items.length > 8 && (
+                    <p className="muted-text" style={{ fontSize: 12, marginTop: 4 }}>
+                      {displayText(`还有 ${dedupePreview.items.length - 8} 条…`)}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="header-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => setDedupePreview(null)}
+                disabled={dedupeMutation.isPending}
+              >
+                {displayText("取消")}
+              </button>
+              {dedupePreview.duplicate_groups > 0 && (
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => dedupeMutation.mutate()}
+                  disabled={dedupeMutation.isPending}
+                >
+                  {dedupeMutation.isPending ? displayText("整理中...") : displayText("确认整理")}
+                </button>
+              )}
+            </div>
+          </article>
+        )}
 
         {statusQuery.data?.index?.needs_rebuild && (
           <div className="field-hint field-hint-warning" style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
             <span style={{ flex: 1 }}>
-              ⚠ 检测到 {statusQuery.data.index.chunks_count} 个内容片段但向量索引文件不存在，语义检索暂时不可用。
+              ⚠ 已有 {statusQuery.data.index.chunks_count} 个片段，但向量索引缺失，语义检索暂不可用。
             </span>
             <button
               type="button"
@@ -1081,7 +1170,7 @@ export default function SettingsPage() {
             onClick={() => diagnosticsMutation.mutate()}
             disabled={diagnosticsMutation.isPending}
           >
-            {diagnosticsMutation.isPending ? displayText("导出中...") : displayText("导出排查信息")}
+            {diagnosticsMutation.isPending ? displayText("导出中...") : displayText("导出诊断")}
           </button>
           {settingsQuery.data && (
             <>
@@ -1090,14 +1179,14 @@ export default function SettingsPage() {
                 type="button"
                 onClick={() => void handleCopy(settingsQuery.data.knowledge_base_dir, "知识库目录")}
               >
-                {displayText("复制知识库目录")}
+                {displayText("复制库目录")}
               </button>
               <button
                 className="secondary-button"
                 type="button"
                 onClick={() => void handleCopy(settingsQuery.data.export_dir, "导出目录")}
               >
-                {displayText("复制导出目录")}
+                {displayText("复制导出")}
               </button>
             </>
           )}

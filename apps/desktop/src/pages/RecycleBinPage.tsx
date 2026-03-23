@@ -74,6 +74,81 @@ export default function RecycleBinPage() {
 
   const isAnythingPending = emptyMutation.isPending || restoringIds.size > 0 || deletingIds.size > 0;
 
+  function getPlatformGroupLabel(platform: string | null | undefined, sourceType: string | null | undefined) {
+    if (platform === "bilibili") return "B站视频";
+    if (platform === "local_file" || sourceType === "file") return "本地文件";
+    if (platform === "webpage" || sourceType === "webpage") return "网页";
+    return "其他来源";
+  }
+
+  // Group items by platform/source
+  const groupedItems = trashQuery.data?.items.reduce<Record<string, typeof trashQuery.data.items>>((acc, item) => {
+    const groupLabel = getPlatformGroupLabel(item.platform, item.source_type);
+    if (!acc[groupLabel]) acc[groupLabel] = [];
+    acc[groupLabel].push(item);
+    return acc;
+  }, {}) ?? {};
+  const groupOrder = ["B站视频", "本地文件", "网页", "其他来源"];
+  const sortedGroups = Object.keys(groupedItems).sort((a, b) => {
+    const ai = groupOrder.indexOf(a);
+    const bi = groupOrder.indexOf(b);
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+
+  function renderItemCard(item: NonNullable<typeof trashQuery.data>["items"][number]) {
+    const isRestoring = restoringIds.has(item.id);
+    const isDeleting = deletingIds.has(item.id);
+    const summaryLines = splitStageDigestText(item.summary || "", 2);
+    return (
+      <article className="card detail-section-card" key={item.id}>
+        <div className="pill-row">
+          <span className="pill">{displayText(`删除于 ${item.deleted_at ? new Date(item.deleted_at).toLocaleDateString() : "未知"}`)}</span>
+        </div>
+        <h3>{displayText(item.title)}</h3>
+        {summaryLines.length > 0 ? (
+          <div className="trash-summary-points">
+            {summaryLines.map((line) => (
+              <p key={`${item.id}-${line}`}>{displayText(line)}</p>
+            ))}
+          </div>
+        ) : (
+          <p className="muted-text">{displayText("当前没有摘要。")}</p>
+        )}
+        <div className="pill-row">
+          {item.tags.map((tag) => (
+            <span className="pill" key={tag}>{displayText(tag)}</span>
+          ))}
+        </div>
+        <div className="header-actions">
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => { setPageMessage(""); setPageError(""); restoreMutation.mutate({ id: item.id, openAfter: false }); }}
+            disabled={isRestoring || isDeleting || isAnythingPending}
+          >
+            {isRestoring ? displayText("恢复中...") : displayText("恢复内容")}
+          </button>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => { setPageMessage(""); setPageError(""); restoreMutation.mutate({ id: item.id, openAfter: true }); }}
+            disabled={isRestoring || isDeleting || isAnythingPending}
+          >
+            {displayText("恢复并打开")}
+          </button>
+          <button
+            className="danger-button"
+            type="button"
+            onClick={() => handlePermanentDelete(item.id, item.title)}
+            disabled={isRestoring || isDeleting || isAnythingPending}
+          >
+            {isDeleting ? displayText("删除中...") : displayText("彻底删除")}
+          </button>
+        </div>
+      </article>
+    );
+  }
+
   return (
     <section className="page">
       <header className="page-header">
@@ -104,65 +179,20 @@ export default function RecycleBinPage() {
         </div>
       )}
 
-      <div className="library-grid">
-        {trashQuery.data?.items.map((item) => {
-          const isRestoring = restoringIds.has(item.id);
-          const isDeleting = deletingIds.has(item.id);
-          const summaryLines = splitStageDigestText(item.summary || "", 2);
-          return (
-            <article className="card detail-section-card" key={item.id}>
-              <div className="pill-row">
-                <span className="pill">{displayText(item.platform ?? item.source_type ?? "未知来源")}</span>
-                <span className="pill">{displayText(`删除于 ${item.deleted_at}`)}</span>
-              </div>
-              <h3>{displayText(item.title)}</h3>
-              {summaryLines.length > 0 ? (
-                <div className="trash-summary-points">
-                  {summaryLines.map((line) => (
-                    <p key={`${item.id}-${line}`}>{displayText(line)}</p>
-                  ))}
-                </div>
-              ) : (
-                <p className="muted-text">{displayText("当前没有摘要。")}</p>
-              )}
-              <div className="pill-row">
-                {item.tags.map((tag) => (
-                  <span className="pill" key={tag}>{displayText(tag)}</span>
-                ))}
-              </div>
-              <div className="header-actions">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={() => { setPageMessage(""); setPageError(""); restoreMutation.mutate({ id: item.id, openAfter: false }); }}
-                  disabled={isRestoring || isDeleting || isAnythingPending}
-                >
-                  {isRestoring ? displayText("恢复中...") : displayText("恢复内容")}
-                </button>
-                <button
-                  className="primary-button"
-                  type="button"
-                  onClick={() => { setPageMessage(""); setPageError(""); restoreMutation.mutate({ id: item.id, openAfter: true }); }}
-                  disabled={isRestoring || isDeleting || isAnythingPending}
-                >
-                  {displayText("恢复并打开")}
-                </button>
-                <button
-                  className="danger-button"
-                  type="button"
-                  onClick={() => handlePermanentDelete(item.id, item.title)}
-                  disabled={isRestoring || isDeleting || isAnythingPending}
-                >
-                  {isDeleting ? displayText("删除中...") : displayText("彻底删除")}
-                </button>
-              </div>
-            </article>
-          );
-        })}
-      </div>
+      {sortedGroups.map((groupLabel) => (
+        <section key={groupLabel} className="trash-source-group">
+          <div className="trash-source-group-header">
+            <span className="eyebrow">{displayText(groupLabel)}</span>
+            <span className="pill">{displayText(`${groupedItems[groupLabel].length} 条`)}</span>
+          </div>
+          <div className="library-grid">
+            {groupedItems[groupLabel].map(renderItemCard)}
+          </div>
+        </section>
+      ))}
 
-      {pageMessage && <p className="success-text">{displayText(pageMessage)}</p>}
-      {pageError && <p className="error-text">{displayText(pageError)}</p>}
+      {pageMessage && <p className="success-text" style={{ marginTop: "var(--space-4)" }}>{displayText(pageMessage)}</p>}
+      {pageError && <p className="error-text" style={{ marginTop: "var(--space-4)" }}>{displayText(pageError)}</p>}
     </section>
   );
 }

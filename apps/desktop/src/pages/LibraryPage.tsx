@@ -34,6 +34,8 @@ type LibraryCardItem = {
   id: string;
   title: string;
   source: string;
+  sourceUrl?: string | null;
+  sourceFile?: string | null;
   summary: string;
   tags: string[];
   coverUrl: string | null;
@@ -58,6 +60,43 @@ type WorkspaceNotice = {
   linkLabel?: string;
   tone?: "default" | "warning";
 };
+
+function buildLibraryCardSourceKey(item: LibraryCardItem) {
+  const sourceUrl = item.sourceUrl?.trim().toLowerCase();
+  if (sourceUrl) {
+    return `url:${sourceUrl}`;
+  }
+
+  const sourceFile = item.sourceFile?.trim().toLowerCase();
+  if (sourceFile) {
+    return `file:${sourceFile}`;
+  }
+
+  const normalizedTitle = item.title.trim().toLowerCase();
+  const normalizedSource = item.source.trim().toLowerCase();
+  const normalizedNoteStyle = (item.noteStyle ?? "").trim().toLowerCase();
+  if (normalizedTitle) {
+    return `fallback:${normalizedSource}:${normalizedNoteStyle}:${normalizedTitle}`;
+  }
+
+  return `id:${item.id}`;
+}
+
+function dedupeLibraryCards(items: LibraryCardItem[]) {
+  const deduped: LibraryCardItem[] = [];
+  const seen = new Set<string>();
+
+  for (const item of items) {
+    const key = buildLibraryCardSourceKey(item);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(item);
+  }
+
+  return deduped;
+}
 
 function loadSearchHistory(): string[] {
   try {
@@ -211,6 +250,8 @@ const mockCards: LibraryCardItem[] = [
     id: "demo-bilibili-001",
     title: "AI 时代的学习方法",
     source: "Bilibili",
+    sourceUrl: null,
+    sourceFile: null,
     summary: "把视频里的观点沉淀成结构化笔记，再继续追问和回看证据。",
     tags: ["学习", "AI", "知识管理"],
     coverUrl: null,
@@ -224,6 +265,8 @@ const mockCards: LibraryCardItem[] = [
     id: "demo-docx-001",
     title: "用户访谈纪要",
     source: "DOCX",
+    sourceUrl: null,
+    sourceFile: null,
     summary: "保留文档导入能力，适合把调研和访谈资料也统一沉淀进来。",
     tags: ["调研", "访谈", "产品"],
     coverUrl: null,
@@ -336,6 +379,8 @@ export default function LibraryPage() {
       return contentsQuery.data.items.map((item) => ({
         id: item.id,
         title: item.title,
+        sourceUrl: item.source_url ?? null,
+        sourceFile: item.source_file ?? null,
         source: item.platform ?? item.source_type ?? "未知来源",
         summary: item.summary || "当前还没有摘要。",
         tags: item.tags,
@@ -355,8 +400,10 @@ export default function LibraryPage() {
     return mockCards;
   }, [contentsQuery.data, contentsQuery.isSuccess]);
 
+  const dedupedCards = useMemo(() => dedupeLibraryCards(cards), [cards]);
+
   const filteredCards = useMemo(() => {
-    let result = cards;
+    let result = dedupedCards;
     if (activeFilter !== "all") {
       result = result.filter((item) => {
         const source = item.source.toLowerCase();
@@ -366,7 +413,7 @@ export default function LibraryPage() {
       });
     }
     return result;
-  }, [activeFilter, cards]);
+  }, [activeFilter, dedupedCards]);
 
   useEffect(() => {
     if (!filteredCards.length) {
@@ -382,13 +429,13 @@ export default function LibraryPage() {
     if (!pendingFocusItem) {
       return;
     }
-    const matchedCard = cards.find((item) => item.id === pendingFocusItem.contentId);
+    const matchedCard = dedupedCards.find((item) => item.id === pendingFocusItem.contentId);
     if (!matchedCard) {
       return;
     }
     setSelectedCardId(matchedCard.id);
     setPendingFocusItem(null);
-  }, [cards, pendingFocusItem]);
+  }, [dedupedCards, pendingFocusItem]);
 
   const selectedCard = useMemo(
     () => filteredCards.find((item) => item.id === selectedCardId) ?? filteredCards[0] ?? null,
@@ -419,9 +466,9 @@ export default function LibraryPage() {
   });
 
   const collections = collectionsQuery.data?.items ?? [];
-  const total = contentsQuery.data?.total ?? 0;
-  const readyCount = cards.filter((item) => item.status === "ready" || item.status === "ready_estimated").length;
-  const noteCount = cards.filter((item) => item.noteStyle).length;
+  const total = dedupedCards.length;
+  const readyCount = dedupedCards.filter((item) => item.status === "ready" || item.status === "ready_estimated").length;
+  const noteCount = dedupedCards.filter((item) => item.noteStyle).length;
   const pendingJobs = pendingJobsQuery.data?.items ?? [];
   const notePreview = getNotePreview(detailQuery.data);
   const quickQuestions = buildQuickQuestions(detailQuery.data);
@@ -481,11 +528,8 @@ export default function LibraryPage() {
         <div className="bili-note-column bili-note-column-left">
           <article className="card glass-panel bili-note-hero-card">
             <div className="bili-note-hero-copy">
-              <p className="eyebrow">{displayText("内容工作台")}</p>
-              <h2>{displayText("把视频导入、沉淀、追问，收束到一条清晰主线")}</h2>
-              <p className="muted-text">
-                {displayText("基于现有知库能力重新组织：左边导入，中间看队列和历史，右边直接预览当前笔记。")}
-              </p>
+              <h2>{displayText("内容库")}</h2>
+              <p className="muted-text">{displayText("导入与预览")}</p>
             </div>
             <div className="bili-note-stat-grid">
               <article className="bili-note-stat-card">
@@ -501,11 +545,6 @@ export default function LibraryPage() {
                 <strong>{noteCount}</strong>
               </article>
             </div>
-            <div className="pill-row">
-              <span className="pill">{displayText("视频导入")}</span>
-              <span className="pill">{displayText("异步导入")}</span>
-              <span className="pill">{displayText("右侧实时预览")}</span>
-            </div>
           </article>
 
           <ImportPanel onImportCompleted={handleImportCompleted} />
@@ -514,7 +553,7 @@ export default function LibraryPage() {
             <div className="bili-note-section-head">
               <div>
                 <p className="eyebrow">{displayText("分组管理")}</p>
-                <h3>{displayText("把当前内容归到你自己的主题里")}</h3>
+                <h3>{displayText("内容分组")}</h3>
               </div>
               <button
                 type="button"
@@ -612,7 +651,7 @@ export default function LibraryPage() {
             <div className="bili-note-section-head">
               <div>
                 <p className="eyebrow">{displayText("内容队列")}</p>
-                <h3>{displayText("围绕单条内容来回切换")}</h3>
+                <h3>{displayText("切换当前内容")}</h3>
               </div>
               <div className="pill-row">
                 <span className="pill">{displayText(`${filteredCards.length} 条当前结果`)}</span>
@@ -771,20 +810,19 @@ export default function LibraryPage() {
                     <span className="pill">{displayText(getNoteStyleLabel(selectedCard.noteStyle))}</span>
                   </div>
                   <div className="bili-note-reader">
-                    <p>{displayText("接入真实内容详情后，这里会直接显示阶段总结、关键片段和后续追问入口。")}</p>
+                    <p>{displayText("接入真实内容后，这里会切到当前笔记。")}</p>
                   </div>
                 </div>
               ) : detailQuery.isLoading ? (
                 <div className="bili-note-preview-empty">
                   <p className="eyebrow">{displayText("当前预览")}</p>
-                  <h3>{displayText("正在加载当前笔记")}</h3>
-                  <p className="muted-text">{displayText("右侧会直接显示当前内容的阶段摘要和快捷入口。")}</p>
+                  <h3>{displayText("正在加载")}</h3>
                 </div>
               ) : detailQuery.isError || !detailQuery.data ? (
                 <div className="bili-note-preview-empty">
                   <p className="eyebrow">{displayText("当前预览")}</p>
                   <h3>{displayText(selectedCard.title)}</h3>
-                  <p className="muted-text">{displayText("当前还没拿到详情数据，你仍然可以打开详情页继续查看。")}</p>
+                  <p className="muted-text">{displayText("暂时没拿到详情数据。")}</p>
                   <div className="header-actions">
                     <Link className="primary-button button-link" to={`/library/${selectedCard.id}`}>
                       {displayText("打开详情")}
@@ -797,9 +835,9 @@ export default function LibraryPage() {
                     <div>
                       <p className="eyebrow">{displayText("当前笔记")}</p>
                       <h3>{displayText(detailQuery.data.title)}</h3>
-                      <p className="muted-text">
-                        {displayText(captureSummary || detailQuery.data.summary || "当前这条内容已经进入可阅读、可回看的笔记阶段。")}
-                      </p>
+                      {(captureSummary || detailQuery.data.summary) ? (
+                        <p className="muted-text">{displayText(captureSummary || detailQuery.data.summary)}</p>
+                      ) : null}
                     </div>
                     <div className="pill-row">
                       <span className={getStatusPillClass(detailQuery.data.status)}>
@@ -812,37 +850,36 @@ export default function LibraryPage() {
 
                   <div className="bili-note-metric-strip">
                     <article className="bili-note-metric-card">
-                      <span>{displayText("来源类型")}</span>
+                      <span>{displayText("来源")}</span>
                       <strong>{displayText(getSourceDescription(selectedCard.source))}</strong>
                     </article>
                     <article className="bili-note-metric-card">
-                      <span>{displayText("材料规模")}</span>
+                      <span>{displayText("片段")}</span>
                       <strong>
                         {displayText(
                           transcriptSegmentCount > 0
-                            ? `${transcriptSegmentCount} 段证据 / ${detailQuery.data.chunks.length} 块检索`
-                            : `${detailQuery.data.chunks.length} 块检索`,
+                            ? `${transcriptSegmentCount} 证据 / ${detailQuery.data.chunks.length} 检索`
+                            : `${detailQuery.data.chunks.length} 检索`,
                         )}
                       </strong>
                     </article>
                     <article className="bili-note-metric-card">
-                      <span>{displayText("质量分")}</span>
+                      <span>{displayText("质量")}</span>
                       <strong>{displayText(qualityScore !== null ? String(qualityScore) : "待评估")}</strong>
                     </article>
                   </div>
 
                   {!!previewStageDigestItems.length ? (
                     <StageDigest
-                      eyebrow="阶段总结"
-                      title="阶段摘要"
-                      description="当前笔记会按阶段摘要展示，并附带相关画面。"
+                      eyebrow="阶段"
+                      title="重点"
                       items={previewStageDigestItems}
                       compact
                       className="library-stage-digest"
                     />
                   ) : (
                     <article className="bili-note-preview-block">
-                      <p className="eyebrow">{displayText("笔记预览")}</p>
+                      <p className="eyebrow">{displayText("正文预览")}</p>
                       <div className="bili-note-reader">
                         {notePreview ? (
                           notePreview.split(/(?<=。|！|？|\.)\s+/).slice(0, 6).map((paragraph, index) => (
@@ -858,8 +895,7 @@ export default function LibraryPage() {
                   <article className="bili-note-preview-block bili-note-preview-block-compact">
                     <div className="bili-note-preview-block-head">
                       <div>
-                        <p className="eyebrow">{displayText("继续处理")}</p>
-                        <p className="muted-text">{displayText("从当前笔记继续提问，或先查看关键资料状态。")}</p>
+                        <p className="eyebrow">{displayText("快捷入口")}</p>
                       </div>
                     </div>
                     {!!visibleQuickQuestions.length && (
@@ -876,9 +912,9 @@ export default function LibraryPage() {
                       </div>
                     )}
                     <div className="pill-row bili-note-preview-meta-pills">
-                      <span className="pill">{displayText(`作者：${detailQuery.data.author || "未知"}`)}</span>
-                      <span className="pill">{displayText(`更新时间：${formatDateTime(detailQuery.data.updated_at)}`)}</span>
-                      <span className="pill">{displayText(`检索块：${detailQuery.data.chunks.length}`)}</span>
+                      <span className="pill">{displayText(`作者 ${detailQuery.data.author || "未知"}`)}</span>
+                      <span className="pill">{displayText(`更新 ${formatDateTime(detailQuery.data.updated_at)}`)}</span>
+                      <span className="pill">{displayText(`检索 ${detailQuery.data.chunks.length}`)}</span>
                     </div>
                     <div className="tag-row-soft bili-note-preview-tag-row">
                       {(detailQuery.data.tags.length ? detailQuery.data.tags : ["暂无标签"]).slice(0, 4).map((tag) => (
@@ -897,7 +933,7 @@ export default function LibraryPage() {
                       className="secondary-button button-link"
                       to={`/chat?q=${encodeURIComponent(detailQuery.data.title)}&contentId=${detailQuery.data.id}&title=${encodeURIComponent(detailQuery.data.title)}`}
                     >
-                      {displayText("围绕它提问")}
+                      {displayText("提问")}
                     </Link>
                     <button
                       className="danger-button"
@@ -912,17 +948,13 @@ export default function LibraryPage() {
               )
             ) : (
               <div className="bili-note-preview-empty">
-                <strong>{displayText("导入一条内容后，右侧会直接展示当前笔记")}</strong>
-                <p className="muted-text">{displayText("右侧会集中显示阶段总结、关键材料和继续提问入口。")}</p>
+                <strong>{displayText("导入内容后，这里会显示当前笔记")}</strong>
               </div>
             )}
           </article>
 
           <details className="card glass-panel maintenance-details bili-note-maintenance-card">
-            <summary>{displayText("旧内容维护")}</summary>
-            <p className="muted-text search-panel-copy">
-              {displayText("需要时再用。它会重试不完整内容，补质量标记和时间跳转，并把旧数据升级到更适合问答的状态。")}
-            </p>
+            <summary>{displayText("旧内容")}</summary>
             <div className="header-actions">
               <button
                 className="secondary-button"
@@ -930,7 +962,7 @@ export default function LibraryPage() {
                 disabled={upgradeMutation.isPending}
                 onClick={() => upgradeMutation.mutate()}
               >
-                {displayText(upgradeMutation.isPending ? "升级中..." : "升级旧内容")}
+                {displayText(upgradeMutation.isPending ? "处理中..." : "补跑旧内容")}
               </button>
             </div>
 
@@ -938,9 +970,9 @@ export default function LibraryPage() {
               <div className="signal-card">
                 <div className="signal-list">
                   <div className="signal-item">
-                    <strong>{displayText(upgradeMutation.data?.message || "旧内容升级反馈")}</strong>
+                    <strong>{displayText(upgradeMutation.data?.message || "处理结果")}</strong>
                     <span className={upgradeMutation.isError ? "error-text" : "muted-text"}>
-                      {displayText(maintenanceMessage || "这次升级已经完成。")}
+                      {displayText(maintenanceMessage || "本轮处理已完成。")}
                     </span>
                   </div>
                 </div>

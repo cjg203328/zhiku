@@ -5,6 +5,7 @@ import { formatMilliseconds, formatTimeRange } from "../lib/utils";
 import {
   deleteChatSession,
   getChatSession,
+  getSettings,
   listChatSessions,
   saveChatNote,
   saveChatTurn,
@@ -274,6 +275,7 @@ function shortenText(value: string, limit = 22) {
   return trimmed.length <= limit ? trimmed : `${trimmed.slice(0, limit).trimEnd()}...`;
 }
 
+
 function dedupeSuggestions(values: string[], currentQuestion?: string) {
   const currentSignature = (currentQuestion || "").trim().replace(/\s+/g, "").toLowerCase();
   const deduped: string[] = [];
@@ -378,6 +380,11 @@ export default function ChatPage() {
     enabled: Boolean(activeSessionId),
     retry: 1,
   });
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: getSettings,
+    retry: 1,
+  });
 
   const saveTurnMutation = useMutation({
     mutationFn: saveChatTurn,
@@ -428,7 +435,6 @@ export default function ChatPage() {
       setLocalMessage(error instanceof Error ? error.message : "删除会话失败，请稍后再试。");
     },
   });
-
   useEffect(() => {
     const query = searchParams.get("q");
     if (query?.trim()) {
@@ -475,6 +481,14 @@ export default function ChatPage() {
   }, [scopedChunkId, scopedChunkLabel, scopedContentId, scopedTitle]);
 
   const sessionMessages = activeSessionQuery.data?.messages ?? [];
+  const latestUserQuestion = useMemo(
+    () =>
+      [...sessionMessages]
+        .reverse()
+        .find((message) => message.role === "user")
+        ?.message_text?.trim() || "",
+    [sessionMessages],
+  );
   useEffect(() => {
     if (!streamEndRef.current) return;
     streamEndRef.current.scrollIntoView({
@@ -505,18 +519,16 @@ export default function ChatPage() {
       0;
     const rewriteCount = Math.max(0, feedbackVariants.length - 1);
     const contextCount = feedbackRoutes?.session_context_used ?? 0;
-    const topScore = typeof answerQuality.top_score === "number" ? answerQuality.top_score.toFixed(1) : "";
     return [
-      { label: "回答方式", value: feedbackModeLabel || "处理中" },
-      { label: "检索范围", value: feedbackScopeLabel },
-      { label: "上下文承接", value: getRetrievalContextLabel(feedbackContext) },
-      { label: "当前聚焦", value: getRetrievalFocusLabel(feedbackFocus) },
-      { label: "检索路径", value: getRetrievalRouteLabel(feedbackRoutes) },
-      { label: "证据命中", value: evidenceCount > 0 ? `${evidenceCount} 条` : "待命中" },
-      { label: "补充检索", value: rewriteCount > 0 ? `${rewriteCount} 次` : "原问题直搜" },
-      { label: "最高相关", value: topScore || "待计算" },
-      { label: "会话上下文", value: contextCount > 0 ? `带入 ${contextCount} 条` : "未引用上文" },
+      { label: "范围", value: feedbackScopeLabel },
+      { label: "证据", value: evidenceCount > 0 ? `${evidenceCount} 条` : "偏弱" },
       { label: "可信度", value: answerQuality.grounded === false ? "谨慎参考" : "已结合证据" },
+      { label: "方式", value: feedbackModeLabel || "处理中" },
+      { label: "承接", value: getRetrievalContextLabel(feedbackContext) },
+      { label: "聚焦", value: getRetrievalFocusLabel(feedbackFocus) },
+      { label: "路径", value: getRetrievalRouteLabel(feedbackRoutes) },
+      { label: "补充", value: rewriteCount > 0 ? `${rewriteCount} 次` : "无" },
+      { label: "会话", value: contextCount > 0 ? `${contextCount} 条` : "无" },
     ];
   }, [answerQuality, feedbackContext, feedbackFocus, feedbackModeLabel, feedbackRoutes, feedbackScopeLabel, feedbackVariants.length]);
   const isLowRecall = useMemo(() => {
@@ -548,8 +560,8 @@ export default function ChatPage() {
       feedbackRoutes ||
       feedbackPaths.length,
   );
-  const primaryFeedbackSignals = feedbackSignals.slice(0, 4);
-  const secondaryFeedbackSignals = feedbackSignals.slice(4).filter((item) => item.value.trim());
+  const primaryFeedbackSignals = feedbackSignals.slice(0, 3);
+  const secondaryFeedbackSignals = feedbackSignals.slice(3).filter((item) => item.value.trim());
   const compactFeedbackTags = feedbackTags.slice(0, 3);
   const feedbackPathItems = feedbackPaths.slice(0, 2);
   const showFeedbackDetails = Boolean(secondaryFeedbackSignals.length || feedbackVariantLabels.length);
@@ -604,6 +616,7 @@ export default function ChatPage() {
   }, [answer, answerQuality, primaryContentId, primaryContentTitle, qualityFollowUpQuestion]);
   const sessionItems = sessionsQuery.data?.items ?? [];
   const visibleSessions = sessionItems.slice(0, 10);
+  const sessionRetentionDays = sessionsQuery.data?.retention_days ?? 7;
   const recommendedCitations = useMemo(() => pickRecommendedCitations(citations), [citations]);
 
   const conversationMessages = useMemo(() => {
@@ -802,13 +815,13 @@ export default function ChatPage() {
           <article className="card glass-panel qa-sidebar-card">
             <div className="panel-heading">
               <div>
-                <p className="eyebrow">{displayText("当前范围")}</p>
+                <p className="eyebrow">{displayText("范围")}</p>
                 <h3>{displayText(scopeLabel)}</h3>
               </div>
-              <span className="pill">{displayText(activeSessionId ? "继续当前会话" : "准备新对话")}</span>
+              <span className="pill">{displayText(activeSessionId ? "当前会话" : "新会话")}</span>
             </div>
             <div className="qa-scope-summary">
-              <span>{displayText(scopedChunkId ? "当前锁定到片段" : scopedContentId ? "当前锁定到单条内容" : "当前在全库问答")}</span>
+              <span>{displayText(scopedChunkId ? "片段范围" : scopedContentId ? "单条范围" : "全库范围")}</span>
               <strong>{displayText(scopedTitle || scopedChunkLabel || scopeLabel)}</strong>
             </div>
             <div className="header-actions">
@@ -849,7 +862,7 @@ export default function ChatPage() {
                 </button>
               )}
               <Link className="secondary-button button-link" to="/library">
-                {displayText("去知识库")}
+                {displayText("知识库")}
               </Link>
               {(scopedContentId || scopedChunkId) && (
                 <button
@@ -863,7 +876,7 @@ export default function ChatPage() {
                     )
                   }
                 >
-                  {displayText("切回全库")}
+                  {displayText("全库")}
                 </button>
               )}
             </div>
@@ -872,18 +885,18 @@ export default function ChatPage() {
           <article className="card glass-panel qa-sidebar-card">
             <div className="panel-heading">
               <div>
-                <p className="eyebrow">{displayText("历史会话")}</p>
-                <h3>{displayText("继续之前的记录")}</h3>
+                <p className="eyebrow">{displayText("会话")}</p>
+                <h3>{displayText("历史会话")}</h3>
               </div>
               <span className="pill">{displayText(`${sessionItems.length} 条`)}</span>
             </div>
-            <p className="muted-text">
-              {displayText(`历史会话默认只保留 ${sessionsQuery.data?.retention_days ?? 7} 天，过期会自动清理。`)}
-            </p>
-            {sessionsQuery.isLoading && <p className="muted-text">{displayText("正在读取会话...")}</p>}
+            <div className="pill-row">
+              <span className="pill">{displayText(`${sessionRetentionDays} 天保留`)}</span>
+            </div>
+            {sessionsQuery.isLoading && <p className="muted-text">{displayText("读取中...")}</p>}
             {sessionsQuery.isError && <p className="error-text">{displayText("暂时无法读取会话历史。")}</p>}
             {!sessionsQuery.isLoading && !sessionsQuery.isError && !visibleSessions.length && (
-              <p className="muted-text">{displayText("还没有历史会话，直接开始第一轮提问就可以。")}</p>
+              <p className="muted-text">{displayText("还没有会话。")}</p>
             )}
             <div className="qa-session-list">
               {visibleSessions.map((session) => {
@@ -935,7 +948,7 @@ export default function ChatPage() {
         <article className="card glass-panel qa-chat-main">
           <div className="qa-chat-topbar">
             <div>
-              <p className="eyebrow">{displayText("智能问答")}</p>
+              <p className="eyebrow">{displayText("问答")}</p>
               <h2>{displayText(activeSessionQuery.data?.title || "新会话")}</h2>
             </div>
             <div className="pill-row">
@@ -949,8 +962,7 @@ export default function ChatPage() {
           <div className="qa-message-stream">
             {!conversationMessages.length && (
               <div className="glass-callout qa-empty-stream">
-                <strong>{displayText("开始一轮问题")}</strong>
-                <p className="muted-text">{displayText("输入一个明确问题后，回答、引用和回看入口会集中显示在这里。")}</p>
+                <strong>{displayText("开始提问")}</strong>
               </div>
             )}
 
@@ -958,7 +970,7 @@ export default function ChatPage() {
               <div className={`qa-quality-banner qa-quality-banner-${qualityBannerTone}`}>
                 <div>
                   <strong>{displayText(answerQuality.label || feedbackModeLabel || "本轮回答状态")}</strong>
-                  <p>{displayText(answerQuality.summary || "系统已生成本轮检索与证据信息，可继续追问或打开详情。")}</p>
+                  <p>{displayText(answerQuality.summary || "已生成检索与证据。")}</p>
                 </div>
                 {!!qualityActionItems.length && (
                   <div className="qa-quality-actions">
@@ -992,8 +1004,7 @@ export default function ChatPage() {
               <div className="qa-evidence-recommend-strip">
                 <div className="qa-evidence-recommend-head">
                   <div>
-                    <strong>{displayText("优先回看片段")}</strong>
-                    <p>{displayText("以下片段与当前回答关联度最高。")}</p>
+                    <strong>{displayText("优先片段")}</strong>
                   </div>
                 </div>
                 <div className="qa-evidence-recommend-list">
@@ -1014,11 +1025,11 @@ export default function ChatPage() {
                         <p>{displayText(citation.snippet)}</p>
                         <div className="header-actions">
                           <Link className="secondary-button button-link" to={detailLink}>
-                            {displayText("打开定位")}
+                            {displayText("详情")}
                           </Link>
                           {jumpUrl && (
                             <a className="primary-button button-link" href={jumpUrl} target="_blank" rel="noreferrer">
-                              {displayText("直接回看")}
+                              {displayText("回看")}
                             </a>
                           )}
                         </div>
@@ -1073,11 +1084,11 @@ export default function ChatPage() {
                               <p className="muted-text">{displayText(citation.snippet)}</p>
                               <div className="header-actions">
                                 <Link className="secondary-button button-link" to={detailLink}>
-                                  {displayText("打开定位")}
+                                  {displayText("详情")}
                                 </Link>
                                 {jumpUrl && (
                                   <a className="secondary-button button-link" href={jumpUrl} target="_blank" rel="noreferrer">
-                                    {displayText("回到时间点")}
+                                    {displayText("回看")}
                                   </a>
                                 )}
                               </div>
@@ -1098,15 +1109,15 @@ export default function ChatPage() {
             {localMessage && <p className="success-text">{displayText(localMessage)}</p>}
             {isLowRecall && (
               <div className="low-recall-warning">
-                <span>{displayText("当前回答依据较弱，可补充相关内容或更换问法。")}</span>
+                <span>{displayText("证据偏弱，可补资料或换问法。")}</span>
               </div>
             )}
             {savedNoteId && (
               <div className="glass-callout">
-                <strong>{displayText("已保存为知识卡片")}</strong>
+                <strong>{displayText("已保存")}</strong>
                 <div className="header-actions">
                   <Link className="secondary-button button-link" to={`/library/${savedNoteId}`}>
-                    {displayText("打开卡片")}
+                    {displayText("打开")}
                   </Link>
                 </div>
               </div>
@@ -1136,7 +1147,6 @@ export default function ChatPage() {
               onChange={(event) => setComposerValue(event.target.value)}
               onKeyDown={handleComposerKeyDown}
             />
-            <p className="muted-text">{displayText("Enter 发送，Shift + Enter 换行")}</p>
             <div className="header-actions">
               <button
                 className="primary-button"
@@ -1147,10 +1157,10 @@ export default function ChatPage() {
                 {isStreaming ? displayText("生成中...") : activeSessionId ? displayText("继续追问") : displayText("发送")}
               </button>
               <button className="secondary-button" type="button" onClick={() => void handleCopyAnswer()} disabled={!answer.trim()}>
-                {displayText("复制当前回答")}
+                {displayText("复制回答")}
               </button>
               <button className="secondary-button" type="button" onClick={handleSaveAnswer} disabled={!answer.trim() || saveNoteMutation.isPending}>
-                {saveNoteMutation.isPending ? displayText("保存中...") : displayText("保存知识卡片")}
+                {saveNoteMutation.isPending ? displayText("保存中...") : displayText("保存卡片")}
               </button>
             </div>
 
@@ -1177,16 +1187,17 @@ export default function ChatPage() {
             <article className="card glass-panel qa-sidebar-card qa-feedback-card">
               <div className="panel-heading">
                 <div>
-                  <p className="eyebrow">{displayText("本轮摘要")}</p>
-                  <h3>{displayText(answerQuality.label || feedbackModeLabel || "回答分析")}</h3>
+                  <p className="eyebrow">{displayText("状态")}</p>
+                  <h3>{displayText(answerQuality.label || "回答")}</h3>
                 </div>
               </div>
-              <div className="pill-row qa-feedback-tag-row">
-                {answerQuality.label && <span className="pill">{displayText(answerQuality.label)}</span>}
-                {compactFeedbackTags.map((tag) => (
-                  <span className="pill" key={tag}>{displayText(tag)}</span>
-                ))}
-              </div>
+              {!!compactFeedbackTags.length && (
+                <div className="pill-row qa-feedback-tag-row">
+                  {compactFeedbackTags.map((tag) => (
+                    <span className="pill" key={tag}>{displayText(tag)}</span>
+                  ))}
+                </div>
+              )}
               <div className="qa-feedback-metrics">
                 {primaryFeedbackSignals.map((item) => (
                   <article className="qa-feedback-metric" key={item.label}>
@@ -1198,12 +1209,12 @@ export default function ChatPage() {
 
               {!!feedbackPathItems.length && (
                 <div className="qa-feedback-section">
-                  <p className="eyebrow">{displayText("优先内容")}</p>
+                  <p className="eyebrow">{displayText("相关内容")}</p>
                   <div className="qa-feedback-paths">
                     {feedbackPathItems.map((item) => (
                       <Link className="qa-feedback-link" key={item.content_id} to={`/library/${item.content_id}`}>
                         <strong>{displayText(item.title)}</strong>
-                        <small>{displayText(`相关度 ${item.score.toFixed(1)}`)}</small>
+                        <small>{displayText(`相关 ${item.score.toFixed(1)}`)}</small>
                       </Link>
                     ))}
                   </div>
@@ -1212,7 +1223,7 @@ export default function ChatPage() {
 
               {showFeedbackDetails && (
                 <details className="qa-feedback-details">
-                  <summary>{displayText("更多细节")}</summary>
+                  <summary>{displayText("细节")}</summary>
                   {!!secondaryFeedbackSignals.length && (
                     <div className="qa-feedback-metrics qa-feedback-metrics-secondary">
                       {secondaryFeedbackSignals.map((item) => (
@@ -1225,7 +1236,7 @@ export default function ChatPage() {
                   )}
                   {!!feedbackVariantLabels.length && (
                     <div className="qa-feedback-section">
-                      <p className="eyebrow">{displayText("问题改写")}</p>
+                      <p className="eyebrow">{displayText("改写")}</p>
                       <div className="pill-row">
                         {feedbackVariantLabels.map((item) => (
                           <span className="pill" key={item}>{displayText(item)}</span>
@@ -1240,13 +1251,10 @@ export default function ChatPage() {
             <article className="card glass-panel qa-sidebar-card qa-feedback-card">
               <div className="panel-heading">
                 <div>
-                  <p className="eyebrow">{displayText("本轮摘要")}</p>
+                  <p className="eyebrow">{displayText("状态")}</p>
                   <h3>{displayText("等待回答")}</h3>
                 </div>
               </div>
-              <p className="muted-text">
-                {displayText("回答生成后，这里会显示检索概况与优先内容。")}
-              </p>
             </article>
           )}
         </aside>

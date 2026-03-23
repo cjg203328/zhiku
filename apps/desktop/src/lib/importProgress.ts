@@ -10,6 +10,13 @@ export type ImportStepMeta = {
   description: string;
 };
 
+function normalizeImportStageStep(step: string | undefined) {
+  if (step === "fetching_subtitle" || step === "fetching_audio" || step === "transcribing_audio" || step === "capturing_screenshots") {
+    return "parsing_content";
+  }
+  return step;
+}
+
 export function isImportJobTerminal(status: string | undefined) {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
@@ -42,6 +49,22 @@ export function getImportJobStepMeta(
     return isReparse
       ? { label: "提取内容", description: "正在重新整理正文、字幕、截图和可回看的证据层。" }
       : { label: "提取内容", description: "正在整理正文、字幕、截图和可回看的证据层。" };
+  }
+
+  if (step === "fetching_subtitle") {
+    return { label: "检查字幕", description: "正在确认当前视频是否有可直接使用的字幕与时间轴。" };
+  }
+
+  if (step === "fetching_audio") {
+    return { label: "检查音频", description: "当前没有公开字幕，正在确认是否能回退到音频正文。" };
+  }
+
+  if (step === "transcribing_audio") {
+    return { label: "音频转写", description: "正在执行本地转写，这一步通常最久，请耐心等待。" };
+  }
+
+  if (step === "capturing_screenshots") {
+    return { label: "整理片段", description: "正在生成关键片段、截图与回看线索。" };
   }
 
   if (step === "saving_content") {
@@ -97,7 +120,8 @@ export function resolveImportStageIndex(
 ) {
   const stages = getImportStageItems(sourceKind, mode);
   if (step === "done") return stages.length - 1;
-  const index = stages.findIndex((item) => item.key === step);
+  const normalizedStep = normalizeImportStageStep(step);
+  const index = stages.findIndex((item) => item.key === normalizedStep);
   return index >= 0 ? index : 0;
 }
 
@@ -106,6 +130,10 @@ export function getImportStepShortLabel(step: string | null | undefined) {
   if (step === "detecting_source") return "识别来源";
   if (step === "reading_file") return "读取文件";
   if (step === "parsing_content") return "提取内容";
+  if (step === "fetching_subtitle") return "检查字幕";
+  if (step === "fetching_audio") return "检查音频";
+  if (step === "transcribing_audio") return "音频转写";
+  if (step === "capturing_screenshots") return "整理片段";
   if (step === "saving_content") return "整理入库";
   if (step === "done") return "已完成";
   if (step === "failed") return "处理失败";

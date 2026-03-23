@@ -162,21 +162,21 @@ export default function StartupPage() {
   const shortcutItems = [
     {
       title: "内容库",
-      description: "导入、查看和整理内容。",
+      description: "导入 / 查看",
       to: "/library",
       cta: "进入",
       badge: pendingJobCount > 0 ? String(pendingJobCount) : "",
     },
     {
-      title: "智能问答",
-      description: isReady ? "围绕已有内容继续提问。" : "当前未就绪，先检查服务和模型。",
+      title: "问答",
+      description: isReady ? "继续" : "待连接",
       to: isReady ? "/chat" : "/settings",
       cta: isReady ? "进入" : "去设置",
       muted: !isReady,
     },
     {
-      title: "系统设置",
-      description: "检查模型、桥接和转写配置。",
+      title: "设置",
+      description: "模型 / 桥接",
       to: "/settings",
       cta: "打开",
     },
@@ -185,11 +185,11 @@ export default function StartupPage() {
           title: "继续查看",
           description: latestItem.title,
           to: `/library/${latestItem.id}`,
-          cta: latestItem.platform ?? latestItem.source_type ?? "内容",
+          cta: "打开",
         }
       : {
           title: "回收站",
-          description: "查看已删除内容，必要时恢复。",
+          description: "恢复或清理",
           to: "/trash",
           cta: "查看",
         },
@@ -254,11 +254,7 @@ export default function StartupPage() {
       <article className="card card-static home-launchpad">
         <div className="home-launchpad-head">
           <div className="home-launchpad-copy">
-            <p className="eyebrow">{displayText("工作台")}</p>
-            <h1 className="home-launchpad-title">{displayText("进入知库")}</h1>
-            <p className="home-launchpad-desc">
-              {displayText("首页只保留状态和常用入口，不再重复展示内容概览。")}
-            </p>
+            <h1 className="home-launchpad-title">{displayText("知库")}</h1>
             <p className="muted-text home-runtime-text">{displayText(runtimeLabel)}</p>
           </div>
 

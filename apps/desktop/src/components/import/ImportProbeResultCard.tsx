@@ -12,10 +12,10 @@ type ProbeResult = {
 };
 
 function getProbeTone(status: string) {
-  if (status === "ready") return { label: "可直接导入", tone: "success", hint: "字幕和元数据均已就绪。" };
-  if (status === "needs_cookie") return { label: "需要 Cookie", tone: "warning", hint: "这条视频需要登录态才能拿到字幕。" };
-  if (status === "needs_asr") return { label: "需要转写", tone: "info", hint: "当前没有字幕，可通过转写补正文。" };
-  return { label: "可尝试导入", tone: "info", hint: "当前已完成基础预检，可继续导入。" };
+  if (status === "ready") return { label: "可导入", tone: "success", hint: "字幕与元数据已就绪。" };
+  if (status === "needs_cookie") return { label: "需登录态", tone: "warning", hint: "当前缺字幕。" };
+  if (status === "needs_asr") return { label: "需转写", tone: "info", hint: "当前缺字幕。" };
+  return { label: "可尝试", tone: "info", hint: "预检已完成。" };
 }
 
 function buildSettingsLink(focus?: string) {
@@ -33,22 +33,22 @@ function getNoteStyleDescription(noteStyle: string, summaryFocus: string) {
   const focus = summaryFocus.trim();
   if (noteStyle === "bilinote") {
     return focus
-      ? `正式导入后会优先围绕“${focus}”整理速览、重点和时间线回看。`
-      : "正式导入后会更强调速览、重点、时间线与片段回看。";
+      ? `围绕“${focus}”整理重点。`
+      : "整理重点。";
   }
   if (noteStyle === "qa") {
     return focus
-      ? `正式导入后会优先围绕“${focus}”组织可追问的问题与证据。`
-      : "正式导入后会更偏向问答准备，方便继续追问。";
+      ? `围绕“${focus}”组织问答。`
+      : "组织问答。";
   }
   if (noteStyle === "brief") {
     return focus
-      ? `正式导入后会围绕“${focus}”生成更短、更聚焦的结论摘要。`
-      : "正式导入后会更偏向短摘要，适合快速过一遍。";
+      ? `围绕“${focus}”生成摘要。`
+      : "生成摘要。";
   }
   return focus
-    ? `正式导入后会围绕“${focus}”生成一版结构化笔记。`
-    : "正式导入后会生成兼顾摘要、要点和正文整理的结构化笔记。";
+    ? `围绕“${focus}”生成笔记。`
+    : "生成笔记。";
 }
 
 type Props = {
@@ -84,13 +84,16 @@ export default function ImportProbeResultCard({
     { limit: 3 },
   );
   const noteStyleLabel = getNoteStyleLabel(noteStyle);
-  const probeSummary = probe.predicted_recommended_action || getNoteStyleDescription(noteStyle, summaryFocus);
+  const probeSummary =
+    tone.tone === "success"
+      ? getNoteStyleDescription(noteStyle, summaryFocus)
+      : probe.predicted_recommended_action || getNoteStyleDescription(noteStyle, summaryFocus);
 
   return (
     <article className="preview-card smart-result-card">
       <div className="panel-heading">
         <div>
-          <p className="eyebrow">{displayText("预检结果")}</p>
+          <p className="eyebrow">{displayText("预检")}</p>
           <h4>{displayText(probe.title)}</h4>
           <p className="muted-text">{displayText(probe.predicted_summary)}</p>
         </div>
@@ -115,9 +118,8 @@ export default function ImportProbeResultCard({
       </article>
       {!!probeStageDigestItems.length && (
         <StageDigest
-          eyebrow="阶段预览"
-          title="导入后重点"
-          description="预检结果已压缩为几个关键段落。"
+          eyebrow="预览"
+          title="重点"
           items={probeStageDigestItems}
           compact
           className="import-probe-stage-digest"
@@ -125,7 +127,7 @@ export default function ImportProbeResultCard({
       )}
       {!!probeIssues.length && (
         <details className="smart-inline-details">
-          <summary>{displayText("查看诊断细节")}</summary>
+          <summary>{displayText(`问题 ${Math.min(probeIssues.length, 4)}`)}</summary>
           <div className="smart-issue-list">
             {probeIssues.slice(0, 4).map((item) => (
               <p className="muted-text" key={item}>{displayText(item)}</p>
@@ -156,7 +158,7 @@ export default function ImportProbeResultCard({
                   : "model",
             )}
           >
-            {displayText("打开设置")}
+            {displayText("设置")}
           </Link>
         )}
       </div>

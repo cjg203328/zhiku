@@ -5,7 +5,7 @@ import mimetypes
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
@@ -72,6 +72,7 @@ class AsrGateway:
         *,
         filename_hint: str = "audio.m4a",
         strategies: list[dict[str, Any]],
+        should_stop: Callable[[AsrTranscript], bool] | None = None,
     ) -> list[AsrTranscript]:
         if not self.is_enabled() or not audio_url.strip() or not strategies:
             return []
@@ -103,6 +104,8 @@ class AsrGateway:
 
                 result["strategy_label"] = str(strategy.get("label") or "").strip()
                 results.append(result)
+                if should_stop is not None and should_stop(result):
+                    break
         finally:
             try:
                 temp_path.unlink(missing_ok=True)

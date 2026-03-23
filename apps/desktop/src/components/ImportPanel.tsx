@@ -606,6 +606,85 @@ function buildImportResultFromJob(job: ImportJob): ImportResponse {
   };
 }
 
+function buildProbePendingSummary(probe: ProbeResult) {
+  if (probe.subtitle_available) {
+    return "已确认存在可用字幕，正在提取正文与时间轴。";
+  }
+  if (probe.subtitle_login_required && probe.audio_available && probe.asr_configured) {
+    return "字幕受登录态限制，正在切换到本地音频转写。";
+  }
+  if (probe.subtitle_login_required) {
+    return "字幕受登录态限制，正在继续尝试可用正文链路。";
+  }
+  if (probe.audio_available && probe.asr_configured) {
+    return "当前没有公开字幕，正在准备本地音频转写。";
+  }
+  if (probe.audio_available) {
+    return "当前没有公开字幕，正在检查音频与补全文字层。";
+  }
+  return probe.predicted_summary.trim() || "任务已排队，正在提取正文与整理笔记。";
+}
+
+function buildProbePendingKeyPoints(probe: ProbeResult) {
+  const points = [`已识别视频：${probe.title}`];
+
+  if (probe.subtitle_available) {
+    points.push("已检测到可直接使用的字幕与时间轴");
+  } else if (probe.subtitle_login_required) {
+    points.push("当前字幕层受登录态限制");
+  } else {
+    points.push("当前没有公开字幕，正在继续检查正文来源");
+  }
+
+  if (probe.audio_available && probe.asr_configured) {
+    points.push("必要时会自动回退到本地音频转写");
+  } else if (probe.audio_available) {
+    points.push("音频可用，但当前还需要补齐转写能力");
+  } else {
+    points.push("当前先走基础解析链路");
+  }
+
+  return points.slice(0, 3);
+}
+
+function hydratePendingImportJobWithProbe(job: ImportJob, probe: ProbeResult): ImportJob {
+  const preview = job.preview;
+  const metadata =
+    preview.metadata && typeof preview.metadata === "object"
+      ? { ...preview.metadata }
+      : {};
+
+  return {
+    ...job,
+    preview: {
+      ...preview,
+      platform: probe.platform || preview.platform,
+      source_url: probe.source_url || preview.source_url,
+      title: probe.title?.trim() || preview.title,
+      author: probe.author ?? preview.author ?? null,
+      summary: buildProbePendingSummary(probe),
+      key_points: buildProbePendingKeyPoints(probe),
+      metadata: {
+        ...metadata,
+        bvid: probe.bvid,
+        cid: probe.cid,
+        page_number: probe.page_number,
+        cover: probe.cover,
+        duration: probe.duration,
+        subtitle_count: probe.subtitle_count,
+        subtitle_login_required: probe.subtitle_login_required,
+        audio_available: probe.audio_available,
+        asr_configured: probe.asr_configured,
+        predicted_status: probe.predicted_status,
+        predicted_quality: probe.predicted_quality,
+        predicted_summary: probe.predicted_summary,
+        predicted_recommended_action: probe.predicted_recommended_action,
+        job_seeded_from_probe: true,
+      },
+    },
+  };
+}
+
 export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
   const { displayText } = useLanguage();
   const queryClient = useQueryClient();
@@ -713,8 +792,37 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
   const urlMutation = useMutation({
     mutationFn: ({ url, noteStyle, summaryFocus }: { url: string; noteStyle: string; summaryFocus: string }) =>
       createUrlImport(url, { noteStyle, summaryFocus, asyncMode: true }),
-    onSuccess: (data) => {
-      acceptImportResponse(data, { clearUrl: true });
+    onSuccess: (data, variables) => {
+      const trimmedUrl = variables.url.trim();
+      const matchedProbe = lastProbeResult?.probe && lastProbedUrl === trimmedUrl ? lastProbeResult.probe : null;
+      let nextData = data;
+      if (!isImportJobTerminal(data.job.status)) {
+        if (matchedProbe && data.job.preview.platform === "bilibili") {
+          nextData = { ...data, job: hydratePendingImportJobWithProbe(data.job, matchedProbe) };
+        } else if (isBilibiliLink(trimmedUrl) && !data.job.preview.title?.trim()) {
+          // 直接导入无预检：从 URL 提取 bvid 作为占位标题
+          const bvidMatch = trimmedUrl.match(/BV[0-9A-Za-z]+/i);
+          const bvid = bvidMatch ? bvidMatch[0] : "";
+          if (bvid) {
+            nextData = {
+              ...data,
+              job: {
+                ...data.job,
+                preview: {
+                  ...data.job.preview,
+                  platform: data.job.preview.platform || "bilibili",
+                  title: data.job.preview.title?.trim() || `B站视频 ${bvid}`,
+                  summary: data.job.preview.summary?.trim() || "任务已排队，正在识别视频并提取正文。",
+                  key_points: data.job.preview.key_points?.length
+                    ? data.job.preview.key_points
+                    : [`已识别视频编号：${bvid}`, "正在确认字幕与音频来源", "提取完成后会自动整理成笔记"],
+                },
+              },
+            };
+          }
+        }
+      }
+      acceptImportResponse(nextData, { clearUrl: true });
     },
   });
 

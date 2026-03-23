@@ -11,7 +11,10 @@ type StageItem = { key: string; label: string };
 type StepMeta = { label: string; description: string };
 type RunningJob = {
   progress?: number;
+  step?: string;
+  created_at?: string;
   preview: {
+    platform?: string;
     title?: string;
     summary?: string;
     content_text?: string;
@@ -27,12 +30,48 @@ type Props = {
   importStageIndex: number;
 };
 
+function formatElapsedLabel(createdAt: string | undefined) {
+  if (!createdAt) {
+    return "";
+  }
+
+  const startedAt = Date.parse(createdAt);
+  if (Number.isNaN(startedAt)) {
+    return "";
+  }
+
+  const totalSeconds = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}小时${minutes}分`;
+  }
+  if (minutes > 0) {
+    return `${minutes}分${seconds}秒`;
+  }
+  return `${seconds}秒`;
+}
+
+function getPlatformLabel(platform: string | undefined) {
+  if (!platform) return "";
+  if (platform === "bilibili") return "B站";
+  if (platform === "local_file") return "文件";
+  if (platform === "webpage") return "网页";
+  return platform;
+}
+
 export default function ImportProgressCard({ runningImportJob, importStepMeta, importStageItems, importStageIndex }: Props) {
   const { displayText } = useLanguage();
   const progressValue = Math.min(100, Math.max(runningImportJob?.progress ?? 0, 5));
   const progressPreview = runningImportJob?.preview;
-  const progressSummarySource = progressPreview?.summary || progressPreview?.content_text || "";
+  const progressTitle = progressPreview?.title?.trim() || importStepMeta.label;
+  const progressSummarySource = progressPreview?.summary || progressPreview?.content_text || importStepMeta.description || "";
   const progressScreenshots = parseNoteScreenshots(progressPreview?.metadata);
+  const isBilibiliTranscribing = progressPreview?.platform === "bilibili" && runningImportJob?.step === "transcribing_audio";
+  const elapsedLabel = formatElapsedLabel(runningImportJob?.created_at);
+  const platformLabel = getPlatformLabel(progressPreview?.platform);
   const progressStageSeeds = (progressPreview?.key_points?.length ?? 0) > 0
     ? buildStageDigestSeeds(progressPreview?.key_points ?? [], {
         idPrefix: "progress-point",
@@ -52,15 +91,28 @@ export default function ImportProgressCard({ runningImportJob, importStepMeta, i
     <article className="preview-card smart-status-card">
       <div className="panel-heading">
         <div>
-          <p className="eyebrow">{displayText("解析进度")}</p>
-          <h4>{displayText(importStepMeta.label)}</h4>
-          <p className="muted-text">{displayText(importStepMeta.description)}</p>
+          <p className="eyebrow">{displayText("处理中")}</p>
+          <h4>{displayText(progressTitle)}</h4>
         </div>
         <span className="pill">{displayText(`${progressValue}%`)}</span>
       </div>
+
+      <div className="pill-row import-progress-meta-row">
+        {progressTitle !== importStepMeta.label ? <span className="pill">{displayText(importStepMeta.label)}</span> : null}
+        {platformLabel ? <span className="pill">{displayText(platformLabel)}</span> : null}
+        {elapsedLabel ? <span className="pill">{displayText(`已耗时 ${elapsedLabel}`)}</span> : null}
+      </div>
+
       <div className="smart-progress-track" aria-hidden="true">
         <div className="smart-progress-fill" style={{ width: `${progressValue}%` }} />
       </div>
+
+      {isBilibiliTranscribing ? (
+        <p className="muted-text import-progress-note">
+          {displayText("当前已切换到本地转写，短视频通常也需要等待 1-3 分钟。")}
+        </p>
+      ) : null}
+
       <div className="status-timeline">
         {importStageItems.map((stage, index) => (
           <div
@@ -77,17 +129,17 @@ export default function ImportProgressCard({ runningImportJob, importStepMeta, i
           </div>
         ))}
       </div>
-      {progressPreview?.title && (
+
+      {progressSummarySource ? (
         <article className="smart-progress-preview">
-          <strong>{displayText(progressPreview.title)}</strong>
-          <p>{displayText(progressSummarySource || "系统正在持续整理内容。")}</p>
+          <p>{displayText(progressSummarySource)}</p>
         </article>
-      )}
+      ) : null}
+
       {!!progressStageDigestItems.length && (
         <StageDigest
           eyebrow="处理中"
-          title="当前重点"
-          description="已提取内容会在这里持续刷新。"
+          title="当前动作"
           items={progressStageDigestItems}
           compact
           className="import-progress-stage-digest"

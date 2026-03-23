@@ -148,7 +148,24 @@ class BilibiliService:
         self._http.cookie = state.cookie_header or None
         return state
 
-    def parse(self, raw_url: str, *, note_style: str = "structured", summary_focus: str = "") -> dict[str, Any]:
+    def parse(
+        self,
+        raw_url: str,
+        *,
+        note_style: str = "structured",
+        summary_focus: str = "",
+        progress_callback: Callable[[str, int, str | None, dict[str, Any] | None], None] | None = None,
+    ) -> dict[str, Any]:
+        def emit_progress(
+            step: str,
+            progress: int,
+            summary: str | None = None,
+            preview_patch: dict[str, Any] | None = None,
+        ) -> None:
+            if progress_callback is None:
+                return
+            progress_callback(step, progress, summary, preview_patch)
+
         auth_state = self._resolve_auth_state()
         normalized_input = self._normalize_input(raw_url)
         resolved_url = self._url_resolver(normalized_input)
@@ -172,6 +189,46 @@ class BilibiliService:
             allow_stub=True,
         )
 
+        runtime_preview_base = {
+            "title": video.title,
+            "author": video.author,
+            "source_url": canonical_source_url,
+            "metadata": {
+                "bvid": video.bvid,
+                "cid": video.cid,
+                "cover": video.cover,
+                "duration": video.duration,
+            },
+        }
+
+        def build_runtime_preview_patch(
+            *,
+            key_points: list[str],
+            metadata: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            patch = dict(runtime_preview_base)
+            patch["key_points"] = key_points
+            patch_metadata = dict(runtime_preview_base["metadata"])
+            if metadata:
+                patch_metadata.update(metadata)
+            patch["metadata"] = patch_metadata
+            return patch
+
+        emit_progress(
+            "fetching_subtitle",
+            54,
+            "正在检查公开字幕与时间轴。",
+            build_runtime_preview_patch(
+                key_points=[
+                    f"已识别视频：{video.title}",
+                    "正在确认是否有可直接使用的字幕与时间轴",
+                    "如果没有公开字幕，会自动回退到音频转写",
+                ],
+                metadata={
+                    "capture_runtime_mode": "checking_subtitle",
+                },
+            ),
+        )
         try:
             subtitle_result = self._fetch_subtitle_segments(video.bvid, video.cid, page_number=selected_page)
             transcript_segments = subtitle_result.segments
@@ -200,10 +257,48 @@ class BilibiliService:
 
         if not transcript_segments:
             try:
+                emit_progress(
+                    "fetching_audio",
+                    62,
+                    "当前没有公开字幕，正在检查音频流。",
+                    build_runtime_preview_patch(
+                        key_points=[
+                            f"已识别视频：{video.title}",
+                            "当前没有拿到公开字幕，正在确认音频流是否可用",
+                            "如果音频可用，会继续自动转到本地转写",
+                        ],
+                        metadata={
+                            "capture_runtime_mode": "checking_audio",
+                            "subtitle_count": subtitle_count,
+                            "subtitle_login_required": subtitle_need_login,
+                            "subtitle_fetch_strategy": subtitle_fetch_strategy,
+                        },
+                    ),
+                )
                 audio_result = self._fetch_audio_url(video.bvid, video.cid, page_number=selected_page)
                 audio_source_url = audio_result.url
                 audio_fetch_strategy = audio_result.strategy
                 if audio_source_url and self.asr_gateway is not None and self.asr_gateway.is_enabled():
+                    emit_progress(
+                        "transcribing_audio",
+                        72,
+                        self._build_transcribing_progress_summary(video.duration),
+                        build_runtime_preview_patch(
+                            key_points=[
+                                f"已识别视频：{video.title}",
+                                "当前没有拿到公开字幕，已切换到本地音频转写",
+                                "转写完成后会继续整理关键片段与截图",
+                            ],
+                            metadata={
+                                "capture_runtime_mode": "transcribing_audio",
+                                "subtitle_count": subtitle_count,
+                                "subtitle_login_required": subtitle_need_login,
+                                "subtitle_fetch_strategy": subtitle_fetch_strategy,
+                                "audio_available": True,
+                                "audio_fetch_strategy": audio_fetch_strategy,
+                            },
+                        ),
+                    )
                     asr_result = self._transcribe_bilibili_audio(
                         audio_source_url,
                         video=video,
@@ -361,6 +456,25 @@ class BilibiliService:
             else:
                 note_markdown = llm_enhanced.get("note_markdown") or note_markdown
 
+        emit_progress(
+            "capturing_screenshots",
+            82,
+            "正在整理关键片段与画面。",
+            build_runtime_preview_patch(
+                key_points=[
+                    "正文与时间片段已恢复，正在整理关键画面",
+                    "这一步会生成回看截图与片段线索",
+                    "完成后会自动入库，内容页可直接查看",
+                ],
+                metadata={
+                    "capture_runtime_mode": "capturing_screenshots",
+                    "transcript_source": transcript_source,
+                    "subtitle_count": subtitle_count,
+                    "subtitle_login_required": subtitle_need_login,
+                    "audio_available": audio_available,
+                },
+            ),
+        )
         screenshot_bundle = self._build_note_screenshot_bundle(
             video=video,
             source_url=canonical_source_url,
@@ -369,13 +483,7 @@ class BilibiliService:
             note_markdown=note_markdown,
         )
         note_screenshots = screenshot_bundle["items"]
-        if note_screenshots:
-            note_markdown = self._inject_screenshots_into_note_markdown(
-                note_markdown,
-                screenshots=note_screenshots,
-            )
-        else:
-            note_markdown = self._strip_screenshot_markers_from_note_markdown(note_markdown)
+        note_markdown = self._strip_screenshot_markers_from_note_markdown(note_markdown)
 
         return {
             "source_type": "url",
@@ -1505,6 +1613,12 @@ class BilibiliService:
             audio_source_url,
             filename_hint=f"{video.bvid}.m4a",
             strategies=strategies,
+            should_stop=lambda candidate: self._should_stop_after_asr_candidate(
+                candidate,
+                score=self._score_asr_result(candidate, video=video, context_terms=context_terms),
+                video=video,
+                context_terms=context_terms,
+            ),
         )
         if not candidates:
             return None
@@ -1512,7 +1626,11 @@ class BilibiliService:
         best_result: dict[str, Any] | None = None
         best_score: int | None = None
         for candidate in candidates:
-            score = self._score_asr_result(candidate, video=video, context_terms=context_terms)
+            score = int(candidate.get("quality_score")) if isinstance(candidate.get("quality_score"), int) else self._score_asr_result(
+                candidate,
+                video=video,
+                context_terms=context_terms,
+            )
             candidate["quality_score"] = score
             if best_result is None or best_score is None or score > best_score:
                 best_result = candidate
@@ -1609,6 +1727,58 @@ class BilibiliService:
             score += 4
 
         return score
+
+    def _should_stop_after_asr_candidate(
+        self,
+        result: dict[str, Any],
+        *,
+        score: int,
+        video: BilibiliVideo,
+        context_terms: list[str],
+    ) -> bool:
+        result["quality_score"] = score
+        if score < 68:
+            return False
+
+        text = str(result.get("text") or "").strip()
+        if len(text) < 160:
+            return False
+
+        segments = self._build_asr_segments(result.get("segments"))
+        if not segments or not any(item.start_ms is not None for item in segments):
+            return False
+
+        if self._looks_like_noisy_transcript(text, title=video.title, description=video.description):
+            return False
+
+        if not context_terms:
+            return True
+
+        normalized_text = re.sub(r"\s+", "", text)
+        lowered_text = text.lower()
+        hits = 0
+        for item in context_terms:
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            if re.search(r"[A-Za-z]", cleaned):
+                if cleaned.lower() in lowered_text:
+                    hits += 1
+            elif re.sub(r"\s+", "", cleaned) in normalized_text:
+                hits += 1
+
+        return hits >= 1
+
+    def _build_transcribing_progress_summary(self, duration_seconds: int | None) -> str:
+        if not duration_seconds or duration_seconds <= 0:
+            return "正在执行本地音频转写，这一步通常最久。"
+
+        duration_label = self._format_timestamp(int(duration_seconds) * 1000)
+        if duration_seconds <= 3 * 60:
+            return f"正在执行本地音频转写（视频时长 {duration_label}，通常需要 1-3 分钟）。"
+        if duration_seconds <= 8 * 60:
+            return f"正在执行本地音频转写（视频时长 {duration_label}，通常需要几分钟）。"
+        return f"正在执行本地音频转写（视频时长 {duration_label}，长视频可能需要更久）。"
 
     def _build_asr_context_prompt(self, video: BilibiliVideo, *, context_terms: list[str]) -> str:
         if not context_terms:
@@ -2354,15 +2524,11 @@ class BilibiliService:
         lines = [
             f"# {video.title}",
             "",
-            "> BiliNote 风格笔记",
-            f"> [打开原视频]({source_url})",
-            f"> 作者：{video.author or '-'} ｜ 时长：{video.duration or '-'} 秒 ｜ 正文来源：{self._label_transcript_source(transcript_source)}",
-            "",
             "## 视频速览",
             "",
-            f"- BVID：{video.bvid}",
-            f"- 播放：{video.view or '-'}",
-            f"- 点赞：{video.like or '-'}",
+            f"- 作者：{video.author or '-'}",
+            f"- 时长：{video.duration or '-'} 秒",
+            f"- 正文来源：{self._label_transcript_source(transcript_source)}",
             f"- 当前状态：{capture_state['label']}",
             f"- 时间定位：{capture_label}",
             "",
@@ -2443,11 +2609,7 @@ class BilibiliService:
             snippet = re.sub(r"\s+", " ", segment.text).strip()
             if len(snippet) > 72:
                 snippet = snippet[:72].rstrip() + "..."
-            seek_url = build_seek_url(source_url, segment.start_ms)
-            if seek_url and segment.start_ms is not None:
-                lines.append(f"- [{label}]({seek_url}) {snippet}")
-            else:
-                lines.append(f"- {label}：{snippet}")
+            lines.append(f"- {label}：{snippet}")
         return lines
 
     def _build_bilinote_clip_sections(
@@ -2470,20 +2632,13 @@ class BilibiliService:
         lines: list[str] = []
         for index, segment in enumerate(selected_segments, start=1):
             label = self._format_segment_range(segment.start_ms, segment.end_ms) or self._format_timestamp(segment.start_ms) or f"片段 {index}"
-            seek_url = build_seek_url(source_url, segment.start_ms)
-            heading = f"### [{label}]({seek_url})" if seek_url and segment.start_ms is not None else f"### {label}"
-            capture_marker = self._build_screenshot_marker(self._select_capture_timestamp_ms(segment))
+            heading = f"### {label}"
             lines.extend([
                 heading,
                 "",
             ])
             segment_text = segment.text.strip() or "当前片段暂无正文。"
             lines.append(segment_text)
-            if capture_marker:
-                lines.extend([
-                    "",
-                    capture_marker,
-                ])
             lines.append("")
         return lines
 

@@ -4,7 +4,7 @@ import type { StageDigestCard } from "../lib/stageDigest";
 type StageDigestProps = {
   eyebrow: string;
   title: string;
-  description: string;
+  description?: string;
   items: StageDigestCard[];
   compact?: boolean;
   className?: string;
@@ -34,7 +34,7 @@ export default function StageDigest({
         <div>
           <p className="eyebrow">{displayText(eyebrow)}</p>
           <h4>{displayText(title)}</h4>
-          <p className="muted-text">{displayText(description)}</p>
+          {description ? <p className="muted-text">{displayText(description)}</p> : null}
         </div>
         <div className="pill-row">
           <span className="pill">{displayText(`${items.length} 节`)}</span>
@@ -54,7 +54,7 @@ export default function StageDigest({
               <div className="stage-digest-copy">
                 <span className="eyebrow">{displayText(item.eyebrow)}</span>
                 <strong>{displayText(item.title)}</strong>
-                <p>{displayText(item.summary || "当前阶段已保留摘要，可继续展开查看。")}</p>
+                <p>{displayText(item.summary || "已保留阶段摘要。")}</p>
               </div>
             </>
           );

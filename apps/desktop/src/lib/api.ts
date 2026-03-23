@@ -454,6 +454,8 @@ export type ContentItem = {
   title: string;
   platform: string | null;
   source_type: string | null;
+  source_url?: string | null;
+  source_file?: string | null;
   summary: string;
   tags: string[];
   category: string;
@@ -551,6 +553,7 @@ export type ImportPreview = {
   source_url?: string;
   source_file?: string;
   title: string;
+  author?: string | null;
   content_text: string;
   summary: string;
   key_points: string[];
@@ -617,6 +620,8 @@ export type UpgradeContentsResponse = {
     fallback_repaired: number;
     skipped: number;
     failed: number;
+    duplicate_groups?: number;
+    duplicates_archived?: number;
     dry_run: boolean;
     limit: number;
   };
@@ -741,6 +746,22 @@ export function triggerReindex() {
   return readJson<{ ok: boolean; chunks_count: number; message: string }>("/api/v1/system/reindex", {
     method: "POST",
   });
+}
+
+export type DedupeResult = {
+  ok: boolean;
+  dry_run: boolean;
+  duplicate_groups: number;
+  duplicates_archived: number;
+  items: { duplicate_id: string; duplicate_title: string; kept_id: string; kept_title: string; source_key: string }[];
+};
+
+export function dedupeContents() {
+  return readJson<DedupeResult>("/api/v1/system/dedupe-contents", { method: "POST" });
+}
+
+export function dedupeContentsPreview() {
+  return readJson<DedupeResult>("/api/v1/system/dedupe-contents?dry_run=true", { method: "POST" });
 }
 
 export function getBilibiliStatus() {
