@@ -7,24 +7,27 @@ from ..config import AppSettings
 from .llm_gateway import LlmGateway
 
 
-MINDMAP_PROMPT = """你是一个知识结构化助手。请根据下面的内容，生成一份思维导图结构（JSON格式）。
+MINDMAP_PROMPT = """根据下面的内容，生成一份思维导图结构（JSON格式）。
 
-要求：
-- 返回纯 JSON，不要 markdown 代码块
-- 结构为：{"title": "主题", "children": [{"title": "子主题", "children": [...]}]}
-- 主题层级不超过3层，每层不超过6个节点
-- 节点标题简洁，不超过20字
+规则：
+- 只返回 JSON，不加任何解释或 markdown 代码块
+- 结构：{{"title": "核心主题", "children": [{{"title": "子主题", "children": [...]}}]}}
+- 最多 3 层，每层最多 5 个节点
+- 节点文字提炼自内容，不超过 15 字，不出现 BV 号、链接、播放量等无关信息
+- 优先覆盖内容的核心结论、方法、步骤，而非目录标题
 
 内容：
 {content}"""
 
-QUIZ_PROMPT = """你是一个出题助手。请根据下面的内容，生成5道理解性选择题（JSON格式）。
+QUIZ_PROMPT = """根据下面的内容，生成 5 道理解性单选题（JSON 格式）。
 
-要求：
-- 返回纯 JSON 数组，不要 markdown 代码块
-- 每题结构：{"question": "题目", "options": ["A. ...", "B. ...", "C. ...", "D. ..."], "answer": "A", "explanation": "解析"}
-- 题目考察核心概念，选项设计合理，有迷惑性
-- answer 字段只填 A/B/C/D
+规则：
+- 只返回 JSON 数组，不加任何解释或 markdown 代码块
+- 每题结构：{{"question": "题目", "options": ["A. ...", "B. ...", "C. ...", "D. ..."], "answer": "A", "explanation": "一句话解析"}}
+- 题目考察内容的核心概念、关键结论或方法步骤
+- 选项设计要有合理的迷惑性，但答案在内容中有明确依据
+- answer 只填 A/B/C/D，explanation 简洁不超过 60 字
+- 不要出考察 BV 号、播放量、UP 主名称等无关信息的题
 
 内容：
 {content}"""

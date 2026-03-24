@@ -21,6 +21,12 @@ const DROPPED_BULLET_LABELS = [
   "来源链接",
   "笔记风格",
   "建议下一步",
+  "粉丝",
+  "关注",
+  "弹幕",
+  "分享",
+  "发布时间",
+  "上传时间",
 ];
 
 const DROPPED_SECTION_TITLES = new Set(["可执行建议", "下一步建议"]);
@@ -69,6 +75,16 @@ function shouldDropLine(text: string) {
   }
 
   if (/\b(?:BV[0-9A-Za-z]+|av\d+)\b/.test(text)) {
+    return true;
+  }
+
+  // 纯统计数据行（粉丝量、播放量等）
+  if (/^(?:粉丝|关注|播放量|弹幕数|收藏数)[：:]\s*\d+/.test(text)) {
+    return true;
+  }
+
+  // UP主主页/个人空间链接
+  if (/space\.bilibili\.com/.test(text)) {
     return true;
   }
 

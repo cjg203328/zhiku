@@ -4,13 +4,13 @@ import { useNavigate } from "react-router-dom";
 import { emptyTrash, getTrashContents, permanentDeleteContent, restoreContent } from "../lib/api";
 import { useLanguage } from "../lib/language";
 import { splitStageDigestText } from "../lib/stageDigest";
+import { useAppStore } from "../store/appStore";
 
 export default function RecycleBinPage() {
   const { displayText } = useLanguage();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [pageMessage, setPageMessage] = useState("");
-  const [pageError, setPageError] = useState("");
+  const showToast = useAppStore((s) => s.showToast);
   const [restoringIds, setRestoringIds] = useState<Set<string>>(new Set());
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
 
@@ -26,11 +26,10 @@ export default function RecycleBinPage() {
     onSuccess: async (payload) => {
       await queryClient.invalidateQueries({ queryKey: ["trash"] });
       await queryClient.invalidateQueries({ queryKey: ["contents"] });
-      setPageError("");
-      setPageMessage(payload.openAfter ? "内容已恢复，正在打开详情。" : "内容已恢复到知识库。");
+      showToast(payload.openAfter ? "内容已恢复，正在打开详情。" : "内容已恢复到知识库。", "success");
       if (payload.openAfter) navigate(`/library/${payload.id}`);
     },
-    onError: () => { setPageMessage(""); setPageError("恢复失败，请稍后再试。"); },
+    onError: () => { showToast("恢复失败，请稍后再试。", "error"); },
   });
 
   const permanentDeleteMutation = useMutation({
@@ -39,10 +38,9 @@ export default function RecycleBinPage() {
     onSettled: (_, __, id) => setDeletingIds((prev) => { const next = new Set(prev); next.delete(id); return next; }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["trash"] });
-      setPageError("");
-      setPageMessage("内容已彻底删除。");
+      showToast("内容已彻底删除。", "success");
     },
-    onError: () => { setPageMessage(""); setPageError("彻底删除失败，请稍后再试。"); },
+    onError: () => { showToast("彻底删除失败，请稍后再试。", "error"); },
   });
 
   const emptyMutation = useMutation({
@@ -50,25 +48,20 @@ export default function RecycleBinPage() {
     onSuccess: async (result) => {
       await queryClient.invalidateQueries({ queryKey: ["trash"] });
       await queryClient.invalidateQueries({ queryKey: ["contents"] });
-      setPageError("");
-      setPageMessage(result.deleted > 0 ? `已永久清空 ${result.deleted} 条内容。` : result.message);
+      showToast(result.deleted > 0 ? `已永久清空 ${result.deleted} 条内容。` : (result.message || "回收站已清空。"), "success");
     },
-    onError: () => { setPageMessage(""); setPageError("清空失败，请稍后再试。"); },
+    onError: () => { showToast("清空失败，请稍后再试。", "error"); },
   });
 
   function handleEmptyTrash() {
     const total = trashQuery.data?.total ?? 0;
     if (!total || emptyMutation.isPending) return;
     if (!window.confirm(displayText(`确认永久清空回收站中的 ${total} 条内容吗？此操作无法恢复。`))) return;
-    setPageMessage("");
-    setPageError("");
     emptyMutation.mutate();
   }
 
   function handlePermanentDelete(id: string, title: string) {
     if (!window.confirm(displayText(`确认彻底删除《${title}》吗？此操作无法恢复。`))) return;
-    setPageMessage("");
-    setPageError("");
     permanentDeleteMutation.mutate(id);
   }
 
@@ -123,7 +116,7 @@ export default function RecycleBinPage() {
           <button
             className="secondary-button"
             type="button"
-            onClick={() => { setPageMessage(""); setPageError(""); restoreMutation.mutate({ id: item.id, openAfter: false }); }}
+            onClick={() => restoreMutation.mutate({ id: item.id, openAfter: false })}
             disabled={isRestoring || isDeleting || isAnythingPending}
           >
             {isRestoring ? displayText("恢复中...") : displayText("恢复内容")}
@@ -131,7 +124,7 @@ export default function RecycleBinPage() {
           <button
             className="primary-button"
             type="button"
-            onClick={() => { setPageMessage(""); setPageError(""); restoreMutation.mutate({ id: item.id, openAfter: true }); }}
+            onClick={() => restoreMutation.mutate({ id: item.id, openAfter: true })}
             disabled={isRestoring || isDeleting || isAnythingPending}
           >
             {displayText("恢复并打开")}
@@ -139,7 +132,7 @@ export default function RecycleBinPage() {
           <button
             className="danger-button"
             type="button"
-            onClick={() => handlePermanentDelete(item.id, item.title)}
+            onClick={() => { handlePermanentDelete(item.id, item.title); }}
             disabled={isRestoring || isDeleting || isAnythingPending}
           >
             {isDeleting ? displayText("删除中...") : displayText("彻底删除")}
@@ -191,8 +184,6 @@ export default function RecycleBinPage() {
         </section>
       ))}
 
-      {pageMessage && <p className="success-text" style={{ marginTop: "var(--space-4)" }}>{displayText(pageMessage)}</p>}
-      {pageError && <p className="error-text" style={{ marginTop: "var(--space-4)" }}>{displayText(pageError)}</p>}
     </section>
   );
 }

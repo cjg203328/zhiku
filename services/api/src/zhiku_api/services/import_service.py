@@ -952,6 +952,12 @@ class ImportService:
         if re.match(r"^(?:打开原视频|原视频链接|源视频链接)", text):
             return True
 
+        if re.search(r"^(?:粉丝|关注(?:数)?|弹幕(?:数)?|收藏(?:数)?|播放量|发布时间|上传时间)[：:]\s*\S+", text):
+            return True
+
+        if re.search(r"space\.bilibili\.com", text):
+            return True
+
         return False
 
     def _join_note_lines(self, lines: list[str]) -> str:

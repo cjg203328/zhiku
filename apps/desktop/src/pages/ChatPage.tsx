@@ -353,6 +353,7 @@ export default function ChatPage() {
   const [answer, setAnswer] = useState("");
   const [citations, setCitations] = useState<ChatCitation[]>([]);
   const [followUps, setFollowUps] = useState<string[]>([]);
+  const [expandedCitations, setExpandedCitations] = useState<Set<string>>(new Set());
   const [isStreaming, setIsStreaming] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [hasSubmitted, setHasSubmitted] = useState(false);
@@ -925,6 +926,7 @@ export default function ChatPage() {
                     >
                       <div className="pill-row">
                         <span className="pill">{displayText(`${session.message_count} 条消息`)}</span>
+                        {session.updated_at && <span className="pill">{displayText(formatMessageTime(session.updated_at))}</span>}
                       </div>
                       <strong>{displayText(session.title?.trim() || "新会话")}</strong>
                       <p className="muted-text">{displayText(session.last_message || "还没有内容预览")}</p>
@@ -1067,7 +1069,7 @@ export default function ChatPage() {
                     <details className="qa-citation-disclosure">
                       <summary>{displayText(`查看引用来源（${messageCitations.length}）`)}</summary>
                       <div className="qa-inline-citations">
-                        {messageCitations.slice(0, 4).map((citation) => {
+                        {(expandedCitations.has(message.id) ? messageCitations : messageCitations.slice(0, 4)).map((citation) => {
                           const chunkLabel = formatChunkLabel(citation);
                           const jumpUrl = buildSeekUrl(citation);
                           const detailLink = buildCitationDetailLink(citation);
@@ -1095,6 +1097,16 @@ export default function ChatPage() {
                             </article>
                           );
                         })}
+                        {messageCitations.length > 4 && !expandedCitations.has(message.id) && (
+                          <button
+                            className="secondary-button"
+                            type="button"
+                            style={{ fontSize: 12, padding: "2px 10px", marginTop: 4 }}
+                            onClick={() => setExpandedCitations((prev) => new Set([...prev, message.id]))}
+                          >
+                            {displayText(`展开全部 ${messageCitations.length} 条引用`)}
+                          </button>
+                        )}
                       </div>
                     </details>
                   )}
@@ -1109,7 +1121,10 @@ export default function ChatPage() {
             {localMessage && <p className="success-text">{displayText(localMessage)}</p>}
             {isLowRecall && (
               <div className="low-recall-warning">
-                <span>{displayText("证据偏弱，可补资料或换问法。")}</span>
+                <span>{displayText("证据偏弱，可补充资料或换个问法试试。")}</span>
+                <Link className="secondary-button button-link" to="/library" style={{ fontSize: 12, padding: "2px 10px" }}>
+                  {displayText("去导入")}
+                </Link>
               </div>
             )}
             {savedNoteId && (

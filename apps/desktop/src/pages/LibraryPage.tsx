@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import ImportPanel from "../components/ImportPanel";
@@ -105,6 +105,10 @@ function loadSearchHistory(): string[] {
   } catch {
     return [];
   }
+}
+
+function clearSearchHistory() {
+  try { window.localStorage.removeItem(SEARCH_HISTORY_KEY); } catch {}
 }
 
 function saveSearchHistory(term: string) {
@@ -278,6 +282,24 @@ const mockCards: LibraryCardItem[] = [
   },
 ];
 
+function highlightKeyword(
+  text: string,
+  keyword: string,
+  displayText: (value: string | null | undefined) => string,
+): React.ReactNode {
+  const renderedText = displayText(text);
+  const renderedKeyword = displayText(keyword).trim();
+  if (!renderedKeyword || !renderedText) return renderedText;
+  const escaped = renderedKeyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const parts = renderedText.split(new RegExp(`(${escaped})`, "gi"));
+  if (parts.length === 1) return renderedText;
+  return parts.map((part, i) =>
+    part.toLowerCase() === renderedKeyword.toLowerCase()
+      ? <mark key={i} className="search-highlight">{part}</mark>
+      : part
+  );
+}
+
 const filterItems: { key: FilterKey; label: string; hint: string }[] = [
   { key: "all", label: "全部内容", hint: "总览" },
   { key: "video", label: "视频笔记", hint: "视频来源" },
@@ -288,6 +310,7 @@ const filterItems: { key: FilterKey; label: string; hint: string }[] = [
 export default function LibraryPage() {
   const { displayText } = useLanguage();
   const queryClient = useQueryClient();
+  const importPanelRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -442,6 +465,16 @@ export default function LibraryPage() {
     [filteredCards, selectedCardId],
   );
 
+  function jumpToImportPanel() {
+    importPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    window.setTimeout(() => {
+      const input = document.getElementById("url-input");
+      if (input instanceof HTMLInputElement) {
+        input.focus();
+      }
+    }, 220);
+  }
+
   const detailQuery = useQuery({
     queryKey: ["content", selectedCard?.id],
     queryFn: () => getContent(selectedCard!.id),
@@ -547,7 +580,9 @@ export default function LibraryPage() {
             </div>
           </article>
 
-          <ImportPanel onImportCompleted={handleImportCompleted} />
+          <div ref={importPanelRef}>
+            <ImportPanel onImportCompleted={handleImportCompleted} />
+          </div>
 
           <article className="card glass-panel bili-note-collection-card">
             <div className="bili-note-section-head">
@@ -684,6 +719,13 @@ export default function LibraryPage() {
                       {item}
                     </button>
                   ))}
+                  <button
+                    type="button"
+                    className="bili-note-search-history-clear"
+                    onMouseDown={() => { clearSearchHistory(); setSearchHistory([]); setShowSearchHistory(false); }}
+                  >
+                    {displayText("清除历史")}
+                  </button>
                 </div>
               )}
             </div>
@@ -752,6 +794,14 @@ export default function LibraryPage() {
                   <>
                     <strong>{displayText("内容列表还是空的")}</strong>
                     <p className="muted-text">{displayText("导入一条视频或文档后，这里会自动出现新的内容卡片。")}</p>
+                    <button
+                      className="primary-button"
+                      type="button"
+                      style={{ marginTop: "var(--space-3)" }}
+                      onClick={jumpToImportPanel}
+                    >
+                      {displayText("去导入内容")}
+                    </button>
                   </>
                 )}
               </div>
@@ -777,8 +827,12 @@ export default function LibraryPage() {
                           <span className="pill">{displayText(getNoteStyleLabel(item.noteStyle))}</span>
                         )}
                       </div>
-                      <strong className="knowledge-list-item-title">{displayText(item.title)}</strong>
-                      <p className="knowledge-list-item-summary">{displayText(item.summary)}</p>
+                      <strong className="knowledge-list-item-title">
+                        {debouncedSearch ? highlightKeyword(item.title, debouncedSearch, displayText) : displayText(item.title)}
+                      </strong>
+                      <p className="knowledge-list-item-summary">
+                        {debouncedSearch ? highlightKeyword(item.summary || "", debouncedSearch, displayText) : displayText(item.summary)}
+                      </p>
                       <div className="bili-note-history-item-foot">
                         <div className="tag-row-soft">
                           {(item.tags.length ? item.tags : ["暂无标签"]).slice(0, 3).map((tag) => (

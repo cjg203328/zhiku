@@ -584,12 +584,40 @@ class LibraryRepository:
     ) -> dict[str, Any]:
         connection = self._connect()
         try:
+            # FTS chunk search: collect content_ids that match the query
+            fts_content_ids: list[str] = []
+            if query and query.strip():
+                keyword = query.strip()
+                try:
+                    fts_rows = connection.execute(
+                        """
+                        SELECT DISTINCT c.id
+                        FROM content_chunks cc
+                        JOIN content_chunks_fts fts ON fts.rowid = cc.rowid
+                        JOIN contents c ON c.id = cc.content_id
+                        WHERE content_chunks_fts MATCH ?
+                          AND c.deleted_at IS NULL
+                        LIMIT 100
+                        """,
+                        (keyword,),
+                    ).fetchall()
+                    fts_content_ids = [row[0] for row in fts_rows]
+                except Exception:
+                    fts_content_ids = []
+
             params: list[Any] = []
             where_clauses = ["deleted_at IS NULL"]
             if query and query.strip():
-                keyword = f"%{query.strip()}%"
-                where_clauses.append("(title LIKE ? OR summary LIKE ? OR content_text LIKE ?)")
-                params.extend([keyword, keyword, keyword])
+                keyword_like = f"%{query.strip()}%"
+                if fts_content_ids:
+                    placeholders = ",".join("?" * len(fts_content_ids))
+                    where_clauses.append(
+                        f"(title LIKE ? OR summary LIKE ? OR content_text LIKE ? OR id IN ({placeholders}))"
+                    )
+                    params.extend([keyword_like, keyword_like, keyword_like, *fts_content_ids])
+                else:
+                    where_clauses.append("(title LIKE ? OR summary LIKE ? OR content_text LIKE ?)")
+                    params.extend([keyword_like, keyword_like, keyword_like])
             if collection_id is not None:
                 where_clauses.append("collection_id = ?")
                 params.append(collection_id)

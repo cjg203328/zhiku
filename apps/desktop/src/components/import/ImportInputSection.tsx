@@ -1,3 +1,4 @@
+import { useCallback, useState } from "react";
 import { useLanguage } from "../../lib/language";
 
 type Props = {
@@ -26,6 +27,64 @@ type Props = {
   onFileMutate: (path: string) => void;
   onFileUploadMutate: (file: File) => void;
 };
+
+function FileDropZone({
+  selectedFile, setSelectedFile, isImporting, onFileUploadMutate, displayText,
+}: {
+  selectedFile: File | null;
+  setSelectedFile: (f: File | null) => void;
+  isImporting: boolean;
+  onFileUploadMutate: (file: File) => void;
+  displayText: (s: string) => string;
+}) {
+  const { isDragging, onDragOver, onDragLeave, onDrop } = useDragDrop(setSelectedFile);
+  return (
+    <div
+      className={`file-dropzone${isDragging ? " file-dropzone--active" : ""}`}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      <label className="file-dropzone__label">
+        {selectedFile
+          ? <span className="file-dropzone__name">{selectedFile.name}</span>
+          : <span>{isDragging ? displayText("释放以选择文件") : displayText("拖拽文件到此处，或点击选择")}</span>
+        }
+        <input
+          type="file"
+          className="file-dropzone__input"
+          onChange={(e) => setSelectedFile(e.target.files?.[0] ?? null)}
+        />
+      </label>
+      {selectedFile && (
+        <button
+          className="secondary-button"
+          type="button"
+          disabled={isImporting}
+          onClick={() => onFileUploadMutate(selectedFile)}
+        >
+          {isImporting ? displayText("处理中...") : displayText("上传并解析")}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function useDragDrop(onFileDrop: (file: File) => void) {
+  const [isDragging, setIsDragging] = useState(false);
+  const onDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+  const onDragLeave = useCallback(() => setIsDragging(false), []);
+  const onDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) onFileDrop(file);
+  }, [onFileDrop]);
+  return { isDragging, onDragOver, onDragLeave, onDrop };
+}
 
 export default function ImportInputSection({
   urlValue, setUrlValue, onUrlChange,
@@ -135,21 +194,13 @@ export default function ImportInputSection({
                 </button>
               </>
             ) : (
-              <>
-                <input
-                  className="search-input"
-                  type="file"
-                  onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
-                />
-                <button
-                  className="secondary-button"
-                  type="button"
-                  disabled={!selectedFile || isImporting}
-                  onClick={() => selectedFile && onFileUploadMutate(selectedFile)}
-                >
-                  {isImporting ? displayText("处理中...") : displayText("上传并解析")}
-                </button>
-              </>
+              <FileDropZone
+                selectedFile={selectedFile}
+                setSelectedFile={setSelectedFile}
+                isImporting={isImporting}
+                onFileUploadMutate={onFileUploadMutate}
+                displayText={displayText}
+              />
             )}
           </div>
         </article>
