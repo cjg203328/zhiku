@@ -18,6 +18,13 @@ function resolveApiBaseUrl() {
     return "http://127.0.0.1:38765";
   }
 
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname.trim().toLowerCase();
+    if (host === "127.0.0.1" || host === "localhost") {
+      return "http://127.0.0.1:38765";
+    }
+  }
+
   return "";
 }
 
