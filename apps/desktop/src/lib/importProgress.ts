@@ -1,3 +1,5 @@
+import type { ImportJob } from "./api";
+
 export type ImportProgressMode = "import" | "reparse";
 
 export type ImportStageItem = {
@@ -9,6 +11,120 @@ export type ImportStepMeta = {
   label: string;
   description: string;
 };
+
+type ImportTimeoutPolicy = {
+  maxIdleMs: number;
+  hardCapMs: number;
+};
+
+function readJobMetadata(job: ImportJob | null | undefined) {
+  const metadata = job?.preview?.metadata;
+  return metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>) : {};
+}
+
+function readJobTextMetadata(job: ImportJob | null | undefined, key: string) {
+  const value = readJobMetadata(job)[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function parseTimestamp(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function getTimeoutScopeLabel(mode: ImportProgressMode) {
+  return mode === "reparse" ? "重新解析" : "导入";
+}
+
+function getTimeoutPolicy(job: ImportJob | null | undefined, mode: ImportProgressMode): ImportTimeoutPolicy {
+  const previewPlatform = job?.preview?.platform?.trim().toLowerCase() || "";
+  const isBilibili = previewPlatform === "bilibili";
+  const isTranscribing = job?.step === "transcribing_audio";
+
+  if (isTranscribing) {
+    return {
+      maxIdleMs: 3 * 60 * 1000,
+      hardCapMs: 35 * 60 * 1000,
+    };
+  }
+
+  if (isBilibili) {
+    return {
+      maxIdleMs: 90 * 1000,
+      hardCapMs: mode === "reparse" ? 18 * 60 * 1000 : 20 * 60 * 1000,
+    };
+  }
+
+  if (job?.source_kind === "file" || job?.source_kind === "file_upload") {
+    return {
+      maxIdleMs: 75 * 1000,
+      hardCapMs: mode === "reparse" ? 10 * 60 * 1000 : 8 * 60 * 1000,
+    };
+  }
+
+  return {
+    maxIdleMs: 60 * 1000,
+    hardCapMs: mode === "reparse" ? 10 * 60 * 1000 : 6 * 60 * 1000,
+  };
+}
+
+function formatDurationLabel(milliseconds: number) {
+  const totalMinutes = Math.max(1, Math.round(milliseconds / 60000));
+  return `${totalMinutes} 分钟`;
+}
+
+export function getImportJobActivityTimestamp(job: ImportJob | null | undefined) {
+  return (
+    parseTimestamp(readJobTextMetadata(job, "job_runtime_last_heartbeat_at")) ??
+    parseTimestamp(job?.updated_at) ??
+    parseTimestamp(job?.created_at) ??
+    null
+  );
+}
+
+export function buildImportTimeoutMessage(job: ImportJob | null | undefined, mode: ImportProgressMode = "import") {
+  const scopeLabel = getTimeoutScopeLabel(mode);
+  const policy = getTimeoutPolicy(job, mode);
+  const previewPlatform = job?.preview?.platform?.trim().toLowerCase() || "";
+  const isBilibili = previewPlatform === "bilibili";
+  const isTranscribing = job?.step === "transcribing_audio";
+
+  if (isTranscribing) {
+    return `${scopeLabel}长时间没有新进度（超过 ${formatDurationLabel(policy.maxIdleMs)} 未更新，最长等待 ${formatDurationLabel(policy.hardCapMs)}）。这类视频可能卡在本地转写，请检查转写运行时后重试。`;
+  }
+
+  if (isBilibili) {
+    return `${scopeLabel}超时（超过 ${formatDurationLabel(policy.hardCapMs)}），请检查小助手、Cookie 或转写运行时后重试。`;
+  }
+
+  if (job?.source_kind === "file" || job?.source_kind === "file_upload") {
+    return `${scopeLabel}超时（超过 ${formatDurationLabel(policy.hardCapMs)}），请检查文件内容和服务状态后重试。`;
+  }
+
+  return `${scopeLabel}超时（超过 ${formatDurationLabel(policy.hardCapMs)}），请检查服务状态后重试。`;
+}
+
+export function resolveImportJobTimeoutState(
+  job: ImportJob | null | undefined,
+  pollStartedAtMs: number,
+  mode: ImportProgressMode = "import",
+  nowMs: number = Date.now(),
+) {
+  const policy = getTimeoutPolicy(job, mode);
+  const lastActivityAt = getImportJobActivityTimestamp(job) ?? pollStartedAtMs;
+  const hardCapExceeded = nowMs - pollStartedAtMs > policy.hardCapMs;
+  const idleExceeded = nowMs - lastActivityAt > policy.maxIdleMs;
+
+  return {
+    timedOut: hardCapExceeded || idleExceeded,
+    message: buildImportTimeoutMessage(job, mode),
+    hardCapExceeded,
+    idleExceeded,
+  };
+}
 
 function normalizeImportStageStep(step: string | undefined) {
   if (step === "fetching_subtitle" || step === "fetching_audio" || step === "transcribing_audio" || step === "capturing_screenshots") {

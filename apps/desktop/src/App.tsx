@@ -14,11 +14,11 @@ const RecycleBinPage = lazy(() => import("./pages/RecycleBinPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
 const navItems = [
-  { to: "/", label: "首页", hint: "状态概览", Icon: Home },
-  { to: "/library", label: "知识库", hint: "导入与浏览", Icon: BookOpen },
-  { to: "/chat", label: "智能问答", hint: "对话与检索", Icon: MessageCircle },
-  { to: "/trash", label: "回收站", hint: "已删除内容", Icon: Trash2 },
-  { to: "/settings", label: "设置", hint: "模型与配置", Icon: Settings },
+  { to: "/", label: "首页", Icon: Home },
+  { to: "/library", label: "知识库", Icon: BookOpen },
+  { to: "/chat", label: "智能问答", Icon: MessageCircle },
+  { to: "/trash", label: "回收站", Icon: Trash2 },
+  { to: "/settings", label: "设置", Icon: Settings },
 ];
 
 const languageItems: { value: AppLanguage; label: string }[] = [
@@ -39,7 +39,7 @@ export default function App() {
               <div className="brand-icon">知</div>
               <span className="brand-name">知库</span>
             </div>
-            <p className="brand-tagline">{displayText("B站视频 · 本地知识库 · 智能问答")}</p>
+            <p className="brand-tagline">{displayText("导入、浏览、提问")}</p>
             <div className="lang-switch">
               {languageItems.map((item) => (
                 <button
@@ -55,7 +55,7 @@ export default function App() {
           </div>
 
           <nav className="nav">
-            {navItems.map(({ to, label, hint, Icon }) => (
+            {navItems.map(({ to, label, Icon }) => (
               <NavLink
                 key={to}
                 to={to}
@@ -66,7 +66,6 @@ export default function App() {
               >
                 <span className="nav-link-icon"><Icon size={16} strokeWidth={1.8} /></span>
                 <span className="nav-link-label">{displayText(label)}</span>
-                <span className="nav-link-hint">{displayText(hint)}</span>
               </NavLink>
             ))}
           </nav>

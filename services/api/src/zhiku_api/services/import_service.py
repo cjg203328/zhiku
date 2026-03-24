@@ -513,9 +513,9 @@ class ImportService:
         duration_text = f"{duration} 秒" if str(duration or "").strip() else "未知"
         transcript_source = self._describe_transcript_source(metadata.get("transcript_source"))
         timeline_label = self._describe_timeline_state(metadata)
-        summary = self._clean_note_line(payload.get("summary"), max_length=160) or "当前正文不足，只能先保留已获取信息。"
-        key_points = self._normalize_note_points(payload.get("key_points"))
-        practical_lines = self._build_practical_digest_lines(payload)
+        practical_lines = self._build_practical_digest_lines(payload, limit=4)
+        summary_paragraphs = self._build_summary_paragraphs(payload, metadata, practical_lines)
+        key_points = self._remove_redundant_note_points(self._normalize_note_points(payload.get("key_points")), practical_lines)
         timeline_lines = self._build_timeline_digest_lines(metadata)
         clip_sections = self._build_clip_digest_sections(metadata)
         origin_lines = self._build_origin_digest_lines(payload, metadata, include_host=False)
@@ -527,19 +527,23 @@ class ImportService:
             f"- 时长：{duration_text}",
             f"- 正文来源：{transcript_source}",
             f"- 时间定位：{timeline_label}",
-            "",
-            "## 核心结论",
-            "",
-            summary,
         ]
 
         if summary_focus.strip():
-            lines[7:7] = [
+            lines.extend([
+                "",
                 "## 本次关注",
                 "",
-                self._clean_note_line(summary_focus, max_length=120),
+                self._polish_note_prose(summary_focus, max_length=120, ensure_terminal=False),
                 "",
-            ]
+            ])
+
+        lines.extend([
+            "",
+            "## 核心结论",
+            "",
+            *self._render_note_paragraphs(summary_paragraphs),
+        ])
 
         if key_points:
             lines.extend([
@@ -568,9 +572,9 @@ class ImportService:
         if practical_lines:
             lines.extend([
                 "",
-                "## 实用整理",
+                "## 精炼正文",
                 "",
-                *practical_lines,
+                *self._render_note_paragraphs(practical_lines),
             ])
 
         if origin_lines:
@@ -585,9 +589,9 @@ class ImportService:
     def _build_webpage_reading_note(self, payload: dict[str, Any], *, summary_focus: str) -> str:
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         host = self._clean_note_line(urlparse(str(payload.get("source_url") or "")).netloc.replace("www.", ""), max_length=48) or "网页来源"
-        summary = self._clean_note_line(payload.get("summary"), max_length=160) or "当前正文不足，只能先保留已获取信息。"
-        key_points = self._normalize_note_points(payload.get("key_points"))
-        practical_lines = self._build_practical_digest_lines(payload)
+        practical_lines = self._build_practical_digest_lines(payload, limit=4)
+        summary_paragraphs = self._build_summary_paragraphs(payload, metadata, practical_lines)
+        key_points = self._remove_redundant_note_points(self._normalize_note_points(payload.get("key_points")), practical_lines)
         origin_lines = self._build_origin_digest_lines(payload, metadata, include_host=True)
 
         lines = [
@@ -595,19 +599,23 @@ class ImportService:
             "",
             f"- 来源站点：{host}",
             f"- 内容来源：{self._clean_note_line(metadata.get('content_source') or '网页正文抽取', max_length=48)}",
-            "",
-            "## 核心结论",
-            "",
-            summary,
         ]
 
         if summary_focus.strip():
-            lines[5:5] = [
+            lines.extend([
+                "",
                 "## 本次关注",
                 "",
-                self._clean_note_line(summary_focus, max_length=120),
+                self._polish_note_prose(summary_focus, max_length=120, ensure_terminal=False),
                 "",
-            ]
+            ])
+
+        lines.extend([
+            "",
+            "## 核心结论",
+            "",
+            *self._render_note_paragraphs(summary_paragraphs),
+        ])
 
         if key_points:
             lines.extend([
@@ -620,9 +628,9 @@ class ImportService:
         if practical_lines:
             lines.extend([
                 "",
-                "## 实用整理",
+                "## 精炼正文",
                 "",
-                *practical_lines,
+                *self._render_note_paragraphs(practical_lines),
             ])
 
         if origin_lines:
@@ -642,31 +650,27 @@ class ImportService:
         summary_focus: str,
     ) -> str:
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        summary = self._clean_note_line(payload.get("summary"), max_length=160) or "当前正文不足，只能先保留已获取信息。"
-        key_points = self._normalize_note_points(payload.get("key_points"))
-        practical_lines = self._build_practical_digest_lines(payload)
-        action_lines = self._build_action_lines(payload, metadata, summary_focus=summary_focus)
+        practical_lines = self._build_practical_digest_lines(payload, limit=4)
+        summary_paragraphs = self._build_summary_paragraphs(payload, metadata, practical_lines)
+        key_points = self._remove_redundant_note_points(self._normalize_note_points(payload.get("key_points")), practical_lines)
         origin_lines = self._build_origin_digest_lines(payload, metadata, include_host=True)
 
         summary_title = "核心结论"
-        points_title = "内容结构"
-        useful_title = "对用户有用的信息"
-        action_title = "可执行建议"
+        points_title = "重点摘录"
+        useful_title = "精炼正文"
         if note_style == "qa":
             summary_title = "问题结论"
             points_title = "关键答案"
-            useful_title = "可直接参考的信息"
-            action_title = "下一步建议"
+            useful_title = "回答整理"
         elif note_style == "brief":
             summary_title = "快速摘要"
-            points_title = "重点列表"
-            useful_title = "简版整理"
-            action_title = "下一步建议"
+            points_title = "重点摘录"
+            useful_title = "精炼正文"
 
         lines = [
             f"## {summary_title}",
             "",
-            summary,
+            *self._render_note_paragraphs(summary_paragraphs),
         ]
 
         if key_points:
@@ -682,15 +686,7 @@ class ImportService:
                 "",
                 f"## {useful_title}",
                 "",
-                *practical_lines,
-            ])
-
-        if action_lines:
-            lines.extend([
-                "",
-                f"## {action_title}",
-                "",
-                *action_lines,
+                *self._render_note_paragraphs(practical_lines),
             ])
 
         if origin_lines:
@@ -706,7 +702,7 @@ class ImportService:
         segments = self._sample_note_segments(metadata, limit=limit)
         lines: list[str] = []
         for index, item in enumerate(segments, start=1):
-            text = self._clean_note_line(item.get("text"), max_length=88)
+            text = self._polish_note_prose(item.get("text"), max_length=88)
             if not text or self._is_low_signal_note_line(text):
                 continue
             label = self._format_note_timestamp(item.get("start_ms")) or f"片段 {index}"
@@ -717,27 +713,22 @@ class ImportService:
         segments = self._sample_note_segments(metadata, limit=limit)
         lines: list[str] = []
         for index, item in enumerate(segments, start=1):
-            text = self._clean_note_line(item.get("text"), max_length=140)
+            text = self._polish_note_prose(item.get("text"), max_length=140)
             if not text or self._is_low_signal_note_line(text):
                 continue
             label = self._format_note_timestamp(item.get("start_ms")) or f"片段 {index}"
             lines.extend([f"### {label}", "", text, ""])
         return lines
 
-    def _build_practical_digest_lines(self, payload: dict[str, Any], *, limit: int = 3) -> list[str]:
+    def _build_practical_digest_lines(self, payload: dict[str, Any], *, limit: int = 4) -> list[str]:
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        candidates: list[str] = []
-
-        for item in self._sample_note_segments(metadata, limit=limit):
-            text = self._clean_note_line(item.get("text"), max_length=140)
-            if text and not self._is_low_signal_note_line(text):
-                candidates.append(text)
+        candidates = self._build_coherent_note_paragraphs(payload, metadata, limit=limit)
 
         if not candidates:
             content_text = str(payload.get("content_text") or "").strip()
-            raw_parts = re.split(r"\n{2,}|\r?\n|(?<=[。！？!?])\s+", content_text)
+            raw_parts = self._split_note_source_parts(content_text)
             for part in raw_parts:
-                text = self._clean_note_line(part, max_length=140)
+                text = self._polish_note_prose(part, max_length=180)
                 if text and not self._is_low_signal_note_line(text):
                     candidates.append(text)
                 if len(candidates) >= limit:
@@ -753,36 +744,305 @@ class ImportService:
             deduped.append(item)
         return deduped[:limit]
 
-    def _build_action_lines(self, payload: dict[str, Any], metadata: dict[str, Any], *, summary_focus: str) -> list[str]:
-        status = str(payload.get("status") or "").strip().lower()
-        needs_guidance = status in {"ready_estimated", "needs_cookie", "needs_asr", "asr_failed", "limited"}
-        if metadata.get("noisy_asr_detected") is True:
-            needs_guidance = True
-        if not needs_guidance:
+    def _build_summary_paragraphs(
+        self,
+        payload: dict[str, Any],
+        metadata: dict[str, Any],
+        practical_lines: list[str],
+    ) -> list[str]:
+        summary_paragraphs = self._filter_note_paragraphs(
+            self._build_note_paragraphs(
+                payload.get("summary"),
+                max_length=160,
+                fallback="当前正文不足，只能先保留已获取信息。",
+            )
+        )
+        if not practical_lines:
+            return summary_paragraphs
+
+        if not summary_paragraphs:
+            return practical_lines[:1]
+
+        first_paragraph = summary_paragraphs[0]
+        if self._looks_like_intro_note_line(first_paragraph):
+            return practical_lines[:1]
+
+        # noisy ASR 经常把开场口癖或断裂句子抬成摘要，优先改用正文首段承接
+        if metadata.get("noisy_asr_detected") is True and metadata.get("llm_enhanced") is not True:
+            return practical_lines[:1]
+
+        return summary_paragraphs
+
+    def _build_coherent_note_paragraphs(
+        self,
+        payload: dict[str, Any],
+        metadata: dict[str, Any],
+        *,
+        limit: int,
+    ) -> list[str]:
+        raw_segments = metadata.get("semantic_transcript_segments")
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raw_segments = metadata.get("transcript_segments")
+
+        ordered_segments: list[str] = []
+        if isinstance(raw_segments, list):
+            for item in raw_segments:
+                if not isinstance(item, dict):
+                    continue
+                text = self._polish_note_prose(item.get("text"), max_length=180, ensure_terminal=False)
+                if not text or self._is_low_signal_note_line(text):
+                    continue
+                ordered_segments.append(text)
+
+        if not ordered_segments:
+            content_text = str(payload.get("content_text") or "").strip()
+            ordered_segments = [
+                self._polish_note_prose(part, max_length=180, ensure_terminal=False)
+                for part in self._split_note_source_parts(content_text)
+            ]
+            ordered_segments = [item for item in ordered_segments if item and not self._is_low_signal_note_line(item)]
+
+        ordered_segments = self._rewrite_introductory_note_lines(ordered_segments)
+        ordered_segments = self._trim_introductory_note_lines(ordered_segments)
+        if not ordered_segments:
             return []
 
-        candidates = [
-            f"优先围绕“{self._clean_note_line(summary_focus, max_length=48)}”继续核对关键片段。"
-            if summary_focus.strip()
-            else "",
-            self._clean_note_line(metadata.get("quality_recommended_action"), max_length=88),
-            self._clean_note_line(metadata.get("capture_recommended_action"), max_length=88),
-        ]
-        if metadata.get("noisy_asr_detected") is True:
-            candidates.append("当前正文主要来自音频转写，重要结论建议结合证据层逐段核对。")
+        paragraphs: list[str] = []
+        buffer = ""
+        buffer_items = 0
+        for item in ordered_segments:
+            merged = self._merge_note_paragraph_text(buffer, item)
+            if buffer and (buffer_items >= 3 or len(merged) > 188):
+                if len(merged) <= 228 and self._should_join_note_directly(buffer, item):
+                    buffer = merged
+                    buffer_items += 1
+                    continue
+                finalized = self._polish_note_prose(buffer, max_length=220)
+                if finalized and not self._is_low_signal_note_line(finalized):
+                    paragraphs.append(finalized)
+                buffer = item
+                buffer_items = 1
+            else:
+                buffer = merged
+                buffer_items = buffer_items + 1 if buffer_items else 1
 
-        lines: list[str] = []
-        seen: set[str] = set()
-        for item in candidates:
-            text = self._clean_note_line(item, max_length=96)
-            if self._is_low_signal_note_line(text):
-                continue
-            normalized = re.sub(r"\s+", "", text.lower())
-            if not text or normalized in seen:
-                continue
-            seen.add(normalized)
-            lines.append(f"- {text}")
-        return lines[:3]
+            if len(paragraphs) >= limit:
+                break
+
+        if buffer and len(paragraphs) < limit:
+            finalized = self._polish_note_prose(buffer, max_length=220)
+            if finalized and not self._is_low_signal_note_line(finalized):
+                paragraphs.append(finalized)
+
+        return paragraphs[:limit]
+
+    def _split_note_source_parts(self, text: str) -> list[str]:
+        if not text.strip():
+            return []
+
+        parts = [
+            part.strip()
+            for part in re.split(r"\n{2,}|\r?\n|(?<=[。！？；!?])\s+|(?<=[，；,;])\s{2,}", text)
+            if part.strip()
+        ]
+        if parts:
+            return parts
+        return [text.strip()]
+
+    def _trim_introductory_note_lines(self, items: list[str]) -> list[str]:
+        trimmed = list(items)
+        while len(trimmed) > 1 and self._looks_like_intro_note_line(trimmed[0]):
+            trimmed.pop(0)
+        return trimmed or items
+
+    def _rewrite_introductory_note_lines(self, items: list[str]) -> list[str]:
+        rewritten = list(items)
+        for index in range(min(4, len(rewritten))):
+            candidate = self._strip_introductory_note_prefix(rewritten[index])
+            if candidate:
+                rewritten[index] = candidate
+        return rewritten
+
+    def _strip_introductory_note_prefix(self, text: str) -> str:
+        source = (text or "").strip()
+        if not source:
+            return ""
+
+        informative_patterns = (
+            r"(?:王者荣耀世界|这款游戏|这个游戏|本作|该作)(?:可|会|是|支持|里|的)",
+            r"(?:可战斗|可探索|可联机|可连机|可单机|玩法|系统|机制|模式|配置|价格|角色|副本|任务|技能|装备|养成|剧情|社交|家园|PC端|手机端)",
+            r"(?:首先|其次|最后|另外|同时|接下来|其实|比如|例如).{0,20}(?:玩法|系统|机制|模式|配置|角色|副本|任务|技能|装备|养成)",
+            r"(?:\d{1,2}月\d{1,2}号|PC端|手机端)",
+        )
+        match_positions = [
+            match.start()
+            for pattern in informative_patterns
+            for match in [re.search(pattern, source, re.IGNORECASE)]
+            if match is not None
+        ]
+        if not match_positions:
+            return source
+
+        start_index = min(match_positions)
+        if start_index <= 0:
+            return source
+
+        prefix = source[:start_index].strip()
+        if not prefix:
+            return source
+        if not self._looks_like_intro_note_line(prefix) and not self._looks_like_intro_note_line(source):
+            return source
+
+        candidate = self._polish_note_prose(source[start_index:], max_length=180, ensure_terminal=False)
+        if not candidate or len(candidate) < 18 or self._is_low_signal_note_line(candidate):
+            return source
+        return candidate
+
+    def _looks_like_intro_note_line(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text or "").lower()
+        if not normalized:
+            return False
+
+        intro_patterns = (
+            r"^(?:hello|hi|哈喽|嗨)?(?:大家好|各位好)",
+            r"^(?:hello|hi|哈喽|嗨)",
+            r"^(?:我是|这里是|欢迎来到|欢迎回到)",
+            r"^(?:这期视频|本期视频|今天我们聊|今天来聊|今天想讲|今天给大家|先给大家|这次给大家)",
+        )
+        if any(re.search(pattern, normalized) for pattern in intro_patterns):
+            return True
+
+        chatty_markers = (
+            "大家好",
+            "各位",
+            "兄弟们",
+            "家人们",
+            "朋友们",
+            "老铁们",
+            "欢迎来到",
+            "欢迎回到",
+            "我是",
+            "谢谢",
+            "拜托",
+            "给大家做一个",
+            "给大家讲",
+            "给大家聊",
+            "坐好发车",
+            "发车",
+            "先说",
+            "先看",
+            "接下来我们",
+            "我们看到的是",
+            "全网最",
+            "你就说",
+            "大不大吧",
+            "不想玩",
+        )
+        informative_markers = (
+            "玩法",
+            "系统",
+            "模式",
+            "机制",
+            "功能",
+            "配置",
+            "测试",
+            "版本",
+            "价格",
+            "步骤",
+            "方法",
+            "区别",
+            "原因",
+            "角色",
+            "副本",
+            "任务",
+            "技能",
+            "装备",
+            "社交",
+            "连机",
+            "联机",
+            "单机",
+            "战斗",
+            "探索",
+            "养成",
+            "核心",
+            "重点",
+        )
+        chatty_hits = sum(marker in normalized for marker in chatty_markers)
+        informative_hits = sum(marker in normalized for marker in informative_markers)
+        if chatty_hits >= 2 and informative_hits == 0:
+            return True
+        if chatty_hits >= 3 and informative_hits <= 1 and len(normalized) <= 96:
+            return True
+        if chatty_hits >= 4 and chatty_hits >= informative_hits + 2 and len(normalized) <= 140:
+            return True
+
+        return len(normalized) <= 36 and any(token in normalized for token in ("大家好", "我是", "欢迎来到"))
+
+    def _merge_note_paragraph_text(self, left: str, right: str) -> str:
+        if not left:
+            return right.strip()
+        if not right:
+            return left.strip()
+
+        stripped_left = left.rstrip()
+        stripped_right = right.lstrip()
+        trimmed_join_left = stripped_left.rstrip("，、,；;：:")
+        if trimmed_join_left != stripped_left and self._should_join_note_directly(trimmed_join_left, stripped_right):
+            return f"{trimmed_join_left}{stripped_right}"
+        if stripped_left.endswith(("，", "。", "！", "？", "；", "：", "、", ",", ";", ":", "/", "-")):
+            return f"{stripped_left}{stripped_right}"
+        if re.search(r"[A-Za-z0-9]$", stripped_left) and re.match(r"^[A-Za-z0-9]", stripped_right):
+            return f"{stripped_left} {stripped_right}"
+        if re.search(r"[\u4e00-\u9fffA-Za-z0-9]$", stripped_left) and re.match(r"^[\u4e00-\u9fffA-Za-z0-9]", stripped_right):
+            if self._should_join_note_directly(stripped_left, stripped_right):
+                return f"{stripped_left}{stripped_right}"
+            joiner = "。" if len(stripped_left) >= 96 else "，"
+            return f"{stripped_left}{joiner}{stripped_right}"
+        return f"{stripped_left} {stripped_right}"
+
+    def _should_join_note_directly(self, left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+
+        if self._starts_with_note_sentence_connector(right):
+            return False
+
+        tail_match = re.search(r"([A-Za-z0-9\u4e00-\u9fff]{1,4})$", left)
+        if not tail_match:
+            return False
+
+        tail = tail_match.group(1)
+        if re.match(r"^[\u4e00-\u9fff]", right) and len(tail) <= 3:
+            return True
+
+        bridge_tails = ("的", "了", "和", "与", "及", "并", "且", "让", "把", "将", "向", "对", "给", "被", "从", "在", "于")
+        return tail in bridge_tails
+
+    def _starts_with_note_sentence_connector(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text or "")
+        if not normalized:
+            return False
+        connectors = (
+            "那么",
+            "然后",
+            "但是",
+            "不过",
+            "所以",
+            "因此",
+            "当然",
+            "另外",
+            "同时",
+            "接下来",
+            "其实",
+            "比如",
+            "例如",
+            "首先",
+            "其次",
+            "最后",
+            "其中",
+            "尤其",
+        )
+        return normalized.startswith(connectors)
 
     def _build_origin_digest_lines(
         self,
@@ -806,11 +1066,41 @@ class ImportService:
         if timeline_label and timeline_label != "未建立时间定位":
             lines.append(f"- 时间定位：{timeline_label}")
 
-        capture_summary = self._clean_note_line(metadata.get("capture_summary"), max_length=88)
-        if capture_summary:
-            lines.append(f"- 当前说明：{capture_summary}")
-
         return lines[:4]
+
+    def _filter_note_paragraphs(self, paragraphs: list[str]) -> list[str]:
+        filtered: list[str] = []
+        seen: set[str] = set()
+        for item in paragraphs:
+            text = self._polish_note_prose(item, max_length=180)
+            if not text or self._is_low_signal_note_line(text):
+                continue
+            normalized = re.sub(r"\s+", "", text.lower())
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            filtered.append(text)
+        return filtered
+
+    def _remove_redundant_note_points(self, points: list[str], paragraphs: list[str], *, limit: int = 4) -> list[str]:
+        paragraph_signatures = [re.sub(r"\s+", "", item.lower()) for item in paragraphs if item]
+        filtered: list[str] = []
+        seen: set[str] = set()
+        for item in points:
+            normalized = re.sub(r"\s+", "", item.lower())
+            if not normalized or normalized in seen:
+                continue
+            if any(
+                normalized in paragraph_signature or paragraph_signature in normalized
+                for paragraph_signature in paragraph_signatures
+                if len(normalized) >= 12 and len(paragraph_signature) >= 12
+            ):
+                continue
+            seen.add(normalized)
+            filtered.append(item)
+            if len(filtered) >= limit:
+                break
+        return filtered
 
     def _sample_note_segments(self, metadata: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
         raw_segments = metadata.get("semantic_transcript_segments")
@@ -847,6 +1137,10 @@ class ImportService:
         skip_prefixes = (
             "当前状态",
             "建议下一步",
+            "后续优先",
+            "当前说明",
+            "材料状态",
+            "当前材料状态",
             "笔记风格",
             "播放",
             "点赞",
@@ -855,7 +1149,7 @@ class ImportService:
         points: list[str] = []
         seen: set[str] = set()
         for item in value:
-            text = self._clean_note_line(item, max_length=88)
+            text = self._polish_note_prose(item, max_length=88)
             if not text:
                 continue
             if self._is_low_signal_note_line(text):
@@ -902,6 +1196,81 @@ class ImportService:
             return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:02d}:{seconds:02d}"
 
+    def _build_note_paragraphs(
+        self,
+        value: Any,
+        *,
+        max_length: int | None = None,
+        fallback: str = "",
+        max_sentences: int = 2,
+        max_chars: int = 88,
+    ) -> list[str]:
+        text = self._polish_note_prose(value, max_length=max_length)
+        if not text and fallback:
+            text = self._polish_note_prose(fallback)
+        if not text:
+            return []
+
+        sentences = self._split_note_sentences(text)
+        if len(sentences) <= 1:
+            return [text]
+
+        paragraphs: list[str] = []
+        current: list[str] = []
+        current_length = 0
+        for sentence in sentences:
+            sentence_length = len(sentence)
+            if current and (len(current) >= max_sentences or current_length + sentence_length > max_chars):
+                paragraphs.append("".join(current))
+                current = [sentence]
+                current_length = sentence_length
+                continue
+            current.append(sentence)
+            current_length += sentence_length
+
+        if current:
+            paragraphs.append("".join(current))
+        return paragraphs or [text]
+
+    def _render_note_paragraphs(self, paragraphs: list[str]) -> list[str]:
+        lines: list[str] = []
+        for index, paragraph in enumerate(paragraphs):
+            if not paragraph:
+                continue
+            if index > 0:
+                lines.append("")
+            lines.append(paragraph)
+        return lines
+
+    def _split_note_sentences(self, text: str) -> list[str]:
+        parts = re.split(r"(?<=[。！？；!?])\s*", text)
+        return [part.strip() for part in parts if part.strip()]
+
+    def _polish_note_prose(
+        self,
+        value: Any,
+        *,
+        max_length: int | None = None,
+        ensure_terminal: bool = True,
+    ) -> str:
+        cleaned = self._clean_note_line(value, max_length=max_length)
+        if not cleaned:
+            return ""
+
+        if re.search(r"[\u4e00-\u9fff]", cleaned):
+            cleaned = cleaned.replace(",", "，")
+            cleaned = cleaned.replace(";", "；")
+            cleaned = cleaned.replace("?", "？")
+            cleaned = cleaned.replace("!", "！")
+            cleaned = re.sub(r"(?<=[\u4e00-\u9fff]):(?=[\u4e00-\u9fffA-Za-z0-9])", "：", cleaned)
+
+        cleaned = re.sub(r"\s*([，。！？；：])\s*", r"\1", cleaned)
+        cleaned = re.sub(r"([，。！？；：…])\1+", r"\1", cleaned)
+        cleaned = cleaned.strip()
+        if ensure_terminal and cleaned and not cleaned.endswith(("...", "…")) and cleaned[-1] not in "。！？；":
+            cleaned += "。"
+        return cleaned
+
     def _clean_note_line(self, value: Any, *, max_length: int | None = None) -> str:
         cleaned = str(value or "")
         if not cleaned.strip():
@@ -939,8 +1308,25 @@ class ImportService:
             "当前没有提炼出稳定要点",
             "这条视频还没有拿到可直接使用的正文",
             "内容仍需继续补齐",
+            "后续优先",
+            "建议下一步",
+            "当前说明",
+            "材料状态",
+            "当前材料状态",
+            "已先整理出主题线索",
+            "温馨提示",
+            "友情提醒",
         )
         if any(text.startswith(prefix) for prefix in low_signal_prefixes):
+            return True
+
+        low_signal_fragments = (
+            "已通过音频转写恢复正文并保留可回看片段",
+            "围绕具体片段继续提问和核对原视频",
+            "围绕时间片段继续提问并核对原视频",
+            "接入理解模型重整精炼层",
+        )
+        if any(fragment in text for fragment in low_signal_fragments):
             return True
 
         if re.search(r"(?:播放|点赞|投币|收藏|转发)\s*[：:]\s*\d+", text):
@@ -958,7 +1344,36 @@ class ImportService:
         if re.search(r"space\.bilibili\.com", text):
             return True
 
+        if self._looks_like_promotional_note_line(text):
+            return True
+
         return False
+
+    def _looks_like_promotional_note_line(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text or "").lower()
+        if not normalized:
+            return False
+
+        promo_patterns = (
+            r"(?:点击|记得|欢迎|麻烦|帮忙).{0,8}(?:关注|点赞|收藏|投币|三连)",
+            r"(?:评论区|置顶|下方|下边|简介区|简介里).{0,12}(?:链接|领取|查看|获取|报名|课程|资料|福利)",
+            r"(?:直播|训练营|社群|粉丝群|知识星球|公众号|私信|加微|微信|vx|qq群|群聊)",
+            r"(?:课程介绍|介绍一下.{0,8}课程|报名|优惠|折扣|福利|下单|购买|咨询|预约|体验课|陪跑)",
+            r"(?:课程中相见|课程里见|训练营里见|直播间见|下节课见|我们课上见|拜拜)$",
+        )
+        if any(re.search(pattern, normalized) for pattern in promo_patterns):
+            return True
+
+        cta_hits = sum(
+            token in normalized
+            for token in ("关注", "点赞", "收藏", "投币", "三连", "评论区", "置顶", "下方", "链接", "私信")
+        )
+        if cta_hits >= 2:
+            return True
+
+        has_sales_topic = any(token in normalized for token in ("课程", "训练营", "社群", "报名", "优惠", "福利"))
+        has_sales_action = any(token in normalized for token in ("链接", "评论区", "置顶", "领取", "咨询", "购买", "下单"))
+        return has_sales_topic and has_sales_action
 
     def _join_note_lines(self, lines: list[str]) -> str:
         merged = "\n".join(lines)

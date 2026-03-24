@@ -20,9 +20,11 @@ import {
   type NoteQuality,
 } from "../lib/api";
 import {
+  buildImportTimeoutMessage as buildSharedImportTimeoutMessage,
   getImportJobStepMeta as getSharedImportJobStepMeta,
   getImportStageItems as getSharedImportStageItems,
   isImportJobTerminal as isSharedImportJobTerminal,
+  resolveImportJobTimeoutState as resolveSharedImportJobTimeoutState,
   resolveImportStageIndex as resolveSharedImportStageIndex,
 } from "../lib/importProgress";
 import { useLanguage } from "../lib/language";
@@ -664,7 +666,6 @@ export default function ContentDetailPage() {
   const [newTagInput, setNewTagInput] = useState("");
   const [isEditingNote, setIsEditingNote] = useState(false);
   const [showFullNote, setShowFullNote] = useState(false);
-  const [showSupplementPanel, setShowSupplementPanel] = useState(false);
   const [showDerivePanel, setShowDerivePanel] = useState(false);
   const [richNoteContent, setRichNoteContent] = useState("");
   const [selectedVersionId, setSelectedVersionId] = useState("current");
@@ -802,10 +803,6 @@ export default function ContentDetailPage() {
     () => buildMarkdownPreviewText(selectedNoteVersion.noteMarkdown || selectedNoteVersion.summary || ""),
     [selectedNoteVersion.noteMarkdown, selectedNoteVersion.summary],
   );
-  const selectedVersionPreviewLines = useMemo(
-    () => selectedVersionPreview.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 6),
-    [selectedVersionPreview],
-  );
   const rawTranscript = useMemo(() => (typeof metadata?.raw_transcript_markdown === "string" ? metadata.raw_transcript_markdown : ""), [metadata]);
   const markdownSections = useMemo(() => parseMarkdownSections(refinedNote), [refinedNote]);
   const markdownSectionMap = useMemo(() => new Map(markdownSections.map((section) => [section.title, section] as const)), [markdownSections]);
@@ -818,12 +815,9 @@ export default function ContentDetailPage() {
   const memoryPoints = useMemo(() => getSectionList(markdownSectionMap.get("值得记住的内容")), [markdownSectionMap]);
   const timelineItems = useMemo(() => parseTimelineItems(markdownSectionMap.get("时间线笔记")), [markdownSectionMap]);
   const clipItems = useMemo(() => parseClipItems(markdownSectionMap.get("片段整理")), [markdownSectionMap]);
-  const practicalDigest = useMemo(() => shortenText(getSectionText(markdownSectionMap.get("实用整理")), 320), [markdownSectionMap]);
-  const originItems = useMemo(() => getSectionList(markdownSectionMap.get("原始信息保留")), [markdownSectionMap]);
   const noteScreenshots = useMemo(() => parseNoteScreenshots(metadata), [metadata]);
   const noteScreenshotStatus = useMemo(() => (typeof metadata?.note_screenshots_status === "string" ? metadata.note_screenshots_status.trim() : ""), [metadata]);
   const noteScreenshotSummary = useMemo(() => (typeof metadata?.note_screenshots_summary === "string" ? metadata.note_screenshots_summary.trim() : ""), [metadata]);
-  const featuredNoteScreenshots = useMemo(() => noteScreenshots.slice(0, 3), [noteScreenshots]);
   const stageDigestSeeds = useMemo(() => {
     if (clipItems.length > 0) {
       return buildStageDigestSeeds(
@@ -916,10 +910,8 @@ export default function ContentDetailPage() {
   );
   const materialSeedPoints = useMemo(() => readStringList(metadata?.material_seed_points), [metadata]);
   const materialSeedQueries = useMemo(() => readStringList(metadata?.material_seed_queries), [metadata]);
-  const materialSeedSummary = useMemo(() => (typeof metadata?.material_seed_summary === "string" ? metadata.material_seed_summary.trim() : ""), [metadata]);
   const sourceDescription = useMemo(() => (typeof metadata?.source_description === "string" ? metadata.source_description.trim() : ""), [metadata]);
   const fullNoteContent = cleanNoteMarkdownForDisplay(richNoteContent || refinedNote || contentQuery.data?.summary || "");
-  const hasSupplementPanel = Boolean(practicalDigest || originItems.length > 0 || (contentQuery.data?.key_points.length ?? 0) > 0);
   const hasDerivedOutputs = Boolean(derivedMindmap || derivedQuiz);
   const savedFrom = useMemo(() => (typeof metadata?.saved_from === "string" ? metadata.saved_from.trim() : ""), [metadata]);
   const sourceQuestion = useMemo(() => (typeof metadata?.question === "string" ? metadata.question.trim() : ""), [metadata]);
@@ -964,19 +956,9 @@ export default function ContentDetailPage() {
     let cancelled = false;
     let timer: number | undefined;
     const pollStartedAt = Date.now();
-    const POLL_TIMEOUT_MS = 12 * 60 * 1000;
 
     const poll = async () => {
       try {
-        if (Date.now() - pollStartedAt > POLL_TIMEOUT_MS) {
-          if (!cancelled) {
-            setReparseFailureMessage("重新解析超时（超过 12 分钟），请稍后重试。");
-            setActiveReparseJobId("");
-            setActiveReparseJob(null);
-          }
-          return;
-        }
-
         const job = await getImportJob(activeReparseJobId);
         if (cancelled) {
           return;
@@ -1017,6 +999,14 @@ export default function ContentDetailPage() {
             setReparseFailureMessage(job.error_message || "重新解析失败，请稍后再试。");
             setActiveReparseJob(null);
           }
+          return;
+        }
+
+        const timeoutState = resolveSharedImportJobTimeoutState(job, pollStartedAt, "reparse");
+        if (timeoutState.timedOut) {
+          setReparseFailureMessage(job.error_message || timeoutState.message || buildSharedImportTimeoutMessage(job, "reparse"));
+          setActiveReparseJobId("");
+          setActiveReparseJob(null);
           return;
         }
 
@@ -1199,16 +1189,29 @@ export default function ContentDetailPage() {
     }
     return unique;
   }, [materialSeedQueries]);
-  const quickAskPreviewItems = useMemo(() => quickAskItems.slice(0, 3), [quickAskItems]);
+  const quickAskPreviewItems = useMemo(() => quickAskItems.slice(0, 2), [quickAskItems]);
+  const sideStatusItems = useMemo(() => {
+    const candidates = [
+      materialReadiness.statusLabel,
+      noteLayerStatus.label,
+      qaModeStatus.label,
+      evidenceStatus.label,
+      transcriptSourceLabel,
+    ];
+    const deduped: string[] = [];
+    for (const item of candidates) {
+      const cleaned = item.trim();
+      if (!cleaned || deduped.includes(cleaned)) continue;
+      deduped.push(cleaned);
+      if (deduped.length >= 4) break;
+    }
+    return deduped;
+  }, [evidenceStatus.label, materialReadiness.statusLabel, noteLayerStatus.label, qaModeStatus.label, transcriptSourceLabel]);
   const detailInfoItems = useMemo(() => {
     const items = [
       { label: "作者", value: contentQuery.data?.author || "-" },
       { label: "分类", value: contentQuery.data?.category || "未分类" },
       ...(savedFrom === "chat" && sourceQuestion ? [{ label: "来源问题", value: sourceQuestion }] : []),
-      { label: "笔记层", value: noteLayerStatus.label },
-      { label: "问答方式", value: qaModeStatus.label },
-      { label: "证据层", value: evidenceStatus.label },
-      { label: "正文来源", value: transcriptSourceLabel },
       { label: "创建时间", value: formatDateTime(contentQuery.data?.created_at) },
       { label: "更新时间", value: formatDateTime(contentQuery.data?.updated_at) },
     ];
@@ -1218,12 +1221,8 @@ export default function ContentDetailPage() {
     contentQuery.data?.category,
     contentQuery.data?.created_at,
     contentQuery.data?.updated_at,
-    evidenceStatus.label,
-    noteLayerStatus.label,
-    qaModeStatus.label,
     savedFrom,
     sourceQuestion,
-    transcriptSourceLabel,
   ]);
 
   const updateMutation = useMutation({
@@ -1378,12 +1377,6 @@ export default function ContentDetailPage() {
     { label: "证据", value: transcriptSegments.length ? `${transcriptSegments.length} 段` : String(contentQuery.data.chunks.length) },
   ];
 
-  const activeViewMeta =
-    activeView === "refined"
-      ? { title: "精炼层" }
-      : activeView === "transcript"
-      ? { title: "证据层" }
-      : { title: "检索层" };
   return (
     <section className="page note-workbench-page">
       <article className="card detail-hero glass-hero product-detail-hero compact-detail-hero">
@@ -1416,16 +1409,7 @@ export default function ContentDetailPage() {
                   onChange={(e) => setSummary(e.target.value)}
                   rows={2}
                 />
-              ) : (
-                <p
-                  className="detail-lead"
-                  style={{ cursor: "text" }}
-                  title="点击编辑摘要"
-                  onClick={() => setIsEditingMeta(true)}
-                >
-                  {displayText(contentQuery.data.summary || qualityInfo.description)}
-                </p>
-              )}
+              ) : null}
             </div>
             <button
               className="btn btn-ghost btn-sm"
@@ -1481,59 +1465,11 @@ export default function ContentDetailPage() {
             ))}
           </div>
 
-          {!!featuredNoteScreenshots.length && (
-            <section className="detail-shot-preview-card" id="detail-note-screenshots">
-              <div className="panel-heading detail-shot-preview-head">
-                <h3>{displayText("关键画面")}</h3>
-                <div className="pill-row">
-                  <span className="pill">{displayText(`${noteScreenshots.length} 帧画面`)}</span>
-                </div>
-              </div>
-              <div className="detail-shot-preview-strip">
-                {featuredNoteScreenshots.map((item) => {
-                  const shotTileBody = (
-                    <>
-                      <div className="detail-shot-preview-image-wrap">
-                        <img
-                          className="detail-shot-preview-image"
-                          src={item.imageUrl}
-                          alt={item.caption || item.timestampLabel || "关键画面"}
-                          loading="lazy"
-                        />
-                        <span className="detail-shot-preview-badge">{displayText(item.timestampLabel || item.rangeLabel || "关键画面")}</span>
-                      </div>
-                      <div className="detail-shot-preview-copy">
-                        <p>{displayText(shortenText(item.caption || item.sourceText || item.rangeLabel || item.timestampLabel || "关键画面", 72))}</p>
-                      </div>
-                    </>
-                  );
-                  return item.seekUrl ? (
-                    <a className="detail-shot-preview-tile" key={item.id} href={item.seekUrl} target="_blank" rel="noreferrer">
-                      {shotTileBody}
-                    </a>
-                  ) : (
-                    <article className="detail-shot-preview-tile" key={item.id}>
-                      {shotTileBody}
-                    </article>
-                  );
-                })}
-              </div>
-            </section>
-          )}
-
           <div className="detail-hero-actions">
             <div className="detail-hero-primary-actions">
               <Link className="primary-button button-link" to={buildScopedChatLink("请基于这条笔记，给我一版更适合复盘的结论整理", { contentId: contentQuery.data.id, title: contentQuery.data.title })}>
                 {displayText("继续提问")}
               </Link>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => reparseMutation.mutate()}
-                disabled={reparseMutation.isPending || Boolean(runningReparseJob)}
-              >
-                {reparseMutation.isPending || runningReparseJob ? displayText("重解析中...") : displayText("重新解析")}
-              </button>
               {contentQuery.data.source_url && (
                 <a className="secondary-button button-link" href={contentQuery.data.source_url} target="_blank" rel="noreferrer">
                   {displayText("打开原链接")}
@@ -1544,9 +1480,17 @@ export default function ContentDetailPage() {
             <details className="detail-hero-more-actions">
               <summary>{displayText("更多")}</summary>
               <div className="detail-hero-more-grid">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => reparseMutation.mutate()}
+                  disabled={reparseMutation.isPending || Boolean(runningReparseJob)}
+                >
+                  {reparseMutation.isPending || runningReparseJob ? displayText("重解析中...") : displayText("重新解析")}
+                </button>
                 {!!noteScreenshots.length && (
                   <a className="secondary-button button-link" href="#detail-note-screenshots-gallery">
-                    {displayText("全部画面")}
+                    {displayText("关键画面")}
                   </a>
                 )}
                 <button className="secondary-button" type="button" onClick={() => exportMutation.mutate(false)} disabled={exportMutation.isPending}>
@@ -1578,11 +1522,7 @@ export default function ContentDetailPage() {
       </article>
 
       <article className="card detail-section-card glass-panel layer-switch-card">
-        <div className="layer-switch-head">
-          <p className="eyebrow">{displayText("内容层")}</p>
-          <span className="pill">{displayText(activeViewMeta.title)}</span>
-        </div>
-        <div className="segment-rail">
+        <div className="segment-rail layer-switch-rail">
           {VIEW_ITEMS.map((item) => (
             <button key={item.key} type="button" className={activeView === item.key ? "segment-pill segment-pill-active" : "segment-pill"} onClick={() => setActiveView(item.key)}>
               {displayText(item.label)}
@@ -1767,10 +1707,7 @@ export default function ContentDetailPage() {
                   {!!noteScreenshots.length && (
                     <details className="bilinote-section-stack detail-media-disclosure" id="detail-note-screenshots-gallery">
                       <summary className="detail-media-summary">
-                        <div>
-                          <p className="eyebrow">{displayText("关键画面")}</p>
-                          <strong>{displayText("全部画面")}</strong>
-                        </div>
+                        <strong>{displayText("关键画面")}</strong>
                         <span className="pill">{displayText(`${noteScreenshots.length} 张`)}</span>
                       </summary>
                       <div className="detail-media-body">
@@ -1827,10 +1764,7 @@ export default function ContentDetailPage() {
               {!isBiliNoteStyle && !!noteScreenshots.length && (
                 <details className="bilinote-section-stack detail-generic-screenshot-section detail-media-disclosure" id="detail-note-screenshots-gallery">
                   <summary className="detail-media-summary">
-                    <div>
-                      <p className="eyebrow">{displayText("关键画面")}</p>
-                      <strong>{displayText("全部画面")}</strong>
-                    </div>
+                    <strong>{displayText("关键画面")}</strong>
                     <span className="pill">{displayText(`${noteScreenshots.length} 张`)}</span>
                   </summary>
                   <div className="detail-media-body">
@@ -1879,57 +1813,6 @@ export default function ContentDetailPage() {
                   <strong>{displayText("画面未生成")}</strong>
                   <p className="muted-text">{displayText(noteScreenshotSummary)}</p>
                 </div>
-              )}
-
-              {hasSupplementPanel && (
-                <section className="detail-inline-disclosure">
-                  <div className="detail-disclosure-head">
-                    <div>
-                      <p className="eyebrow">{displayText("补充信息")}</p>
-                      <strong>{displayText("补充内容")}</strong>
-                    </div>
-                    <div className="detail-disclosure-actions">
-                      <button className="btn btn-ghost btn-sm" type="button" onClick={() => setShowSupplementPanel((v) => !v)}>
-                        {showSupplementPanel ? displayText("收起") : displayText("展开")}
-                      </button>
-                    </div>
-                  </div>
-                  {showSupplementPanel && (
-                    <div className="detail-disclosure-body">
-                      <div className="bilinote-reading-grid bilinote-reading-grid-secondary">
-                        {practicalDigest && (
-                          <article className="bilinote-reading-card">
-                            <span className="eyebrow">{displayText("实用整理")}</span>
-                            <strong>{displayText("可直接复用的正文内容")}</strong>
-                            <p>{displayText(practicalDigest)}</p>
-                          </article>
-                        )}
-                        {!!contentQuery.data.key_points.length && (
-                          <article className="bilinote-reading-card">
-                            <span className="eyebrow">{displayText("关键信息")}</span>
-                            <strong>{displayText("提炼出的要点")}</strong>
-                            <div className="bilinote-bullet-list">
-                              {contentQuery.data.key_points.slice(0, 4).map((point) => (
-                                <p key={point}>{displayText(`• ${point}`)}</p>
-                              ))}
-                            </div>
-                          </article>
-                        )}
-                        {originItems.length > 0 && (
-                          <article className="bilinote-reading-card">
-                            <span className="eyebrow">{displayText("原始信息保留")}</span>
-                            <strong>{displayText("采集状态与来源说明")}</strong>
-                            <div className="bilinote-bullet-list">
-                              {originItems.map((item) => (
-                                <p key={item}>{displayText(`• ${item}`)}</p>
-                              ))}
-                            </div>
-                          </article>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                </section>
               )}
 
               <section className="detail-inline-disclosure detail-note-disclosure">
@@ -2165,12 +2048,10 @@ export default function ContentDetailPage() {
 
             <article className="glass-callout detail-side-summary">
               <strong>{displayText(materialReadiness.title)}</strong>
-              <p className="muted-text">{displayText(materialSeedSummary || materialReadiness.description)}</p>
-              <div className="pill-row" style={{ alignItems: "center" }}>
-                <span className="pill">{displayText(materialReadiness.statusLabel)}</span>
-                <span className="pill">{displayText(activeViewMeta.title)}</span>
-                <span className="pill">{displayText(transcriptSourceLabel)}</span>
-                {materialReadiness.weakCapture && <span className="pill">{displayText("种子材料")}</span>}
+              <div className="pill-row detail-side-summary-pills">
+                {sideStatusItems.map((item) => (
+                  <span className="pill" key={item}>{displayText(item)}</span>
+                ))}
               </div>
             </article>
 
@@ -2208,13 +2089,6 @@ export default function ContentDetailPage() {
                           <span className="muted-text">{displayText(item.capturedAt ? formatDateTime(item.capturedAt) : "未记录时间")}</span>
                         </div>
                         <strong>{displayText(item.summaryFocus || item.title || "未命名版本")}</strong>
-                        <p className="muted-text">
-                          {displayText(
-                            item.summaryFocus
-                              ? `关注点：${item.summaryFocus}`
-                              : item.captureSummary || item.summary || "当前版本已保留快照，可随时回看。",
-                          )}
-                        </p>
                       </button>
                     );
                   })}
@@ -2252,13 +2126,6 @@ export default function ContentDetailPage() {
                     />
                   )}
 
-                  {!selectedVersionStageDigestItems.length && selectedNoteVersion.summary && (
-                    <div className="glass-callout">
-                      <strong>{displayText("当时的摘要")}</strong>
-                      <p className="muted-text">{displayText(selectedNoteVersion.summary)}</p>
-                    </div>
-                  )}
-
                   {!selectedVersionStageDigestItems.length && !!selectedNoteVersion.keyPoints.length && (
                     <div className="bilinote-bullet-list">
                       {selectedNoteVersion.keyPoints.slice(0, 4).map((point) => (
@@ -2266,19 +2133,6 @@ export default function ContentDetailPage() {
                       ))}
                     </div>
                   )}
-
-                  <details className="detail-mini-disclosure">
-                    <summary>{displayText("查看正文快照")}</summary>
-                    <div className="bili-note-reader">
-                      {selectedVersionPreviewLines.length > 0 ? (
-                        selectedVersionPreviewLines.map((line) => (
-                          <p key={`${selectedNoteVersion.id}-${line}`}>{displayText(line)}</p>
-                        ))
-                      ) : (
-                        <p>{displayText("这版笔记暂时没有可展示的正文。")}</p>
-                      )}
-                    </div>
-                  </details>
 
                   <div className="header-actions bili-note-preview-actions">
                     <button
@@ -2309,19 +2163,7 @@ export default function ContentDetailPage() {
             )}
 
             <details className="card detail-section-card glass-panel detail-section-card-compact detail-side-disclosure">
-              <summary>{displayText("补充信息")}</summary>
-              <div className="smart-diagnostic-strip">
-                {materialReadiness.cards.map((item) => (
-                  <article
-                    className={`smart-diagnostic-card smart-diagnostic-card-${item.tone}`}
-                    key={item.label}
-                  >
-                    <span>{displayText(item.label)}</span>
-                    <strong>{displayText(item.value)}</strong>
-                  </article>
-                ))}
-              </div>
-
+              <summary>{displayText("来源与标签")}</summary>
               {(materialSeedPoints.length > 0 || sourceDescription) && (
                 <div className="detail-side-group">
                   {materialSeedPoints.length > 0 ? (
@@ -2353,19 +2195,6 @@ export default function ContentDetailPage() {
               <div className="tag-row-soft">
                 {contentQuery.data.tags.length ? contentQuery.data.tags.map((tag) => <span className="pill" key={tag}>{displayText(tag)}</span>) : <span className="pill">{displayText("暂无标签")}</span>}
               </div>
-
-              {(qualityInfo.actionLabel || materialReadiness.weakCapture) && (
-                <div className="header-actions">
-                  {qualityInfo.actionLabel && (
-                    <Link className="secondary-button button-link" to="/settings">
-                      {displayText(qualityInfo.actionLabel)}
-                    </Link>
-                  )}
-                  <button className="secondary-button" type="button" onClick={() => reparseMutation.mutate()} disabled={reparseMutation.isPending}>
-                    {reparseMutation.isPending ? displayText("重解析中...") : displayText("重新整理材料")}
-                  </button>
-                </div>
-              )}
             </details>
           </article>
 
@@ -2543,28 +2372,16 @@ export default function ContentDetailPage() {
 
           <article className="card detail-section-card glass-panel">
             <details className="metadata-details advanced-details">
-              <summary>{displayText("编辑与维护")}</summary>
+              <summary>{displayText("维护")}</summary>
               <div className="form-grid detail-form-grid">
-                <label className="form-block form-block-full">
-                  <span className="field-label">{displayText("标题")}</span>
-                  <input className="search-input" value={title} onChange={(event) => setTitle(event.target.value)} />
-                </label>
                 <label className="form-block">
                   <span className="field-label">{displayText("分类")}</span>
                   <input className="search-input" value={category} onChange={(event) => setCategory(event.target.value)} />
                 </label>
-                <label className="form-block form-block-full">
-                  <span className="field-label">{displayText("一句话摘要")}</span>
-                  <textarea className="text-area" value={summary} onChange={(event) => setSummary(event.target.value)} rows={5} />
-                </label>
-                <label className="form-block form-block-full">
-                  <span className="field-label">{displayText("标签（逗号分隔）")}</span>
-                  <input className="search-input" value={tags} onChange={(event) => setTags(event.target.value)} />
-                </label>
               </div>
               <div className="header-actions">
                 <button className="primary-button" type="button" onClick={() => updateMutation.mutate()} disabled={updateMutation.isPending}>
-                  {updateMutation.isPending ? displayText("保存中...") : displayText("保存修改")}
+                  {updateMutation.isPending ? displayText("保存中...") : displayText("保存分类")}
                 </button>
                 <button className="secondary-button" type="button" onClick={() => reindexMutation.mutate()} disabled={reindexMutation.isPending}>
                   {reindexMutation.isPending ? displayText("重建中...") : displayText("重建片段索引")}

@@ -411,7 +411,7 @@ class BilibiliService:
             transcript_source=transcript_source,
             noisy_asr_detected=noisy_asr_detected,
         )
-        key_points = self._decorate_key_points(key_points, capture_state=capture_state, content_text=content_text)
+        key_points = self._decorate_key_points(key_points, content_text=content_text)
         tags = self._build_tags(video)
         note_markdown = self._build_note_markdown(
             video,
@@ -2184,23 +2184,14 @@ class BilibiliService:
         transcript_source: str,
         noisy_asr_detected: bool,
     ) -> str:
-        if transcript_source == "asr" and noisy_asr_detected:
-            return self._build_noisy_asr_summary(
-                video=video,
-                description=description,
-                capture_state=capture_state,
-            )
-
-        if content_text:
+        source_text = content_text or description.strip()
+        if source_text:
             sentences = [
                 re.sub(r"\s+", " ", item).strip()
-                for item in re.split(r"[\n。！？!?]", content_text)
+                for item in re.split(r"[\n。！？!?]", source_text)
                 if re.sub(r"\s+", " ", item).strip()
             ]
-            compact = "；".join(sentences[:2]).strip() if sentences else content_text.replace("\n", " ").strip()
-            if capture_state["status"] not in {"ready", "ready_estimated"}:
-                preview = compact[:72] + ("..." if len(compact) > 72 else "")
-                return f"{capture_state['summary']} 当前可用内容：{preview}"
+            compact = "；".join(sentences[:2]).strip() if sentences else source_text.replace("\n", " ").strip()
             return compact[:160] + ("..." if len(compact) > 160 else "")
         return f"《{video.title}》已完成解析，但当前未提取到字幕正文。"
 
@@ -2213,9 +2204,6 @@ class BilibiliService:
         transcript_source: str,
         noisy_asr_detected: bool,
     ) -> list[str]:
-        if transcript_source == "asr" and noisy_asr_detected:
-            return self._build_noisy_asr_key_points(title=title, description=description)
-
         source = content_text or description
         if not source:
             return ["当前未提取到可生成要点的正文。"]
@@ -2255,42 +2243,6 @@ class BilibiliService:
                 break
 
         return [item for _, item in sorted(selected, key=lambda row: row[0])] or [source[:80]]
-
-    def _build_noisy_asr_summary(
-        self,
-        *,
-        video: BilibiliVideo,
-        description: str,
-        capture_state: dict[str, str | None],
-    ) -> str:
-        title = video.title.strip() or "这条视频"
-        description_preview = self._truncate_text(description, limit=76)
-        parts = [
-            f"这条视频围绕《{title}》展开，当前已通过音频转写恢复正文并保留可回看片段。",
-        ]
-        if description_preview:
-            parts.append(f"简介补充：{description_preview}")
-        parts.append("由于原始转写存在口语噪声，现阶段更适合围绕具体片段继续提问和核对原视频。")
-        return " ".join(parts)
-
-    def _build_noisy_asr_key_points(self, *, title: str, description: str) -> list[str]:
-        points: list[str] = []
-        cleaned_title = title.strip()
-        if cleaned_title:
-            points.append(f"视频主题：{cleaned_title}")
-
-        description_sentences = [
-            re.sub(r"\s+", " ", item).strip()
-            for item in re.split(r"[\n。！？!?]", description or "")
-            if re.sub(r"\s+", " ", item).strip()
-        ]
-        for item in description_sentences[:2]:
-            if item and item not in points:
-                points.append(item)
-
-        points.append("当前正文来自音频转写，建议围绕时间片段继续提问并核对原视频。")
-        points.append("如需更像人工整理的结论，后续可接入理解模型重整精炼层。")
-        return points[:4]
 
     def _looks_like_noisy_transcript(self, text: str, *, title: str, description: str) -> bool:
         cleaned = re.sub(r"\s+", " ", text or "").strip()
@@ -2366,30 +2318,29 @@ class BilibiliService:
         self,
         key_points: list[str],
         *,
-        capture_state: dict[str, str | None],
         content_text: str,
     ) -> list[str]:
-        if capture_state["status"] in {"ready", "ready_estimated"}:
-            return key_points
-
         decorated: list[str] = []
-        summary = str(capture_state["summary"] or "").strip()
-        action = str(capture_state["recommended_action"] or "").strip()
-        if summary:
-            decorated.append(summary)
-        if action:
-            decorated.append(action)
+        seen: set[str] = set()
+        for item in key_points:
+            cleaned = re.sub(r"\s+", " ", str(item or "")).strip()
+            if not cleaned:
+                continue
+            signature = re.sub(r"\s+", "", cleaned.lower())
+            if signature in seen:
+                continue
+            seen.add(signature)
+            decorated.append(cleaned)
+            if len(decorated) >= 4:
+                break
+
+        if decorated:
+            return decorated
 
         compact = content_text.replace("\n", " ").strip()
         if compact:
-            preview = compact[:80] + ("..." if len(compact) > 80 else "")
-            if preview not in decorated:
-                decorated.append(preview)
-
-        for item in key_points:
-            if item not in decorated:
-                decorated.append(item)
-        return decorated[:4]
+            return [compact[:80] + ("..." if len(compact) > 80 else "")]
+        return []
 
     def _build_note_markdown(
         self,

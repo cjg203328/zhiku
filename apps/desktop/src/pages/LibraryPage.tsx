@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import ImportPanel from "../components/ImportPanel";
 import StageDigest from "../components/StageDigest";
 import {
@@ -309,6 +309,7 @@ const filterItems: { key: FilterKey; label: string; hint: string }[] = [
 
 export default function LibraryPage() {
   const { displayText } = useLanguage();
+  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const importPanelRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -685,12 +686,19 @@ export default function LibraryPage() {
           <article className="card glass-panel bili-note-history-card">
             <div className="bili-note-section-head">
               <div>
-                <p className="eyebrow">{displayText("内容队列")}</p>
-                <h3>{displayText("切换当前内容")}</h3>
+                <p className="eyebrow">{displayText("知识库")}</p>
+                <h3>{displayText("笔记列表")}</h3>
               </div>
-              <div className="pill-row">
-                <span className="pill">{displayText(`${filteredCards.length} 条当前结果`)}</span>
-                {pendingCount > 0 && <span className="pill pill-warning">{displayText(`${pendingCount} 条处理中`)}</span>}
+              <div className="header-actions">
+                <div className="pill-row">
+                  <span className="pill">{displayText(`${filteredCards.length} 条当前结果`)}</span>
+                  {pendingCount > 0 && <span className="pill pill-warning">{displayText(`${pendingCount} 条处理中`)}</span>}
+                </div>
+                {selectedCard && !selectedCard.isDemo && (
+                  <Link className="secondary-button button-link" to={`/library/${selectedCard.id}`}>
+                    {displayText("打开详情")}
+                  </Link>
+                )}
               </div>
             </div>
 
@@ -739,7 +747,6 @@ export default function LibraryPage() {
                   onClick={() => setActiveFilter(item.key)}
                 >
                   {displayText(item.label)}
-                  <small className="library-filter-hint">{displayText(item.hint)}</small>
                 </button>
               ))}
             </div>
@@ -814,7 +821,14 @@ export default function LibraryPage() {
                       key={item.id}
                       type="button"
                       className={selected ? "bili-note-history-item bili-note-history-item-active" : "bili-note-history-item"}
-                      onClick={() => setSelectedCardId(item.id)}
+                      title={displayText(selected && !item.isDemo ? "再次点击可打开详情" : "点击切换到右侧预览")}
+                      onClick={() => {
+                        if (selected && !item.isDemo) {
+                          navigate(`/library/${item.id}`);
+                          return;
+                        }
+                        setSelectedCardId(item.id);
+                      }}
                     >
                       <div className="bili-note-history-item-head">
                         <div className="pill-row">
@@ -833,15 +847,18 @@ export default function LibraryPage() {
                       <p className="knowledge-list-item-summary">
                         {debouncedSearch ? highlightKeyword(item.summary || "", debouncedSearch, displayText) : displayText(item.summary)}
                       </p>
+                      <div className="tag-row-soft bili-note-history-item-tags">
+                        {(item.tags.length ? item.tags : ["暂无标签"]).slice(0, 3).map((tag) => (
+                          <span className="pill" key={`${item.id}-${tag}`}>
+                            {displayText(tag)}
+                          </span>
+                        ))}
+                      </div>
                       <div className="bili-note-history-item-foot">
-                        <div className="tag-row-soft">
-                          {(item.tags.length ? item.tags : ["暂无标签"]).slice(0, 3).map((tag) => (
-                            <span className="pill" key={`${item.id}-${tag}`}>
-                              {displayText(tag)}
-                            </span>
-                          ))}
-                        </div>
                         <span className="muted-text">{displayText(item.updatedAt ? formatDateTime(item.updatedAt) : "示例内容")}</span>
+                        <span className="bili-note-history-item-cta">
+                          {displayText(selected && !item.isDemo ? "再次点击打开详情" : "点击预览")}
+                        </span>
                       </div>
                     </button>
                   );

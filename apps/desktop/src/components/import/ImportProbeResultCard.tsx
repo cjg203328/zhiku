@@ -12,10 +12,13 @@ type ProbeResult = {
 };
 
 function getProbeTone(status: string) {
-  if (status === "ready") return { label: "可导入", tone: "success", hint: "字幕与元数据已就绪。" };
-  if (status === "needs_cookie") return { label: "需登录态", tone: "warning", hint: "当前缺字幕。" };
-  if (status === "needs_asr") return { label: "需转写", tone: "info", hint: "当前缺字幕。" };
-  return { label: "可尝试", tone: "info", hint: "预检已完成。" };
+  if (status === "ready") return { label: "可直接导入", tone: "success", hint: "字幕与元数据已经就绪。" };
+  if (status === "ready_estimated") return { label: "可转写补全", tone: "info", hint: "当前没有公开字幕，但已经具备正文回退能力。" };
+  if (status === "needs_cookie") return { label: "需登录态", tone: "warning", hint: "不补登录态时，很可能只能拿到基础档案。" };
+  if (status === "needs_asr") return { label: "需转写", tone: "warning", hint: "当前没有字幕，补齐转写后成功率会明显更高。" };
+  if (status === "asr_failed") return { label: "转写待重试", tone: "warning", hint: "转写链路没有成功，这还不是最终完整结果。" };
+  if (status === "limited") return { label: "仅基础档案", tone: "warning", hint: "目前只能确认基础材料，不等于完整视频正文。" };
+  return { label: "预检完成", tone: "info", hint: "当前展示的是导入前的能力判断。" };
 }
 
 function buildSettingsLink(focus?: string) {
@@ -87,6 +90,8 @@ export default function ImportProbeResultCard({
   const probeSummary =
     tone.tone === "success"
       ? getNoteStyleDescription(noteStyle, summaryFocus)
+      : probe.predicted_status === "ready_estimated"
+        ? `${getNoteStyleDescription(noteStyle, summaryFocus)} 导入时会优先尝试转写回退。`
       : probe.predicted_recommended_action || getNoteStyleDescription(noteStyle, summaryFocus);
 
   return (

@@ -21,6 +21,11 @@ const DROPPED_BULLET_LABELS = [
   "来源链接",
   "笔记风格",
   "建议下一步",
+  "后续优先",
+  "当前说明",
+  "材料状态",
+  "当前材料状态",
+  "当前正文来源",
   "粉丝",
   "关注",
   "弹幕",
@@ -30,6 +35,24 @@ const DROPPED_BULLET_LABELS = [
 ];
 
 const DROPPED_SECTION_TITLES = new Set(["可执行建议", "下一步建议"]);
+const SECTION_TITLE_ALIASES: Record<string, string> = {
+  "快速摘要": "核心结论",
+  "问题结论": "核心结论",
+  "对用户有用的信息": "精炼正文",
+  "可直接参考的信息": "精炼正文",
+  "回答整理": "精炼正文",
+  "实用整理": "精炼正文",
+  "正文整理": "精炼正文",
+  "视频笔记": "精炼正文",
+  "速记内容": "精炼正文",
+  "内容结构": "重点摘录",
+  "关键答案": "重点摘录",
+  "值得记住的内容": "重点摘录",
+  "一句话总结": "核心结论",
+};
+const CANONICAL_SECTION_TITLES = new Set(["核心结论", "重点摘录", "精炼正文", "原始信息保留"]);
+const NOTE_PARAGRAPH_CONNECTOR_PATTERN =
+  "(?:那么|然后|但是|不过|所以|因此|另外|同时|接下来|其实|比如|例如|首先|其次|最后|其中|尤其)";
 
 const LOW_SIGNAL_PREFIXES = [
   "当前正文还不够稳定",
@@ -41,6 +64,12 @@ const LOW_SIGNAL_PREFIXES = [
   "当前没有提炼出稳定要点",
   "这条视频还没有拿到可直接使用的正文",
   "内容仍需继续补齐",
+  "后续优先",
+  "建议下一步",
+  "当前说明",
+  "已先整理出主题线索",
+  "温馨提示",
+  "友情提醒",
 ];
 
 function cleanInlineMarkdown(text: string) {
@@ -57,12 +86,113 @@ function cleanInlineMarkdown(text: string) {
   return cleaned;
 }
 
+function normalizeReadableChinese(text: string) {
+  if (!/[\u4e00-\u9fff]/.test(text)) {
+    return text;
+  }
+
+  return text
+    .replace(/,/g, "，")
+    .replace(/;/g, "；")
+    .replace(/\?/g, "？")
+    .replace(/!/g, "！")
+    .replace(/(?<=[\u4e00-\u9fff]):(?=[\u4e00-\u9fffA-Za-z0-9])/g, "：")
+    .replace(/\s*([，。！？；：])\s*/g, "$1")
+    .replace(/([，。！？；：…])\1+/g, "$1")
+    .trim();
+}
+
+function looksPromotional(text: string) {
+  const normalized = text.replace(/\s+/g, "").toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  const patterns = [
+    /(?:点击|记得|欢迎|麻烦|帮忙).{0,8}(?:关注|点赞|收藏|投币|三连)/,
+    /(?:评论区|置顶|下方|下边|简介区|简介里).{0,12}(?:链接|领取|查看|获取|报名|课程|资料|福利)/,
+    /(?:直播|训练营|社群|粉丝群|知识星球|公众号|私信|加微|微信|vx|qq群|群聊)/,
+    /(?:课程介绍|介绍一下.{0,8}课程|报名|优惠|折扣|福利|下单|购买|咨询|预约|体验课|陪跑)/,
+    /(?:课程中相见|课程里见|训练营里见|直播间见|下节课见|我们课上见|拜拜)$/,
+  ];
+  if (patterns.some((pattern) => pattern.test(normalized))) {
+    return true;
+  }
+
+  const ctaHits = ["关注", "点赞", "收藏", "投币", "三连", "评论区", "置顶", "下方", "链接", "私信"]
+    .filter((token) => normalized.includes(token)).length;
+  if (ctaHits >= 2) {
+    return true;
+  }
+
+  const hasSalesTopic = ["课程", "训练营", "社群", "报名", "优惠", "福利"].some((token) => normalized.includes(token));
+  const hasSalesAction = ["链接", "评论区", "置顶", "领取", "咨询", "购买", "下单"].some((token) => normalized.includes(token));
+  return hasSalesTopic && hasSalesAction;
+}
+
+function normalizeSectionTitle(title: string) {
+  return SECTION_TITLE_ALIASES[title] ?? title;
+}
+
+function regroupParagraphParts(parts: string[], maxChars = 88) {
+  if (!parts.length) {
+    return [] as string[];
+  }
+
+  const merged: string[] = [];
+  let buffer = "";
+  for (const part of parts) {
+    const candidate = `${buffer}${part}`.trim();
+    if (buffer && candidate.length > maxChars) {
+      merged.push(buffer.trim());
+      buffer = part;
+      continue;
+    }
+    buffer = candidate;
+  }
+
+  if (buffer.trim()) {
+    merged.push(buffer.trim());
+  }
+  return merged;
+}
+
+function splitReadableParagraphs(text: string) {
+  if (!/[\u4e00-\u9fff]/.test(text) || text.length < 72) {
+    return [text];
+  }
+
+  const sentenceParts = text
+    .split(/(?<=[。！？；])/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (sentenceParts.length >= 2) {
+    return regroupParagraphParts(sentenceParts);
+  }
+
+  const connectorRegex = new RegExp(`(?<=[，；])(?=${NOTE_PARAGRAPH_CONNECTOR_PATTERN})|(?<=\\s)(?=${NOTE_PARAGRAPH_CONNECTOR_PATTERN})`, "g");
+  const parts = text
+    .replace(connectorRegex, "\n")
+    .split(/\n+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (parts.length <= 1) {
+    return [text];
+  }
+
+  return regroupParagraphParts(parts);
+}
+
 function shouldDropLine(text: string) {
   if (!text) {
     return true;
   }
 
   if (LOW_SIGNAL_PREFIXES.some((prefix) => text.startsWith(prefix))) {
+    return true;
+  }
+
+  if (/(?:已通过音频转写恢复正文并保留可回看片段|围绕具体片段继续提问和核对原视频|围绕时间片段继续提问并核对原视频|接入理解模型重整精炼层)/.test(text)) {
     return true;
   }
 
@@ -88,6 +218,10 @@ function shouldDropLine(text: string) {
     return true;
   }
 
+  if (looksPromotional(text)) {
+    return true;
+  }
+
   return false;
 }
 
@@ -108,6 +242,7 @@ export function cleanNoteMarkdownForDisplay(markdown: string) {
 
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   const cleanedLines: string[] = [];
+  const seenCanonicalTitles = new Set<string>();
   let skippedSection = false;
 
   for (const rawLine of lines) {
@@ -137,10 +272,16 @@ export function cleanNoteMarkdownForDisplay(markdown: string) {
 
     if (/^##\s+/.test(trimmed) || /^###\s+/.test(trimmed)) {
       const prefix = trimmed.startsWith("###") ? "### " : "## ";
-      const title = cleanInlineMarkdown(trimmed.replace(/^#{2,3}\s+/, ""));
-      skippedSection = DROPPED_SECTION_TITLES.has(title);
+      const title = normalizeSectionTitle(cleanInlineMarkdown(trimmed.replace(/^#{2,3}\s+/, "")));
+      skippedSection = !title || DROPPED_SECTION_TITLES.has(title);
       if (skippedSection) {
         continue;
+      }
+      if (CANONICAL_SECTION_TITLES.has(title) && seenCanonicalTitles.has(title)) {
+        continue;
+      }
+      if (CANONICAL_SECTION_TITLES.has(title)) {
+        seenCanonicalTitles.add(title);
       }
       if (title) {
         cleanedLines.push(`${prefix}${title}`);
@@ -153,7 +294,7 @@ export function cleanNoteMarkdownForDisplay(markdown: string) {
     }
 
     if (/^[-*]\s+/.test(trimmed)) {
-      const bulletText = cleanInlineMarkdown(trimmed.replace(/^[-*]\s+/, ""));
+      const bulletText = normalizeReadableChinese(cleanInlineMarkdown(trimmed.replace(/^[-*]\s+/, "")));
       if (!bulletText || shouldDropBullet(bulletText)) {
         continue;
       }
@@ -161,9 +302,13 @@ export function cleanNoteMarkdownForDisplay(markdown: string) {
       continue;
     }
 
-    const paragraph = cleanInlineMarkdown(trimmed.replace(/^>\s*/, ""));
+    const paragraph = normalizeReadableChinese(cleanInlineMarkdown(trimmed.replace(/^>\s*/, "")));
     if (paragraph && !shouldDropLine(paragraph)) {
-      cleanedLines.push(paragraph);
+      for (const part of splitReadableParagraphs(paragraph)) {
+        if (part && !shouldDropLine(part)) {
+          cleanedLines.push(part);
+        }
+      }
     }
   }
 

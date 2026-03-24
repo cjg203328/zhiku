@@ -27,9 +27,11 @@ import {
   uploadFileImport,
 } from "../lib/api";
 import {
+  buildImportTimeoutMessage,
   getImportJobStepMeta,
   getImportStageItems,
   isImportJobTerminal,
+  resolveImportJobTimeoutState,
   resolveImportStageIndex,
 } from "../lib/importProgress";
 import { useLanguage } from "../lib/language";
@@ -109,34 +111,6 @@ function getProbeTone(status: string) {
 
 function preflightNeedsConfirmation(status: string) {
   return status !== "ready" && status !== "ready_estimated";
-}
-
-function resolveImportPollTimeoutMs(job: ImportJob | null) {
-  if (!job) {
-    return 3 * 60 * 1000;
-  }
-
-  const previewPlatform = job.preview?.platform?.trim().toLowerCase() || "";
-  if (previewPlatform === "bilibili") {
-    return 15 * 60 * 1000;
-  }
-
-  if (job.source_kind === "file" || job.source_kind === "file_upload") {
-    return 6 * 60 * 1000;
-  }
-
-  return 4 * 60 * 1000;
-}
-
-function buildImportTimeoutMessage(job: ImportJob | null) {
-  const previewPlatform = job?.preview?.platform?.trim().toLowerCase() || "";
-  if (previewPlatform === "bilibili") {
-    return "导入超时（超过 15 分钟）。这类 B 站视频可能正在走本地转写，请检查小助手、Cookie 或转写运行时后重试。";
-  }
-  if (job?.source_kind === "file" || job?.source_kind === "file_upload") {
-    return "导入超时（超过 6 分钟），请检查文件内容和服务状态后重试。";
-  }
-  return "导入超时（超过 4 分钟），请检查服务状态后重试。";
 }
 
 function buildSettingsLink(focus?: "model" | "asr" | "bilibili") {
@@ -871,30 +845,10 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
 
     let cancelled = false;
     let timer: number | undefined;
-    const pollTimeoutMs = resolveImportPollTimeoutMs(activeImportJob);
     const startedAt = Date.now();
 
     const poll = async () => {
       try {
-        // 超时检测
-        if (Date.now() - startedAt > pollTimeoutMs) {
-          if (!cancelled) {
-            setActiveImportJobId("");
-            setActiveImportJob((current) =>
-              current
-                ? {
-                    ...current,
-                    status: "failed",
-                    progress: 100,
-                    step: "failed",
-                    error_message: buildImportTimeoutMessage(current),
-                  }
-                : null,
-            );
-          }
-          return;
-        }
-
         const job = await getImportJob(activeImportJobId);
         if (cancelled) {
           return;
@@ -930,6 +884,19 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
           } else {
             setActiveImportJob(null);
           }
+          return;
+        }
+
+        const timeoutState = resolveImportJobTimeoutState(job, startedAt, "import");
+        if (timeoutState.timedOut) {
+          setActiveImportJobId("");
+          setActiveImportJob({
+            ...job,
+            status: "failed",
+            progress: 100,
+            step: "failed",
+            error_message: timeoutState.message,
+          });
           return;
         }
 

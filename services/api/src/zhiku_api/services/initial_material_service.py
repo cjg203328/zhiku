@@ -5,6 +5,14 @@ from typing import Any
 
 
 WEAK_CAPTURE_STATUSES = {"needs_cookie", "needs_asr", "asr_failed", "limited", "preview_ready"}
+PROMOTIONAL_PATTERNS = (
+    re.compile(r"(?:点击|记得|欢迎|麻烦|帮忙).{0,8}(?:关注|点赞|收藏|投币|三连)"),
+    re.compile(r"(?:评论区|置顶|下方|下边|简介区|简介里).{0,12}(?:链接|领取|查看|获取|报名|课程|资料|福利)"),
+    re.compile(r"(?:直播|训练营|社群|粉丝群|知识星球|公众号|私信|加微|微信|vx|qq群|群聊)"),
+    re.compile(r"(?:课程介绍|介绍一下.{0,8}课程|报名|优惠|折扣|福利|下单|购买|咨询|预约|体验课|陪跑)"),
+    re.compile(r"(?:课程中相见|课程里见|训练营里见|直播间见|下节课见|我们课上见|拜拜)$"),
+)
+LOW_SIGNAL_POINT_PREFIXES = ("后续优先", "建议下一步", "当前说明", "当前材料状态", "当前正文来源", "已先整理出主题线索")
 
 
 class InitialMaterialService:
@@ -28,7 +36,6 @@ class InitialMaterialService:
             description=description,
             summary=summary,
             capture_summary=capture_summary,
-            capture_action=capture_action,
         )
         seed_queries = self._build_seed_queries(title=title, tags=tags, seed_points=seed_points)
         seed_markdown = self._build_seed_markdown(
@@ -60,7 +67,7 @@ class InitialMaterialService:
         payload["metadata"] = metadata
 
         if capture_status not in WEAK_CAPTURE_STATUSES:
-          return
+            return
 
         if seed_text and len(seed_text) > len(content_text):
             payload["content_text"] = seed_text
@@ -77,7 +84,10 @@ class InitialMaterialService:
     def _build_seed_summary(self, *, title: str, capture_summary: str, seed_points: list[str]) -> str:
         lead = capture_summary.strip() or f"《{title}》当前只拿到了有限材料。"
         if seed_points:
-            return f"{lead} 已先整理出主题线索：{seed_points[0]}"
+            focus = re.sub(r"^主题焦点：", "", seed_points[0]).strip().rstrip("。")
+            focus = re.sub(r"[！？!?]+", "", focus)
+            if focus:
+                return f"{lead} 当前可以先关注：{focus}。"
         return lead
 
     def _build_seed_points(
@@ -87,7 +97,6 @@ class InitialMaterialService:
         description: str,
         summary: str,
         capture_summary: str,
-        capture_action: str,
     ) -> list[str]:
         points: list[str] = []
         if title.strip():
@@ -103,9 +112,6 @@ class InitialMaterialService:
             if len(points) >= 3:
                 break
 
-        if capture_action.strip():
-            points.append(f"后续优先：{capture_action.strip()}")
-
         deduped: list[str] = []
         for item in points:
             cleaned = self._normalize_point(item)
@@ -120,7 +126,7 @@ class InitialMaterialService:
             f"{topic} 这条内容里最值得核对的结论是什么？",
         ]
         if seed_points:
-            first_point = re.sub(r"^(主题焦点：|后续优先：)", "", seed_points[0]).strip()
+            first_point = re.sub(r"^主题焦点：", "", seed_points[0]).strip()
             if first_point:
                 queries.append(f"围绕“{first_point}”还能继续追问什么？")
 
@@ -204,14 +210,16 @@ class InitialMaterialService:
         for item in items:
             if len(item) < 10:
                 continue
+            if self._looks_like_promotional_copy(item):
+                continue
             score = min(len(item), 42)
             if 16 <= len(item) <= 68:
                 score += 10
             if re.search(r"\d", item):
                 score += 4
-            if any(token in item for token in ("核心", "关键", "问题", "行业", "策略", "AI", "独立游戏", "3A", "建议", "趋势")):
+            if any(token in item for token in ("核心", "关键", "问题", "行业", "策略", "AI", "独立游戏", "3A", "趋势", "发布", "上线", "功能", "模型")):
                 score += 8
-            if any(token in item for token in ("http", "BV", "点击", "合作", "商务", "链接", "关注", "转发")):
+            if any(token in item for token in ("http", "BV", "合作", "商务", "链接", "转发")):
                 score -= 16
             if item.endswith(("吗", "呢", "？", "?")):
                 score -= 4
@@ -222,7 +230,10 @@ class InitialMaterialService:
         for _, item in ordered:
             if any(item in existing or existing in item for existing in picked):
                 continue
-            picked.append(item)
+            polished = self._polish_sentence(item)
+            if not polished:
+                continue
+            picked.append(polished)
             if len(picked) >= 3:
                 break
         return picked
@@ -238,4 +249,47 @@ class InitialMaterialService:
         cleaned = re.sub(r"\s+", " ", text or "").strip(" -:：;；，,。")
         if len(cleaned) < 6:
             return ""
+        if any(cleaned.startswith(prefix) for prefix in LOW_SIGNAL_POINT_PREFIXES):
+            return ""
+        if self._looks_like_promotional_copy(cleaned):
+            return ""
+        return self._polish_sentence(cleaned)
+
+    def _looks_like_promotional_copy(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", "", text or "").lower()
+        if not normalized:
+            return False
+        if any(normalized.startswith(prefix) for prefix in LOW_SIGNAL_POINT_PREFIXES):
+            return True
+        if any(pattern.search(normalized) for pattern in PROMOTIONAL_PATTERNS):
+            return True
+
+        cta_hits = sum(
+            token in normalized
+            for token in ("关注", "点赞", "收藏", "投币", "三连", "评论区", "置顶", "下方", "链接", "私信")
+        )
+        if cta_hits >= 2:
+            return True
+
+        has_sales_topic = any(token in normalized for token in ("课程", "训练营", "社群", "报名", "优惠", "福利"))
+        has_sales_action = any(token in normalized for token in ("链接", "置顶", "评论区", "领取", "咨询", "购买", "下单"))
+        return has_sales_topic and has_sales_action
+
+    def _polish_sentence(self, text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        if not cleaned:
+            return ""
+
+        if re.search(r"[\u4e00-\u9fff]", cleaned):
+            cleaned = cleaned.replace(",", "，")
+            cleaned = cleaned.replace(";", "；")
+            cleaned = cleaned.replace("?", "？")
+            cleaned = cleaned.replace("!", "！")
+            cleaned = re.sub(r"(?<=[\u4e00-\u9fff]):(?=[\u4e00-\u9fffA-Za-z0-9])", "：", cleaned)
+
+        cleaned = re.sub(r"\s*([，。！？；：])\s*", r"\1", cleaned)
+        cleaned = re.sub(r"([，。！？；：…])\1+", r"\1", cleaned)
+        cleaned = cleaned.strip(" -")
+        if cleaned and cleaned[-1] not in "。！？；…":
+            cleaned += "。"
         return cleaned
