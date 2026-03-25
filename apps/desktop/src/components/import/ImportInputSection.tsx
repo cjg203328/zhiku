@@ -1,5 +1,12 @@
 import { useCallback, useState } from "react";
 import { useLanguage } from "../../lib/language";
+import type { NoteGenerationMode } from "../../lib/api";
+
+const NOTE_GENERATION_MODE_ITEMS: Array<{ value: NoteGenerationMode; label: string; hint: string }> = [
+  { value: "model_draft", label: "模型成稿", hint: "优先让模型理解后输出更完整的成品笔记。" },
+  { value: "hybrid", label: "混合模式", hint: "本地整理为骨架，模型补足可读性与段落组织。" },
+  { value: "local_only", label: "本地整理", hint: "只走本地规则，更省 token，适合批量导入。" },
+];
 
 type Props = {
   urlValue: string;
@@ -9,14 +16,18 @@ type Props = {
   setNoteStyle: (v: string) => void;
   summaryFocus: string;
   setSummaryFocus: (v: string) => void;
+  noteGenerationMode: NoteGenerationMode;
+  setNoteGenerationMode: (v: NoteGenerationMode) => void;
   showAdvanced: boolean;
   setShowAdvanced: (fn: (prev: boolean) => boolean) => void;
   awaitingImportConfirmation: boolean;
   probeRequiresConfirmation: boolean;
   lastProbedUrl: string;
-  isImporting: boolean;
+  hasRunningJobs: boolean;
   isProbePending: boolean;
   isUrlPending: boolean;
+  isFilePending: boolean;
+  isFileUploadPending: boolean;
   desktopRuntime: boolean;
   filePathValue: string;
   setFilePathValue: (v: string) => void;
@@ -29,11 +40,11 @@ type Props = {
 };
 
 function FileDropZone({
-  selectedFile, setSelectedFile, isImporting, onFileUploadMutate, displayText,
+  selectedFile, setSelectedFile, isFileUploadPending, onFileUploadMutate, displayText,
 }: {
   selectedFile: File | null;
   setSelectedFile: (f: File | null) => void;
-  isImporting: boolean;
+  isFileUploadPending: boolean;
   onFileUploadMutate: (file: File) => void;
   displayText: (s: string) => string;
 }) {
@@ -60,10 +71,10 @@ function FileDropZone({
         <button
           className="secondary-button"
           type="button"
-          disabled={isImporting}
+          disabled={isFileUploadPending}
           onClick={() => onFileUploadMutate(selectedFile)}
         >
-          {isImporting ? displayText("处理中...") : displayText("上传并解析")}
+          {isFileUploadPending ? displayText("处理中...") : displayText("上传并解析")}
         </button>
       )}
     </div>
@@ -90,9 +101,10 @@ export default function ImportInputSection({
   urlValue, setUrlValue, onUrlChange,
   noteStyle, setNoteStyle,
   summaryFocus, setSummaryFocus,
+  noteGenerationMode, setNoteGenerationMode,
   showAdvanced, setShowAdvanced,
   awaitingImportConfirmation, probeRequiresConfirmation, lastProbedUrl,
-  isImporting, isProbePending, isUrlPending,
+  hasRunningJobs, isProbePending, isUrlPending, isFilePending, isFileUploadPending,
   desktopRuntime,
   filePathValue, setFilePathValue,
   selectedFile, setSelectedFile,
@@ -118,7 +130,7 @@ export default function ImportInputSection({
         <button
           className="secondary-button"
           type="button"
-          disabled={!urlValue.trim() || !isBilibiliLink(urlValue) || isProbePending || isImporting}
+          disabled={!urlValue.trim() || !isBilibiliLink(urlValue) || isProbePending}
           onClick={onProbe}
         >
           {isProbePending ? displayText("预检中...") : displayText("预检")}
@@ -126,15 +138,18 @@ export default function ImportInputSection({
         <button
           className="primary-button"
           type="button"
-          disabled={!urlValue.trim() || isImporting || isProbePending}
+          disabled={!urlValue.trim() || isUrlPending || isProbePending}
           onClick={onUrlImportStart}
         >
-          {isImporting ? displayText("处理中...") : displayText("开始导入")}
+          {isUrlPending ? displayText("处理中...") : displayText("开始导入")}
         </button>
         <button className="secondary-button" type="button" onClick={() => setShowAdvanced((c) => !c)}>
           {showAdvanced ? displayText("收起选项") : displayText("更多选项")}
         </button>
       </div>
+      {hasRunningJobs ? (
+        <p className="field-hint">{displayText("后台仍有任务在处理，当前可以继续新增其他导入。")}</p>
+      ) : null}
 
       {awaitingImportConfirmation && probeRequiresConfirmation && lastProbedUrl === urlValue.trim() ? (
         <article className="result-callout import-guard-callout">
@@ -174,6 +189,25 @@ export default function ImportInputSection({
             onChange={(event) => setSummaryFocus(event.target.value)}
           />
 
+          <div className="section-block">
+            <span className="field-label">{displayText("成稿方式")}</span>
+            <div className="segment-rail">
+              {NOTE_GENERATION_MODE_ITEMS.map((item) => (
+                <button
+                  key={item.value}
+                  type="button"
+                  className={noteGenerationMode === item.value ? "segment-pill segment-pill-active" : "segment-pill"}
+                  onClick={() => setNoteGenerationMode(item.value)}
+                >
+                  {displayText(item.label)}
+                </button>
+              ))}
+            </div>
+            <p className="field-hint">
+              {displayText(NOTE_GENERATION_MODE_ITEMS.find((item) => item.value === noteGenerationMode)?.hint || "")}
+            </p>
+          </div>
+
           <div className="section-block smart-file-block">
             <h4>{displayText("文件导入")}</h4>
             {desktopRuntime ? (
@@ -187,17 +221,17 @@ export default function ImportInputSection({
                 <button
                   className="secondary-button"
                   type="button"
-                  disabled={!filePathValue.trim() || isImporting}
+                  disabled={!filePathValue.trim() || isFilePending}
                   onClick={() => onFileMutate(filePathValue.trim())}
                 >
-                  {isImporting ? displayText("处理中...") : displayText("按路径导入")}
+                  {isFilePending ? displayText("处理中...") : displayText("按路径导入")}
                 </button>
               </>
             ) : (
               <FileDropZone
                 selectedFile={selectedFile}
                 setSelectedFile={setSelectedFile}
-                isImporting={isImporting}
+                isFileUploadPending={isFileUploadPending}
                 onFileUploadMutate={onFileUploadMutate}
                 displayText={displayText}
               />

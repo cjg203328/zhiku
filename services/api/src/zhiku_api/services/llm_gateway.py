@@ -7,6 +7,7 @@ import time
 from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit, urlunsplit
 
 from ..config import AppSettings
 
@@ -156,6 +157,7 @@ class LlmGateway:
         query: str,
         matches: list[dict[str, Any]],
         *,
+        quality: dict[str, Any] | None = None,
         conversation_context: list[dict[str, Any]] | None = None,
         query_intent: str | None = None,
     ) -> LlmResult | None:
@@ -182,20 +184,26 @@ class LlmGateway:
 
         intent_label = self._describe_query_intent(query_intent)
         intent_instruction = self._build_intent_instruction(query_intent)
+        role_instruction = self._build_answer_role_instruction(
+            query_intent=query_intent,
+            quality=quality,
+        )
         prompt = (
             conversation_block
             + f"问题：{query}\n\n"
             + f"回答方向：{intent_instruction}\n\n"
+            + f"当前职责：{role_instruction}\n\n"
             + "参考资料：\n"
             + "\n\n".join(context_blocks)
             + "\n\n直接用中文回答，全部中文内容使用简体中文，不要出现繁体字。不要重复问题，不要写‘根据资料’这类前缀。"
             "如果资料有视频时间点，可自然提示回看。追问时接着上一轮说，不要重铺背景。"
+            "问题简单时，可以用轻微拟人化、像人在当面交流的自然口吻，保持简洁，不要油腻或堆语气词。"
         )
         try:
             text = self._chat(
                 prompt,
                 temperature=0.2,
-                system_prompt="你是一个帮用户理解和提炼内容的助手，回答直接自然，有判断力，不套模板。",
+                system_prompt="你是一个帮用户理解和提炼内容的助手。证据明确时你负责整理、归纳、汇总和输出；问题复杂时你要先完成判断，再直接给最终答案。简单问题可更像真人对话，复杂问题要继续保持清晰结构。",
             )
         except LlmGatewayError:
             return None
@@ -272,6 +280,10 @@ class LlmGateway:
         content_kind = "视频" if content_type == "video" else "文章" if content_type == "article" else "内容"
         intent_label = self._describe_query_intent(query_intent)
         intent_instruction = self._build_intent_instruction(query_intent)
+        role_instruction = self._build_answer_role_instruction(
+            query_intent=query_intent,
+            quality=quality,
+        )
 
         prompt = (
             f"这是一条{content_kind}内容：《{title}》\n"
@@ -280,16 +292,18 @@ class LlmGateway:
             + f"\n{conversation_block}"
             + f"问题：{query}\n\n"
             + f"回答方向：{intent_instruction}\n\n"
+            + f"当前职责：{role_instruction}\n\n"
             + "直接用中文回答，全部中文内容使用简体中文，不要出现繁体字。"
             + ("如果是视频，可指出大概时间点方便回看。" if content_kind == "视频" else "")
             + ("\n注意：正文来自音频转写，个别细节可能有误，不确定的说清楚即可。" if transcript_source == "asr" else "")
             + "\n不要重复问题，不要写套话开头，追问时接着上一轮说。"
+            + "问题简单时，可以用轻微拟人化、像人在当面交流的自然口吻，保持简洁，不要油腻或堆语气词。"
         )
         try:
             text = self._chat(
                 prompt,
                 temperature=0.2,
-                system_prompt="你是一个帮用户理解视频和文章内容的助手，回答直接、自然，有自己的判断，不套模板。",
+                system_prompt="你是一个帮用户理解视频和文章内容的助手。证据明确时你负责整理、归纳、汇总和输出；问题复杂时你要先完成判断，再直接给最终答案。回答直接、自然，不套模板。简单问题可以更像真人对话，复杂问题继续保持结构感。",
             )
         except LlmGatewayError:
             return None
@@ -324,6 +338,7 @@ class LlmGateway:
             "6. 如果这是追问，优先承接上一轮继续往下答，不要把已经说过的总览完整重写一遍。\n"
             "7. 如果上下文里已经有上一轮结论，这一轮第一句直接切到新的问题点，不要重铺背景。\n\n"
             "8. 全部中文内容使用简体中文，不要出现繁体字。\n\n"
+            "9. 如果问题本身很简单，可以用轻微拟人化、像人在当面交流的口吻直接回答，但不要油腻或堆语气词。\n\n"
             f"当前用户意图：{intent_label}\n"
             f"回答结构建议：{intent_instruction}\n\n"
             + conversation_block
@@ -334,7 +349,148 @@ class LlmGateway:
             text = self._chat(
                 prompt,
                 temperature=0.35,
-                system_prompt="你是一个直接回答问题的助手，语气自然，给实用建议，不套模板。",
+                system_prompt="你是一个直接回答问题的助手，语气自然，给实用建议，不套模板。简单问题可更像真人简短回应，复杂问题再展开。",
+            )
+        except LlmGatewayError:
+            return None
+        if not text:
+            return None
+        return LlmResult(text=text, provider=self.settings.model_provider, model=self.settings.chat_model)
+
+    def generate_weak_retrieval_answer(
+        self,
+        query: str,
+        matches: list[dict[str, Any]],
+        *,
+        quality: dict[str, Any] | None = None,
+        query_intent: str | None = None,
+        conversation_context: list[dict[str, Any]] | None = None,
+    ) -> LlmResult | None:
+        if not self.is_enabled() or not query.strip():
+            return None
+
+        hint_blocks: list[str] = []
+        for index, item in enumerate(matches[:3], start=1):
+            title = item.get("title") or "未命名内容"
+            heading = item.get("heading") or f"片段 {index}"
+            time_label = self._format_time_range(item.get("start_ms"), item.get("end_ms"))
+            lines = [f"[{index}] 标题：{title}", f"弱线索：{heading}"]
+            if time_label:
+                lines.append(f"时间：{time_label}")
+            evidence_excerpt = self._build_match_excerpt(item, max_length=180)
+            if evidence_excerpt:
+                lines.append(f"摘录：{evidence_excerpt}")
+            hint_blocks.append("\n".join(lines))
+
+        intent_label = self._describe_query_intent(query_intent)
+        intent_instruction = self._build_intent_instruction(query_intent)
+        retrieval_summary = str((quality or {}).get("summary") or "").strip()
+        conversation_block = self._build_conversation_block(
+            conversation_context,
+            heading="最近几轮上下文",
+        )
+        prompt = (
+            "当前知识库只命中到少量弱相关线索，不足以支撑基于资料的确定性回答。\n"
+            "请优先依靠通用知识和稳妥推理回答用户问题。\n"
+            "如果下面的线索确实有帮助，可以当成弱参考；如果关系不大，可以忽略，不要硬拼进答案。\n"
+            "要求：\n"
+            "1. 先给结论，再给理由、判断框架或步骤。\n"
+            "2. 对依赖具体资料才能确认的细节，要明确标注为一般经验、常见做法，或提示需要继续核实。\n"
+            "3. 不要把弱线索说成已经证实的事实，不要编造来源。\n"
+            "4. 如果这是追问，优先承接上下文，但不要机械重复上一轮。\n"
+            "5. 全部中文内容使用简体中文，不要出现繁体字。\n\n"
+            "6. 如果问题本身很简单，可以用轻微拟人化、像人在当面交流的口吻回答，但不要油腻或堆语气词。\n\n"
+            f"当前用户意图：{intent_label}\n"
+            f"回答结构建议：{intent_instruction}\n"
+            + (f"当前检索状态：{retrieval_summary}\n\n" if retrieval_summary else "\n")
+            + ("弱相关线索：\n" + "\n\n".join(hint_blocks) + "\n\n" if hint_blocks else "")
+            + conversation_block
+            + f"用户问题：{query}\n\n"
+            + "请直接输出中文答案，不要输出 JSON，不要写“根据弱检索结果”之类的前言。"
+        )
+        try:
+            text = self._chat(
+                prompt,
+                temperature=0.3,
+                system_prompt="你是一个谨慎、直接的中文助手。证据不足时要明确边界，优先给用户稳妥可执行的回答。简单问题可更像真人简短回应，复杂问题保持判断力。",
+            )
+        except LlmGatewayError:
+            return None
+        if not text:
+            return None
+        return LlmResult(text=text, provider=self.settings.model_provider, model=self.settings.chat_model)
+
+    def generate_web_search_answer(
+        self,
+        query: str,
+        web_results: list[dict[str, Any]],
+        *,
+        local_matches: list[dict[str, Any]] | None = None,
+        local_quality: dict[str, Any] | None = None,
+        query_intent: str | None = None,
+        conversation_context: list[dict[str, Any]] | None = None,
+    ) -> LlmResult | None:
+        if not self.is_enabled() or not query.strip() or not web_results:
+            return None
+
+        local_blocks: list[str] = []
+        for index, item in enumerate((local_matches or [])[:3], start=1):
+            title = item.get("title") or "未命名内容"
+            heading = item.get("heading") or f"片段 {index}"
+            excerpt = self._build_match_excerpt(item, max_length=180)
+            lines = [f"[{index}] 标题：{title}", f"本地线索：{heading}"]
+            if excerpt:
+                lines.append(f"摘录：{excerpt}")
+            local_blocks.append("\n".join(lines))
+
+        web_blocks: list[str] = []
+        for index, item in enumerate(web_results[:5], start=1):
+            title = str(item.get("title") or "").strip() or f"结果 {index}"
+            snippet = str(item.get("snippet") or "").strip()
+            url = str(item.get("url") or "").strip()
+            lines = [f"[{index}] 标题：{title}"]
+            if snippet:
+                lines.append(f"摘要：{snippet}")
+            if url:
+                lines.append(f"链接：{url}")
+            web_blocks.append("\n".join(lines))
+
+        conversation_block = self._build_conversation_block(
+            conversation_context,
+            heading="最近几轮上下文",
+        )
+        intent_label = self._describe_query_intent(query_intent)
+        intent_instruction = self._build_intent_instruction(query_intent)
+        retrieval_summary = str((local_quality or {}).get("summary") or "").strip()
+        local_lead = (
+            "先看本地知识库：当前只有弱相关线索，不能直接当成已证实结论。"
+            if local_blocks
+            else "当前本地知识库没有命中可直接支撑回答的资料。"
+        )
+        prompt = (
+            f"{local_lead}\n"
+            "现在允许你参考联网搜索结果补充回答，但必须遵守：\n"
+            "1. 优先沿着本地内容的方向回答，不要让联网结果压过本地资料。\n"
+            "2. 只有外部结果能补足的部分再补，不要把搜索摘要说成已经完全核实的事实。\n"
+            "3. 先给结论，再给理由、步骤或边界。\n"
+            "4. 对时效性或不确定内容要明确说清楚。\n"
+            "5. 全部中文内容使用简体中文，不要出现繁体字。\n\n"
+            f"当前用户意图：{intent_label}\n"
+            f"回答结构建议：{intent_instruction}\n"
+            + (f"本地检索状态：{retrieval_summary}\n\n" if retrieval_summary else "\n")
+            + ("本地线索：\n" + "\n\n".join(local_blocks) + "\n\n" if local_blocks else "")
+            + "联网搜索结果：\n"
+            + "\n\n".join(web_blocks)
+            + "\n\n"
+            + conversation_block
+            + f"用户问题：{query}\n\n"
+            + "请直接输出中文答案，不要输出 JSON，不要写多余前言。简单问题可以更自然一点，但不要油腻。"
+        )
+        try:
+            text = self._chat(
+                prompt,
+                temperature=0.3,
+                system_prompt="你是一个本地知识库优先的中文助手。先吸收本地资料，再把联网搜索当成补充信息，最后给用户一版自然、稳妥的答案。",
             )
         except LlmGatewayError:
             return None
@@ -401,16 +557,22 @@ class LlmGateway:
             "不要在 note_markdown 里输出原始 URL、本地图片地址、截图 Markdown、静态资源路径或整段生硬转写。\n"
             "不要堆砌无关术语表，不要把元数据、播放量、点赞量、链接地址当成正文主体。\n"
             "正文层只保留真正影响理解、复盘和执行的内容，尽量写成自然可读的成品笔记。\n"
+            "在输出之前先完成理解，再组织成稿；不要把原始转写直接压缩后塞进笔记。\n"
+            "所有中文句子都要有清晰的停顿和标点，不要输出大段无标点长句。\n"
+            "段落要有分层，每段尽量只承载一个核心意思，不要把多个判断硬挤在同一段里。\n"
+            "如果一段里已经出现两个以上完整判断，请主动拆段；不要为了压缩篇幅牺牲句子边界。\n"
+            "中文长句要主动拆成更自然的短句，优先保证阅读顺畅，再考虑压缩篇幅。\n"
             "不要输出采集状态、系统说明、下一步建议、继续提问提示、模型接入建议之类的过程性文案。\n"
             "笔记要更像“原生笔记的精炼版”，而不是说明书式缩略。\n"
             "输出必须是 JSON 对象，字段只有 summary、key_points、note_markdown，不要输出代码块。\n"
             "字段要求：\n"
-            "- summary：1 到 2 句中文，像笔记开头的核心结论，不要写采集状态、系统提示、后续建议。\n"
-            "- key_points：3 到 5 条中文短句数组，优先保留策略、步骤、判断条件、注意事项、时间点；不要写“建议继续提问”“核对原视频”这类系统话术；其中识别到的英文术语正常保留。\n"
+            "- summary：1 到 2 句中文，像笔记开头的核心结论；必须是完整句子，标点明确，不要写采集状态、系统提示、后续建议。\n"
+            "- key_points：3 到 5 条中文短句数组；每条都尽量写成独立、完整、可直接阅读的短句，避免无标点长串；优先保留策略、步骤、判断条件、注意事项、时间点；不要写“建议继续提问”“核对原视频”这类系统话术；其中识别到的英文术语正常保留。\n"
             "- note_markdown：适合详情页展示的中文 Markdown，必须包含以下二级标题：\n"
             "## 核心结论\n"
             "## 精炼正文\n"
             "## 重点摘录\n"
+            "其中“核心结论”和“精炼正文”都必须写成自然段，不要整段只写一个超长句；单段尽量控制在 1 到 2 句；“重点摘录”里的每一条都要有明显停顿，避免像转写残片。\n"
             "如果正文不足，就明确写“当前正文不足，只能先保留已获取信息”，不要硬编。\n\n"
             f"{style_instruction}\n"
             f"标题：{title}\n"
@@ -555,12 +717,21 @@ class LlmGateway:
         headers = {}
         if self.settings.llm_api_key:
             headers["Authorization"] = f"Bearer {self.settings.llm_api_key}"
+        headers["User-Agent"] = self._build_gateway_user_agent()
+        headers["Accept"] = "application/json"
         req = urllib_request.Request(endpoint, headers=headers, method="GET")
 
         try:
             with urllib_request.urlopen(req, timeout=self.settings.llm_timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
+            if getattr(exc, "code", None) == 404:
+                return {
+                    "ok": False,
+                    "endpoint": endpoint,
+                    "models": [],
+                    "message": "当前地址没有返回模型目录。若平台未开放 /models，可直接手填聊天模型名后再点“测试连接”；若文档要求填写到 /v1 层级，也请确认接口地址是否少了一段。",
+                }
             error = self._build_gateway_error(exc)
             return {
                 "ok": False,
@@ -624,17 +795,19 @@ class LlmGateway:
             ],
             "temperature": temperature,
         }
-        data = json.dumps(payload).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.settings.llm_api_key}",
+            "User-Agent": self._build_gateway_user_agent(),
+            "Accept": "application/json, text/event-stream",
         }
-        req = urllib_request.Request(endpoint, data=data, headers=headers, method="POST")
         try:
-            with urllib_request.urlopen(req, timeout=self.settings.llm_timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            payload = self._request_chat_json(endpoint, payload, headers)
         except HTTPError as exc:
-            raise self._build_gateway_error(exc) from exc
+            body = self._read_http_error_body(exc)
+            if self._should_retry_chat_with_stream(exc, body):
+                return self._chat_with_stream(endpoint, payload, headers)
+            raise self._build_gateway_error(exc, body=body) from exc
         except URLError as exc:
             raise LlmGatewayError("连接模型接口失败，请检查接口地址、网络或代理设置。", classification="network_error") from exc
         except TimeoutError as exc:
@@ -644,6 +817,34 @@ class LlmGateway:
         except Exception:
             return None
 
+        return self._extract_chat_message_text(payload)
+
+    def _request_chat_json(self, endpoint: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib_request.Request(endpoint, data=data, headers=headers, method="POST")
+        with urllib_request.urlopen(req, timeout=self.settings.llm_timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _chat_with_stream(self, endpoint: str, payload: dict[str, Any], headers: dict[str, str]) -> str | None:
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        data = json.dumps(stream_payload).encode("utf-8")
+        req = urllib_request.Request(endpoint, data=data, headers=headers, method="POST")
+        try:
+            with urllib_request.urlopen(req, timeout=self.settings.llm_timeout_seconds) as response:
+                stream_text = response.read().decode("utf-8", errors="ignore")
+        except HTTPError as exc:
+            raise self._build_gateway_error(exc) from exc
+        except URLError as exc:
+            raise LlmGatewayError("连接模型接口失败，请检查接口地址、网络或代理设置。", classification="network_error") from exc
+        except TimeoutError as exc:
+            raise LlmGatewayError("模型接口响应超时，请稍后再试，或检查网络与模型负载。", classification="timeout_error") from exc
+        except Exception:
+            return None
+
+        return self._extract_chat_stream_text(stream_text)
+
+    def _extract_chat_message_text(self, payload: dict[str, Any]) -> str | None:
         choices = payload.get("choices") or []
         if not choices:
             return None
@@ -662,18 +863,84 @@ class LlmGateway:
             return self._normalize_llm_text(merged) if merged else None
         return None
 
+    def _extract_chat_stream_text(self, stream_text: str) -> str | None:
+        parts: list[str] = []
+        for raw_line in stream_text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+            try:
+                payload = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            choices = payload.get("choices") or []
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                delta_content = delta.get("content") if isinstance(delta, dict) else None
+                if isinstance(delta_content, str) and delta_content:
+                    parts.append(delta_content)
+                    continue
+                if isinstance(delta_content, list):
+                    for item in delta_content:
+                        if not isinstance(item, dict):
+                            continue
+                        text = item.get("text")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text.strip())
+                message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+                content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, str) and content:
+                    parts.append(content)
+        merged = "".join(parts).strip()
+        return self._normalize_llm_text(merged) if merged else None
+
+    def _should_retry_chat_with_stream(self, exc: HTTPError, body: str) -> bool:
+        http_status = getattr(exc, "code", None)
+        if http_status != 400:
+            return False
+        lowered = body.lower()
+        return "stream must be set to true" in lowered
+
+    def _build_gateway_user_agent(self) -> str:
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/136.0.0.0 Safari/537.36 Zhiku/0.1"
+        )
+
+    def _normalize_api_base_url(self, base_url: str) -> str:
+        candidate = base_url.strip()
+        if not candidate:
+            return ""
+
+        parsed = urlsplit(candidate)
+        path = (parsed.path or "").rstrip("/")
+        normalized_path = re.sub(
+            r"/(?:chat/completions|responses|models|embeddings|audio/transcriptions)$",
+            "",
+            path,
+            flags=re.IGNORECASE,
+        ).rstrip("/")
+
+        if parsed.scheme or parsed.netloc:
+            return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+        return normalized_path
+
     def _resolve_chat_endpoint(self, base_url: str) -> str:
-        candidate = base_url.strip().rstrip("/")
-        if candidate.endswith("/chat/completions"):
-            return candidate
+        candidate = self._normalize_api_base_url(base_url)
+        if not candidate:
+            return ""
         return f"{candidate}/chat/completions"
 
     def _resolve_models_endpoint(self, base_url: str) -> str:
-        candidate = base_url.strip().rstrip("/")
-        if candidate.endswith("/models"):
-            return candidate
-        if candidate.endswith("/chat/completions"):
-            return f"{candidate[:-len('/chat/completions')]}/models"
+        candidate = self._normalize_api_base_url(base_url)
+        if not candidate:
+            return ""
         return f"{candidate}/models"
 
     def _parse_json_object(self, text: str) -> dict[str, Any] | None:
@@ -844,6 +1111,19 @@ class LlmGateway:
         }
         return mapping.get(str(query_intent or "").strip(), "解释说明")
 
+    def _build_answer_role_instruction(
+        self,
+        *,
+        query_intent: str | None = None,
+        quality: dict[str, Any] | None = None,
+    ) -> str:
+        level = str((quality or {}).get("level") or "").strip().lower()
+        if query_intent in {"reason", "compare", "decision"}:
+            return "当前问题更偏判断与思考，请先完成取舍和归纳，再直接给最终答案，但不要脱离资料乱扩写。"
+        if level in {"strong", "medium"}:
+            return "当前检索证据已经比较明确，请把重点放在整理、归纳、汇总和清晰表达上，不要超出资料额外发挥。"
+        return "请在不脱离已有资料的前提下做必要判断，直接回答用户真正关心的问题。"
+
     def _build_intent_instruction(self, query_intent: str | None) -> str:
         mapping = {
             "summary": "优先整理成 2 到 4 条真正可带走的结论，不要按命中顺序复述。",
@@ -917,13 +1197,16 @@ class LlmGateway:
             return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:02d}:{seconds:02d}"
 
-    def _build_gateway_error(self, exc: HTTPError) -> LlmGatewayError:
-        http_status = getattr(exc, "code", None)
-        body = ""
+    def _read_http_error_body(self, exc: HTTPError) -> str:
         try:
-            body = exc.read().decode("utf-8", errors="ignore")
+            return exc.read().decode("utf-8", errors="ignore")
         except Exception:
-            body = ""
+            return ""
+
+    def _build_gateway_error(self, exc: HTTPError, *, body: str | None = None) -> LlmGatewayError:
+        http_status = getattr(exc, "code", None)
+        if body is None:
+            body = self._read_http_error_body(exc)
 
         lowered_body = body.lower()
         if http_status in {401, 403}:

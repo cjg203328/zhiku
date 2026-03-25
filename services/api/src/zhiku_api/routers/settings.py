@@ -29,6 +29,7 @@ class ModelSettings(BaseModel):
     embedding_model: str = "bge-m3"
     llm_api_base_url: str = ""
     llm_api_key_configured: bool = False
+    participation_mode: str = "balanced"
 
 
 class ModelSettingsUpdate(BaseModel):
@@ -37,6 +38,7 @@ class ModelSettingsUpdate(BaseModel):
     embedding_model: str | None = None
     llm_api_base_url: str | None = None
     llm_api_key: str | None = None
+    participation_mode: str | None = None
 
 
 class AsrSettings(BaseModel):
@@ -138,6 +140,7 @@ def _build_response(request: Request) -> SettingsResponse:
             embedding_model=settings.embedding_model,
             llm_api_base_url=settings.llm_api_base_url,
             llm_api_key_configured=bool(settings.llm_api_key.strip()),
+            participation_mode=settings.llm_participation_mode_normalized,
         ),
         asr=AsrSettings(**asr_status),
         bilibili=BilibiliSettings(
@@ -176,6 +179,7 @@ def _save_ui_snapshot(request: Request, payload: SettingsUpdate) -> None:
             "embedding_model": payload.model.embedding_model if payload.model and payload.model.embedding_model is not None else current.model.embedding_model,
             "llm_api_base_url": payload.model.llm_api_base_url if payload.model and payload.model.llm_api_base_url is not None else current.model.llm_api_base_url,
             "llm_api_key_configured": bool((payload.model.llm_api_key if payload.model and payload.model.llm_api_key is not None else container.settings.llm_api_key).strip()),
+            "participation_mode": payload.model.participation_mode if payload.model and payload.model.participation_mode is not None else current.model.participation_mode,
         },
         "asr": {
             "provider": payload.asr.provider if payload.asr and payload.asr.provider is not None else current.asr.provider,
@@ -233,6 +237,7 @@ def _write_env_file(request: Request) -> None:
         "ZHIKU_EMBEDDING_MODEL": settings.embedding_model,
         "ZHIKU_LLM_API_BASE_URL": settings.llm_api_base_url,
         "ZHIKU_LLM_API_KEY": settings.llm_api_key,
+        "ZHIKU_LLM_PARTICIPATION_MODE": settings.llm_participation_mode_normalized,
         "ZHIKU_ASR_PROVIDER": settings.asr_provider,
         "ZHIKU_ASR_MODEL": settings.asr_model,
         "ZHIKU_ASR_API_BASE_URL": settings.asr_api_base_url,
@@ -261,6 +266,8 @@ def _apply_runtime_settings(request: Request, payload: SettingsUpdate) -> None:
             settings.llm_api_base_url = payload.model.llm_api_base_url.strip()
         if payload.model.llm_api_key is not None:
             settings.llm_api_key = payload.model.llm_api_key.strip()
+        if payload.model.participation_mode is not None:
+            settings.llm_participation_mode = payload.model.participation_mode.strip()
 
     if payload.asr is not None:
         if payload.asr.provider is not None:

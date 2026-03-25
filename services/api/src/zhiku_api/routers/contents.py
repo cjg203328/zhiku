@@ -5,8 +5,10 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from uuid import uuid4
 
+from ..config import DEFAULT_NOTE_GENERATION_MODE
 from ..repositories import LibraryRepository
 from ..services import ContentUpgradeService, ExportService, ImportService
+from ..services.import_service import normalize_note_generation_mode
 
 router = APIRouter(prefix="/api/v1/contents", tags=["contents"])
 
@@ -29,6 +31,7 @@ class ContentUpdateRequest(BaseModel):
 class ReparseContentRequest(BaseModel):
     note_style: str | None = None
     summary_focus: str | None = None
+    note_generation_mode: str | None = None
     async_mode: bool = False
 
 
@@ -189,7 +192,13 @@ def _build_job_preview_from_content(
     return preview
 
 
-def _build_reparse_pending_preview(content: dict, *, note_style: str, summary_focus: str) -> dict:
+def _build_reparse_pending_preview(
+    content: dict,
+    *,
+    note_style: str,
+    summary_focus: str,
+    note_generation_mode: str,
+) -> dict:
     preview = _build_job_preview_from_content(
         content,
         title_prefix="正在重新解析：",
@@ -200,6 +209,7 @@ def _build_reparse_pending_preview(content: dict, *, note_style: str, summary_fo
             "job_mode": "reparse",
             "note_style": str(note_style).strip() or "structured",
             "summary_focus": str(summary_focus).strip(),
+            "note_generation_mode": normalize_note_generation_mode(note_generation_mode),
         },
     )
     preview["content_text"] = ""
@@ -227,6 +237,7 @@ def _run_reparse_job(
     source_file: str,
     note_style: str,
     summary_focus: str,
+    note_generation_mode: str,
 ) -> None:
     repository = LibraryRepository(getattr(settings, "db_path"))
     import_service = ImportService(settings, bilibili_session_broker=bilibili_session_broker)
@@ -240,6 +251,7 @@ def _run_reparse_job(
             content or {"id": content_id, "title": "当前内容", "tags": [], "metadata": {}},
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=note_generation_mode,
         )
     )
 
@@ -272,18 +284,21 @@ def _run_reparse_job(
                 source_url,
                 note_style=note_style,
                 summary_focus=summary_focus,
+                note_generation_mode=note_generation_mode,
             )
         else:
             preview = import_service.build_file_preview(
                 source_file,
                 note_style=note_style,
                 summary_focus=summary_focus,
+                note_generation_mode=note_generation_mode,
             )
 
         writing_preview = _build_reparse_pending_preview(
             content,
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=note_generation_mode,
         )
         writing_preview["summary"] = "正文已重新取回，正在保存版本历史并刷新当前内容。"
         writing_preview["key_points"] = [
@@ -510,12 +525,16 @@ def reparse_content(content_id: str, request: Request, background_tasks: Backgro
     metadata = content.get("metadata") if isinstance(content.get("metadata"), dict) else {}
     note_style = (payload.note_style if payload and payload.note_style is not None else metadata.get("note_style") or "structured")
     summary_focus = (payload.summary_focus if payload and payload.summary_focus is not None else metadata.get("summary_focus") or "")
+    note_generation_mode = normalize_note_generation_mode(
+        payload.note_generation_mode if payload and payload.note_generation_mode is not None else metadata.get("note_generation_mode") or DEFAULT_NOTE_GENERATION_MODE
+    )
 
     if payload and payload.async_mode:
         pending_preview = _build_reparse_pending_preview(
             content,
             note_style=str(note_style),
             summary_focus=str(summary_focus),
+            note_generation_mode=note_generation_mode,
         )
         source_value = source_file or source_url or content_id
         job = repository.create_import_job(
@@ -536,6 +555,7 @@ def reparse_content(content_id: str, request: Request, background_tasks: Backgro
             source_file=source_file,
             note_style=str(note_style),
             summary_focus=str(summary_focus),
+            note_generation_mode=note_generation_mode,
         )
         return {
             "ok": True,
@@ -550,6 +570,7 @@ def reparse_content(content_id: str, request: Request, background_tasks: Backgro
             source_url,
             note_style=str(note_style),
             summary_focus=str(summary_focus),
+            note_generation_mode=note_generation_mode,
         )
     elif source_file:
         try:
@@ -557,6 +578,7 @@ def reparse_content(content_id: str, request: Request, background_tasks: Backgro
                 source_file,
                 note_style=str(note_style),
                 summary_focus=str(summary_focus),
+                note_generation_mode=note_generation_mode,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"原始文件无法重新解析：{exc}") from exc

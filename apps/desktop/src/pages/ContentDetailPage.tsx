@@ -17,6 +17,7 @@ import {
   updateContent,
   type DerivedItem,
   type ImportJob,
+  type NoteGenerationMode,
   type NoteQuality,
 } from "../lib/api";
 import {
@@ -28,6 +29,7 @@ import {
   resolveImportStageIndex as resolveSharedImportStageIndex,
 } from "../lib/importProgress";
 import { useLanguage } from "../lib/language";
+import { prepareReadableNoteMarkdown } from "../lib/readableNote";
 import { formatMilliseconds, formatTimeRange } from "../lib/utils";
 import MarkdownNoteView, { cleanNoteMarkdownForDisplay } from "../components/MarkdownNoteView";
 import RichNoteEditor from "../components/RichNoteEditor";
@@ -130,6 +132,12 @@ function getNoteStyleLabel(value: unknown) {
   return "标准版";
 }
 
+function getNoteGenerationModeLabel(value: unknown) {
+  if (value === "model_draft") return "模型成稿";
+  if (value === "local_only") return "本地整理";
+  return "混合模式";
+}
+
 function isImportJobTerminal(status: string | undefined) {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
@@ -138,7 +146,7 @@ function getImportJobStepMeta(step: string | undefined) {
   if (step === "queued") return { label: "已接收任务", description: "当前重整理任务已进入队列。" };
   if (step === "detecting_source") return { label: "识别来源", description: "正在确认当前内容的重解析来源，并选择合适的抓取方式。" };
   if (step === "reading_file") return { label: "读取文件", description: "正在重新读取原始文件内容，并准备生成新的结构化笔记。" };
-  if (step === "parsing_content") return { label: "提取内容", description: "正在重新整理正文、字幕、截图和可回看的证据层。" };
+  if (step === "parsing_content") return { label: "提取内容", description: "正在重新整理正文、字幕、截图和回看线索。" };
   if (step === "fetching_subtitle") return { label: "检查字幕", description: "正在确认当前视频是否有可直接使用的字幕与时间轴。" };
   if (step === "fetching_audio") return { label: "检查音频", description: "当前没有公开字幕，正在确认是否能回退到音频正文。" };
   if (step === "transcribing_audio") return { label: "音频转写", description: "正在执行本地转写，这一步通常最久，请耐心等待。" };
@@ -281,13 +289,17 @@ function shortenText(value: string, limit: number) {
   return compact.length <= limit ? compact : `${compact.slice(0, limit).trimEnd()}...`;
 }
 
+function formatReadableNoteMarkdown(markdown: string) {
+  return cleanNoteMarkdownForDisplay(prepareReadableNoteMarkdown(markdown));
+}
+
 function parseNoteVersions(value: unknown) {
   if (!Array.isArray(value)) return [] as NoteVersionSnapshot[];
   return value
     .map((item) => {
       if (!item || typeof item !== "object") return null;
       const entry = item as Record<string, unknown>;
-      const noteMarkdown = typeof entry.note_markdown === "string" ? cleanNoteMarkdownForDisplay(entry.note_markdown) : "";
+      const noteMarkdown = typeof entry.note_markdown === "string" ? formatReadableNoteMarkdown(entry.note_markdown) : "";
       const summary = typeof entry.summary === "string" ? entry.summary.trim() : "";
       const keyPoints = readStringList(entry.key_points);
       if (!noteMarkdown && !summary && !keyPoints.length) return null;
@@ -317,7 +329,7 @@ function getNoteVersionSourceLabel(value: string) {
 }
 
 function buildMarkdownPreviewText(markdown: string, limit = 520) {
-  const compact = cleanNoteMarkdownForDisplay(markdown)
+  const compact = formatReadableNoteMarkdown(markdown)
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, "$1")
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
     .replace(/^#{1,6}\s+/gm, "")
@@ -433,16 +445,16 @@ function getQualityInfo(status: string | null | undefined, metadata: Record<stri
 
   if (status === "ready" && noisyAsrDetected) {
     return {
-      label: "证据完整",
-      description: "当前正文主要来自音频转写，证据和时间锚点已可用，但语义仍需进一步重整。",
+      label: "原文可用",
+      description: "当前正文主要来自音频转写，原文和时间锚点已可用，但语义仍需进一步重整。",
       actionLabel: "去配置模型",
     };
   }
-  if (status === "ready") return { label: "笔记完成", description: captureSummary || "已形成精炼笔记、原始正文与时间锚点。", actionLabel: null };
+  if (status === "ready") return { label: "笔记完成", description: captureSummary || "已形成笔记、原文与时间锚点。", actionLabel: null };
   if (status === "ready_estimated") {
     return {
       label: "正文恢复",
-      description: captureSummary || (asrModeLabel ? `当前正文来自${asrModeLabel}的音频转写，可结合证据层查看关键片段。` : "当前正文来自音频转写，可结合证据层查看关键片段。"),
+      description: captureSummary || (asrModeLabel ? `当前正文来自${asrModeLabel}的音频转写，可结合原文与时间点继续核对。` : "当前正文来自音频转写，可结合原文与时间点继续核对。"),
       actionLabel: null,
     };
   }
@@ -511,32 +523,14 @@ function getMaterialReadiness(
   const chunkReady = chunkCount > 0;
   const noteReady = Boolean(noteQuality?.refined_note_ready || noteQuality?.llm_enhanced);
 
-  const cards = [
-    {
-      label: "正文材料",
-      value: transcriptReady ? `${transcriptCount} 段` : sourceDescription ? "仅简介" : "未拿到",
-      tone: transcriptReady ? "success" : sourceDescription ? "info" : "warning",
-    },
-    {
-      label: "检索片段",
-      value: chunkReady ? `${chunkCount} 段` : "待整理",
-      tone: chunkReady ? "success" : weakCapture ? "warning" : "info",
-    },
-    {
-      label: "精炼笔记",
-      value: noteReady ? "已形成" : weakCapture ? "草稿" : "整理中",
-      tone: noteReady ? "success" : weakCapture ? "warning" : "info",
-    },
-  ] as const;
-
-  let title = "材料已成形";
-  let description = "正文、片段与笔记层已汇齐，可以直接阅读、检索和继续追问。";
+  let title = "内容已成形";
+  let description = "原文和笔记已成形，可以直接阅读、回看和继续追问。";
   if (weakCapture) {
-    title = "材料仍在补齐";
-    description = captureAction || "当前以来源简介或片段草稿为主，但检索链路已经可用。";
+    title = "内容仍在补齐";
+    description = captureAction || "当前以基础原文或草稿为主，但主流程已经可用。";
   } else if (!noteReady || !chunkReady) {
-    title = "层级仍在补齐";
-    description = captureAction || "主链路已打通，片段与精炼层仍在继续完善。";
+    title = "内容仍在整理";
+    description = captureAction || "原文已经到位，笔记或回看定位还在继续整理。";
   }
 
   return {
@@ -544,7 +538,6 @@ function getMaterialReadiness(
     weakCapture,
     title,
     description,
-    cards,
   };
 }
 
@@ -611,25 +604,54 @@ function parseEvidenceDigest(metadata: Record<string, unknown> | null | undefine
     .filter((item): item is EvidenceDigestItem => Boolean(item));
 }
 
-const QUICK_QUESTIONS = [
-  "请把这条笔记整理成一页可直接复盘的结论",
-  "如果只保留最值得记住的三点，应该留下什么？",
-  "围绕这条内容继续追问时，最应该先展开哪个部分？",
-];
-
 const VIEW_ITEMS = [
-  { key: "refined", label: "精炼层" },
-  { key: "transcript", label: "证据层" },
-  { key: "chunks", label: "检索层" },
+  { key: "refined", label: "笔记" },
+  { key: "transcript", label: "原文" },
 ] as const;
 
 type ViewKey = (typeof VIEW_ITEMS)[number]["key"];
 
 function normalizeViewKey(value: string | null): ViewKey | null {
-  if (value === "refined" || value === "transcript" || value === "chunks") {
+  if (value === "chunks") {
+    return "transcript";
+  }
+  if (value === "refined" || value === "transcript") {
     return value;
   }
   return null;
+}
+
+const REPARSE_MODE_ITEMS: Array<{ value: NoteGenerationMode; label: string; hint: string }> = [
+  { value: "model_draft", label: "模型成稿", hint: "优先让模型理解后成稿，适合看最终笔记质量。" },
+  { value: "hybrid", label: "混合模式", hint: "先走本地整理，再用模型补强可读性，适合常规使用。" },
+  { value: "local_only", label: "本地整理", hint: "只用本地规则整理，适合更省 token 的刷新。" },
+];
+
+function normalizeNoteGenerationMode(value: unknown): NoteGenerationMode {
+  if (value === "model_draft" || value === "hybrid" || value === "local_only") {
+    return value;
+  }
+  return "hybrid";
+}
+
+function buildNoteDraftValue(noteQuality: NoteQuality | null) {
+  if (noteQuality?.llm_enhanced) {
+    return "模型精炼";
+  }
+  if (noteQuality?.refined_note_ready) {
+    return "已整理";
+  }
+  return "待补强";
+}
+
+function buildMaterialSummary(transcriptCount: number, chunkCount: number) {
+  if (transcriptCount > 0) {
+    return `原文 ${transcriptCount} 段`;
+  }
+  if (chunkCount > 0) {
+    return `已整理 ${chunkCount} 段`;
+  }
+  return "待补齐";
 }
 
 function buildTranscriptAnchorId(index: number, chunkId?: string | null) {
@@ -644,7 +666,6 @@ export default function ContentDetailPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const transcriptCardRefs = useRef(new Map<string, HTMLElement>());
-  const chunkCardRefs = useRef(new Map<string, HTMLElement>());
   const lastAppliedFocusKeyRef = useRef("");
   const contentQuery = useQuery({
     queryKey: ["content", contentId],
@@ -666,7 +687,6 @@ export default function ContentDetailPage() {
   const [newTagInput, setNewTagInput] = useState("");
   const [isEditingNote, setIsEditingNote] = useState(false);
   const [showFullNote, setShowFullNote] = useState(false);
-  const [showDerivePanel, setShowDerivePanel] = useState(false);
   const [richNoteContent, setRichNoteContent] = useState("");
   const [selectedVersionId, setSelectedVersionId] = useState("current");
   const [deriveView, setDeriveView] = useState<"none" | "mindmap" | "quiz">("none");
@@ -675,6 +695,7 @@ export default function ContentDetailPage() {
   const [activeReparseJobId, setActiveReparseJobId] = useState("");
   const [activeReparseJob, setActiveReparseJob] = useState<ImportJob | null>(null);
   const [reparseFailureMessage, setReparseFailureMessage] = useState("");
+  const [reparseNoteGenerationMode, setReparseNoteGenerationMode] = useState<NoteGenerationMode>("hybrid");
 
   const derivedItemsQuery = useQuery({
     queryKey: ["derived", contentId],
@@ -763,7 +784,12 @@ export default function ContentDetailPage() {
     const refined = (contentQuery.data.metadata as Record<string,unknown> | null)?.refined_note_markdown;
     const note = (contentQuery.data.metadata as Record<string,unknown> | null)?.note_markdown;
     const raw = typeof refined === "string" ? refined : typeof note === "string" ? note : contentQuery.data.summary;
-    setRichNoteContent(cleanNoteMarkdownForDisplay(raw || ""));
+    setRichNoteContent(formatReadableNoteMarkdown(raw || ""));
+    const nextNoteGenerationMode =
+      typeof (contentQuery.data.metadata as Record<string, unknown> | null)?.note_generation_mode === "string"
+        ? (contentQuery.data.metadata as Record<string, unknown>).note_generation_mode
+        : undefined;
+    setReparseNoteGenerationMode(normalizeNoteGenerationMode(nextNoteGenerationMode));
   }, [contentQuery.data]);
 
   const metadata = useMemo<Record<string, unknown> | null>(() => {
@@ -772,8 +798,8 @@ export default function ContentDetailPage() {
   }, [contentQuery.data]);
   const refinedNote = useMemo(() => {
     const refined = metadata?.refined_note_markdown;
-    if (typeof refined === "string" && refined.trim()) return cleanNoteMarkdownForDisplay(refined);
-    return typeof metadata?.note_markdown === "string" ? cleanNoteMarkdownForDisplay(metadata.note_markdown) : "";
+    if (typeof refined === "string" && refined.trim()) return formatReadableNoteMarkdown(refined);
+    return typeof metadata?.note_markdown === "string" ? formatReadableNoteMarkdown(metadata.note_markdown) : "";
   }, [metadata]);
   const noteStyleValue = useMemo(() => (typeof metadata?.note_style === "string" ? metadata.note_style.trim() : ""), [metadata]);
   const historicalNoteVersions = useMemo(() => parseNoteVersions(metadata?.note_versions), [metadata]);
@@ -897,6 +923,30 @@ export default function ContentDetailPage() {
     return parts.join(" / ");
   }, [metadata]);
   const noteQuality = useMemo(() => getNoteQuality(metadata), [metadata]);
+  const qualityGapItems = useMemo(() => {
+    const rawItems = noteQuality?.capture_gap_report?.items;
+    if (!Array.isArray(rawItems)) {
+      return [] as string[];
+    }
+    return rawItems
+      .map((item) => item.detail?.trim() || item.label?.trim() || "")
+      .filter(Boolean)
+      .slice(0, 3);
+  }, [noteQuality]);
+  const coverageMissingSections = useMemo(() => {
+    const rawItems = noteQuality?.note_coverage_report?.missing_sections;
+    if (!Array.isArray(rawItems)) {
+      return [] as string[];
+    }
+    return rawItems
+      .map((item) => {
+        const label = item.label?.trim() || item.position?.trim() || "";
+        const excerpt = item.excerpt?.trim() || "";
+        return label && excerpt ? `${label}：${excerpt}` : label || excerpt;
+      })
+      .filter(Boolean)
+      .slice(0, 3);
+  }, [noteQuality]);
   const qualityInfo = useMemo(() => getQualityInfo(contentQuery.data?.status, metadata), [contentQuery.data?.status, metadata]);
   const runningReparseJob = useMemo(
     () => (activeReparseJob && !isSharedImportJobTerminal(activeReparseJob.status) ? activeReparseJob : null),
@@ -911,8 +961,7 @@ export default function ContentDetailPage() {
   const materialSeedPoints = useMemo(() => readStringList(metadata?.material_seed_points), [metadata]);
   const materialSeedQueries = useMemo(() => readStringList(metadata?.material_seed_queries), [metadata]);
   const sourceDescription = useMemo(() => (typeof metadata?.source_description === "string" ? metadata.source_description.trim() : ""), [metadata]);
-  const fullNoteContent = cleanNoteMarkdownForDisplay(richNoteContent || refinedNote || contentQuery.data?.summary || "");
-  const hasDerivedOutputs = Boolean(derivedMindmap || derivedQuiz);
+  const fullNoteContent = formatReadableNoteMarkdown(richNoteContent || refinedNote || contentQuery.data?.summary || "");
   const savedFrom = useMemo(() => (typeof metadata?.saved_from === "string" ? metadata.saved_from.trim() : ""), [metadata]);
   const sourceQuestion = useMemo(() => (typeof metadata?.question === "string" ? metadata.question.trim() : ""), [metadata]);
   const evidenceSummary = useMemo(() => (typeof metadata?.evidence_summary === "string" ? metadata.evidence_summary.trim() : ""), [metadata]);
@@ -938,11 +987,6 @@ export default function ContentDetailPage() {
     setSelectedVersionId("current");
   }, [contentId, historicalNoteVersions.length, noteStyleValue, refinedNote]);
 
-  useEffect(() => {
-    if (hasDerivedOutputs) {
-      setShowDerivePanel(true);
-    }
-  }, [hasDerivedOutputs]);
   useEffect(() => {
     setActiveReparseJobId("");
     setActiveReparseJob(null);
@@ -1085,89 +1129,24 @@ export default function ContentDetailPage() {
   const focusRequest = useMemo(() => {
     const targetView =
       requestedView ??
-      (targetChunk ? "chunks" : targetTranscriptIndex !== null ? "transcript" : null);
+      (targetChunk || targetTranscriptIndex !== null ? "transcript" : null);
     if (!targetView) {
       return null;
     }
 
-    if (targetView === "chunks") {
-      if (!targetChunk) {
-        return null;
-      }
-      return {
-        key: `chunks:${targetChunk.id}`,
-        view: "chunks" as const,
-        anchorId: targetChunk.id,
-        message: "已定位到问答引用命中的检索片段。",
-      };
-    }
-
-    if (targetTranscriptIndex === null) {
+    const targetIndex = targetTranscriptIndex ?? targetChunk?.chunk_index ?? null;
+    if (targetIndex === null) {
       return null;
     }
 
-    const linkedChunkId = chunkByIndex.get(targetTranscriptIndex)?.id ?? targetChunk?.id ?? null;
+    const linkedChunkId = chunkByIndex.get(targetIndex)?.id ?? targetChunk?.id ?? null;
     return {
-      key: `transcript:${linkedChunkId ?? targetTranscriptIndex}`,
+      key: `transcript:${linkedChunkId ?? targetIndex}`,
       view: "transcript" as const,
-      anchorId: buildTranscriptAnchorId(targetTranscriptIndex, linkedChunkId),
-      message: "已定位到问答引用命中的证据片段。",
+      anchorId: buildTranscriptAnchorId(targetIndex, linkedChunkId),
+      message: targetChunk ? "已定位到命中的原文位置。" : "已定位到问答引用命中的原文片段。",
     };
   }, [chunkByIndex, requestedView, targetChunk, targetTranscriptIndex]);
-  const noteLayerStatus = useMemo(() => {
-    if (noteQuality?.llm_enhanced) {
-      return {
-        label: "模型精炼",
-        description: "已形成高层笔记，可直接用于总结、复盘与扩写。",
-      };
-    }
-    if (noteQuality?.refined_note_ready) {
-      return {
-        label: "基础整理",
-        description: "已形成可读笔记，并保留证据层用于核对。",
-      };
-    }
-    return {
-      label: "原始建档",
-      description: "当前仍以原始材料为主，精炼层仍可继续补强。",
-    };
-  }, [noteQuality?.llm_enhanced, noteQuality?.refined_note_ready]);
-  const qaModeStatus = useMemo(() => {
-    if (noteQuality?.agent_ready) {
-      return {
-        label: "理解问答",
-        description: "支持整条内容理解，并可回溯到命中证据。",
-      };
-    }
-    if (noteQuality?.retrieval_ready) {
-      return {
-        label: "证据检索",
-        description: "优先命中具体片段，适合精确核对。",
-      };
-    }
-    return {
-      label: "待补强",
-      description: "问答能力仍在补齐。",
-    };
-  }, [noteQuality?.agent_ready, noteQuality?.retrieval_ready]);
-  const evidenceStatus = useMemo(() => {
-    if (noteQuality?.time_jump_ready) {
-      return {
-        label: "可回看",
-        description: timestampsEstimated ? "已保留时间锚点，部分位置来自估算定位。" : "已保留时间锚点，可直接回到原始内容。",
-      };
-    }
-    if (noteQuality?.raw_evidence_ready) {
-      return {
-        label: "可核对",
-        description: "已保留原始正文或片段，可用于交叉核对。",
-      };
-    }
-    return {
-      label: "较弱",
-      description: "原始证据仍偏弱，结论仅供参考。",
-    };
-  }, [noteQuality?.raw_evidence_ready, noteQuality?.time_jump_ready, timestampsEstimated]);
   const materialReadiness = useMemo(
     () =>
       getMaterialReadiness(contentQuery.data?.status, {
@@ -1178,35 +1157,11 @@ export default function ContentDetailPage() {
       }),
     [contentQuery.data?.chunks.length, contentQuery.data?.status, metadata, noteQuality, transcriptSegments.length],
   );
-  const quickAskItems = useMemo(() => {
-    const merged = [...materialSeedQueries, ...QUICK_QUESTIONS];
-    const unique: string[] = [];
-    for (const item of merged) {
-      const cleaned = item.trim();
-      if (!cleaned || unique.includes(cleaned)) continue;
-      unique.push(cleaned);
-      if (unique.length >= 4) break;
-    }
-    return unique;
-  }, [materialSeedQueries]);
-  const quickAskPreviewItems = useMemo(() => quickAskItems.slice(0, 2), [quickAskItems]);
-  const sideStatusItems = useMemo(() => {
-    const candidates = [
-      materialReadiness.statusLabel,
-      noteLayerStatus.label,
-      qaModeStatus.label,
-      evidenceStatus.label,
-      transcriptSourceLabel,
-    ];
-    const deduped: string[] = [];
-    for (const item of candidates) {
-      const cleaned = item.trim();
-      if (!cleaned || deduped.includes(cleaned)) continue;
-      deduped.push(cleaned);
-      if (deduped.length >= 4) break;
-    }
-    return deduped;
-  }, [evidenceStatus.label, materialReadiness.statusLabel, noteLayerStatus.label, qaModeStatus.label, transcriptSourceLabel]);
+  const noteDraftValue = useMemo(() => buildNoteDraftValue(noteQuality), [noteQuality]);
+  const materialSummaryValue = useMemo(
+    () => buildMaterialSummary(transcriptSegments.length, contentQuery.data?.chunks.length ?? 0),
+    [contentQuery.data?.chunks.length, transcriptSegments.length],
+  );
   const detailInfoItems = useMemo(() => {
     const items = [
       { label: "作者", value: contentQuery.data?.author || "-" },
@@ -1265,6 +1220,7 @@ export default function ContentDetailPage() {
       reparseContent(contentId, {
         note_style: typeof metadata?.note_style === "string" ? metadata.note_style : undefined,
         summary_focus: typeof metadata?.summary_focus === "string" ? metadata.summary_focus : undefined,
+        note_generation_mode: reparseNoteGenerationMode,
         async_mode: true,
       }),
     onMutate: () => {
@@ -1315,8 +1271,7 @@ export default function ContentDetailPage() {
       return;
     }
 
-    const targetMap = focusRequest.view === "chunks" ? chunkCardRefs.current : transcriptCardRefs.current;
-    const targetElement = targetMap.get(focusRequest.anchorId);
+    const targetElement = transcriptCardRefs.current.get(focusRequest.anchorId);
     if (!targetElement) {
       return;
     }
@@ -1372,9 +1327,9 @@ export default function ContentDetailPage() {
 
   const heroMetaItems = [
     { label: "完整度", value: typeof noteQuality?.score === "number" ? `${noteQuality.score} 分` : qualityInfo.label },
-    { label: "结构", value: noteQuality?.double_note_ready ? "双层完成" : "继续补齐" },
+    { label: "材料", value: materialSummaryValue },
     { label: "时间", value: noteQuality?.time_jump_ready ? "可回跳" : timestampsAvailable ? "部分可用" : "未提供" },
-    { label: "证据", value: transcriptSegments.length ? `${transcriptSegments.length} 段` : String(contentQuery.data.chunks.length) },
+    { label: "笔记", value: noteDraftValue },
   ];
 
   return (
@@ -1425,6 +1380,7 @@ export default function ContentDetailPage() {
             <span className="pill">{displayText(contentQuery.data.platform ?? "未知平台")}</span>
             <span className="pill">{displayText(qualityInfo.label)}</span>
             <span className="pill">{displayText(transcriptSourceLabel)}</span>
+            <span className="pill">{displayText(getNoteGenerationModeLabel(metadata?.note_generation_mode))}</span>
             {metadata?.noisy_asr_detected === true && <span className="pill">{displayText("转写噪声")}</span>}
           </div>
           {isEditingMeta && (
@@ -1466,6 +1422,26 @@ export default function ContentDetailPage() {
           </div>
 
           <div className="detail-hero-actions">
+            <div className="detail-reparse-mode-panel">
+              <div className="detail-reparse-mode-copy">
+                <span>{displayText("重解析成稿")}</span>
+                <strong>{displayText(REPARSE_MODE_ITEMS.find((item) => item.value === reparseNoteGenerationMode)?.label || "混合模式")}</strong>
+                <p>{displayText(REPARSE_MODE_ITEMS.find((item) => item.value === reparseNoteGenerationMode)?.hint || "先本地整理，再按需要补强可读性。")}</p>
+              </div>
+              <div className="segment-rail detail-reparse-mode-rail" aria-label={displayText("重解析成稿模式")}>
+                {REPARSE_MODE_ITEMS.map((item) => (
+                  <button
+                    key={item.value}
+                    type="button"
+                    className={reparseNoteGenerationMode === item.value ? "segment-pill segment-pill-active" : "segment-pill"}
+                    onClick={() => setReparseNoteGenerationMode(item.value)}
+                    disabled={reparseMutation.isPending || Boolean(runningReparseJob)}
+                  >
+                    {displayText(item.label)}
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="detail-hero-primary-actions">
               <Link className="primary-button button-link" to={buildScopedChatLink("请基于这条笔记，给我一版更适合复盘的结论整理", { contentId: contentQuery.data.id, title: contentQuery.data.title })}>
                 {displayText("继续提问")}
@@ -1518,6 +1494,27 @@ export default function ContentDetailPage() {
               <p>{displayText(reparseFailureMessage)}</p>
             </div>
           )}
+          {(qualityGapItems.length > 0 || coverageMissingSections.length > 0) && (
+            <details className="smart-inline-details smart-inline-details-block">
+              <summary>{displayText("当前缺口")}</summary>
+              <div className="smart-inline-panel">
+                {qualityGapItems.length > 0 && (
+                  <div className="smart-issue-list">
+                    {qualityGapItems.map((item) => (
+                      <p className="muted-text" key={item}>{displayText(item)}</p>
+                    ))}
+                  </div>
+                )}
+                {coverageMissingSections.length > 0 && (
+                  <div className="smart-issue-list">
+                    {coverageMissingSections.map((item) => (
+                      <p className="muted-text" key={item}>{displayText(item)}</p>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </details>
+          )}
         </div>
       </article>
 
@@ -1548,7 +1545,7 @@ export default function ContentDetailPage() {
                     <div className="detail-material-list">
                       {evidenceDigest.slice(0, 3).map((item) => (
                         <article className="detail-material-item" key={`${item.title}-${item.anchor}-${item.line}`}>
-                          <span className="eyebrow">{displayText(item.timeLabel || item.anchor || "证据片段")}</span>
+                          <span className="eyebrow">{displayText(item.timeLabel || item.anchor || "原文片段")}</span>
                           <strong>{displayText(item.title)}</strong>
                           <p>{displayText(item.snippet || item.line)}</p>
                         </article>
@@ -1568,7 +1565,7 @@ export default function ContentDetailPage() {
                     )}
                     <Link
                       className="secondary-button button-link"
-                      to={buildScopedChatLink("请基于这张问答卡片，把结论和证据整理成更适合复盘的版本", {
+                      to={buildScopedChatLink("请基于这张问答卡片，把结论和原文整理成更适合复盘的版本", {
                         contentId: contentQuery.data.id,
                         title: contentQuery.data.title,
                       })}
@@ -1588,7 +1585,6 @@ export default function ContentDetailPage() {
                     </div>
                     <div className="pill-row">
                       {!!timelineItems.length && <span className="pill">{displayText(`${timelineItems.length} 个时间点`)}</span>}
-                      {!!clipItems.length && <span className="pill">{displayText(`${clipItems.length} 个片段`)}</span>}
                       {!!noteScreenshots.length && <span className="pill">{displayText(`${noteScreenshots.length} 张关键画面`)}</span>}
                     </div>
                   </div>
@@ -1671,37 +1667,6 @@ export default function ContentDetailPage() {
                         )}
                       </div>
                     </div>
-                  )}
-
-                  {!!clipItems.length && (
-                    <details className="bilinote-section-stack detail-media-disclosure">
-                      <summary className="detail-media-summary">
-                        <div>
-                          <p className="eyebrow">{displayText("片段整理")}</p>
-                          <strong>{displayText("完整分段")}</strong>
-                        </div>
-                        <span className="pill">{displayText(`${clipItems.length} 段`)}</span>
-                      </summary>
-                      <div className="detail-media-body">
-                        <div className="bilinote-clip-grid">
-                          {clipItems.map((item) =>
-                            item.href ? (
-                              <a className="bilinote-clip-card" key={`${item.label}-${item.href}`} href={item.href} target="_blank" rel="noreferrer">
-                                <span className="eyebrow">{displayText(item.label)}</span>
-                                <strong>{displayText("打开原片段")}</strong>
-                                <p>{displayText(shortenText(item.summary || "当前片段已保留，适合回到原文继续核对。", 160))}</p>
-                              </a>
-                            ) : (
-                              <article className="bilinote-clip-card" key={`${item.label}-${item.summary}`}>
-                                <span className="eyebrow">{displayText(item.label)}</span>
-                                <strong>{displayText("片段摘要")}</strong>
-                                <p>{displayText(shortenText(item.summary || "当前片段已保留，适合继续核对。", 160))}</p>
-                              </article>
-                            ),
-                          )}
-                        </div>
-                      </div>
-                    </details>
                   )}
 
                   {!!noteScreenshots.length && (
@@ -1841,11 +1806,8 @@ export default function ContentDetailPage() {
                     >
                       {isEditingNote ? displayText("完成编辑") : displayText("编辑笔记")}
                     </button>
-                    <button className="btn btn-ghost btn-sm" type="button" onClick={() => void handleCopyText(fullNoteContent, "精炼笔记")}>
+                    <button className="btn btn-ghost btn-sm" type="button" onClick={() => void handleCopyText(fullNoteContent, "当前笔记")}>
                       {displayText("复制")}
-                    </button>
-                    <button className="btn btn-ghost btn-sm" type="button" onClick={() => setActiveView("transcript")}>
-                      {displayText("看证据层")}
                     </button>
                   </div>
                 </div>
@@ -1861,7 +1823,7 @@ export default function ContentDetailPage() {
                       setTimeout(() => setLocalMessage(""), 2000);
                       void html;
                     }}
-                    placeholder="在这里写精炼笔记，支持标题、加粗、列表、高亮..."
+                    placeholder="在这里继续整理笔记，支持标题、加粗、列表、高亮..."
                     />
                   ) : (
                     <MarkdownNoteView markdown={fullNoteContent} />
@@ -1874,7 +1836,7 @@ export default function ContentDetailPage() {
           {activeView === "transcript" && (
             <article className="card detail-section-card glass-panel">
               <div className="glass-callout transcript-callout">
-                <strong>{displayText("证据层")}</strong>
+                <strong>{displayText("原文片段")}</strong>
                 <p className="muted-text">{displayText(qualityInfo.description)}</p>
                 <div className="pill-row">
                   <span className="pill">{displayText(transcriptSourceLabel)}</span>
@@ -1927,6 +1889,14 @@ export default function ContentDetailPage() {
                           </div>
                         </div>
                         <pre className="content-pre glass-pre transcript-pre">{displayText(segment.text)}</pre>
+                        {(linkedChunk?.heading?.trim() || linkedChunk?.summary?.trim()) && (
+                          <article className="glass-callout transcript-linked-summary">
+                            <strong>{displayText(linkedChunk?.heading?.trim() || "整理摘要")}</strong>
+                            {linkedChunk?.summary?.trim() && linkedChunk.summary.trim() !== segment.text.trim() ? (
+                              <p className="muted-text">{displayText(linkedChunk.summary.trim())}</p>
+                            ) : null}
+                          </article>
+                        )}
                         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
                           <div className={`highlight-picker${ann.highlight ? " visible" : ""}`}>
                             {(["yellow", "blue", "green"] as HighlightColor[]).map((color) => (
@@ -1979,61 +1949,62 @@ export default function ContentDetailPage() {
                     );
                   })}
                 </div>
+              ) : contentQuery.data.chunks.length > 0 ? (
+                <div className="citation-list">
+                  {contentQuery.data.chunks.map((chunk) => {
+                    const chunkMeta = chunk.metadata ?? {};
+                    const startMs = readNumber(chunkMeta.start_ms);
+                    const label = formatTimeRange(startMs, readNumber(chunkMeta.end_ms), typeof chunkMeta.timestamp_label === "string" ? chunkMeta.timestamp_label : chunk.heading);
+                    const jumpUrl = resolveSeekUrl(typeof chunkMeta.seek_url === "string" ? chunkMeta.seek_url : null, contentQuery.data.source_url, startMs);
+                    const transcriptAnchorId = buildTranscriptAnchorId(chunk.chunk_index, chunk.id);
+                    const chunkLabel = chunk.heading?.trim() ? `片段 ${chunk.chunk_index + 1} · ${chunk.heading.trim()}` : `片段 ${chunk.chunk_index + 1}`;
+                    const chunkCardClassName =
+                      focusedAnchorId === transcriptAnchorId
+                        ? "card detail-section-card glass-panel chunk-glass-card detail-section-card-focused"
+                        : "card detail-section-card glass-panel chunk-glass-card";
+                    return (
+                      <article
+                        className={chunkCardClassName}
+                        key={chunk.id}
+                        ref={(element) => {
+                          if (element) {
+                            transcriptCardRefs.current.set(transcriptAnchorId, element);
+                          } else {
+                            transcriptCardRefs.current.delete(transcriptAnchorId);
+                          }
+                        }}
+                        tabIndex={-1}
+                      >
+                        <div className="panel-heading">
+                          <div>
+                            <p className="eyebrow">{displayText(label || chunkLabel)}</p>
+                            <h4>{displayText(chunk.heading?.trim() || "已整理原文")}</h4>
+                          </div>
+                          <span className="pill">{displayText("整理片段")}</span>
+                        </div>
+                        {chunk.summary?.trim() ? (
+                          <article className="glass-callout transcript-linked-summary">
+                            <strong>{displayText("摘要")}</strong>
+                            <p className="muted-text">{displayText(chunk.summary.trim())}</p>
+                          </article>
+                        ) : null}
+                        <pre className="content-pre glass-pre compact-pre">{displayText(chunk.chunk_text)}</pre>
+                        <div className="header-actions">
+                          <button className="secondary-button" type="button" onClick={() => void handleCopyText(chunk.chunk_text, chunkLabel)}>
+                            {displayText("复制片段")}
+                          </button>
+                          <Link className="secondary-button button-link" to={buildScopedChatLink("请只基于这个片段回答，并整理最值得记住的观点", { contentId: contentQuery.data.id, chunkId: chunk.id, title: contentQuery.data.title, chunkLabel })}>
+                            {displayText("围绕它追问")}
+                          </Link>
+                          {jumpUrl && <a className="primary-button button-link" href={jumpUrl} target="_blank" rel="noreferrer" title={displayText("将在浏览器中打开原视频对应时间点")}>{displayText("根据时间戳回看")}</a>}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
               ) : (
                 <pre className="content-pre glass-pre source-pre">{displayText(rawTranscript || contentQuery.data.content_text || "当前没有可展示的原始转写。")}</pre>
               )}
-            </article>
-          )}
-
-          {activeView === "chunks" && (
-            <article className="card detail-section-card glass-panel">
-              {!contentQuery.data.chunks.length && <p className="muted-text">{displayText("这条内容还没有整理出可用片段。")}</p>}
-              <div className="citation-list">
-                {contentQuery.data.chunks.map((chunk) => {
-                  const chunkMeta = chunk.metadata ?? {};
-                  const startMs = readNumber(chunkMeta.start_ms);
-                  const endMs = readNumber(chunkMeta.end_ms);
-                  const label = formatTimeRange(startMs, endMs, typeof chunkMeta.timestamp_label === "string" ? chunkMeta.timestamp_label : chunk.heading);
-                  const jumpUrl = resolveSeekUrl(typeof chunkMeta.seek_url === "string" ? chunkMeta.seek_url : null, contentQuery.data.source_url, startMs);
-                  const chunkLabel = chunk.heading?.trim() ? `片段 ${chunk.chunk_index + 1} · ${chunk.heading.trim()}` : `片段 ${chunk.chunk_index + 1}`;
-                  const chunkCardClassName =
-                    focusedAnchorId === chunk.id
-                      ? "card detail-section-card glass-panel chunk-glass-card detail-section-card-focused"
-                      : "card detail-section-card glass-panel chunk-glass-card";
-                  return (
-                    <article
-                      className={chunkCardClassName}
-                      key={chunk.id}
-                      ref={(element) => {
-                        if (element) {
-                          chunkCardRefs.current.set(chunk.id, element);
-                        } else {
-                          chunkCardRefs.current.delete(chunk.id);
-                        }
-                      }}
-                      tabIndex={-1}
-                    >
-                      <div className="panel-heading">
-                        <div>
-                          <p className="eyebrow">{displayText(chunkLabel)}</p>
-                          <h4>{displayText(chunk.summary || "这个片段还没有独立摘要。")}</h4>
-                        </div>
-                        {label && <span className="pill">{displayText(label)}</span>}
-                      </div>
-                      <pre className="content-pre glass-pre compact-pre">{displayText(chunk.chunk_text)}</pre>
-                      <div className="header-actions">
-                        <button className="secondary-button" type="button" onClick={() => void handleCopyText(chunk.chunk_text, chunkLabel)}>
-                          {displayText("复制片段")}
-                        </button>
-                        <Link className="secondary-button button-link" to={buildScopedChatLink("请只基于这个检索片段回答，并提炼最值得记住的观点", { contentId: contentQuery.data.id, chunkId: chunk.id, title: contentQuery.data.title, chunkLabel })}>
-                          {displayText("围绕它追问")}
-                        </Link>
-                        {jumpUrl && <a className="primary-button button-link" href={jumpUrl} target="_blank" rel="noreferrer" title={displayText("将在浏览器中打开原视频对应时间点")}>{displayText("根据时间戳回看")}</a>}
-                      </div>
-                    </article>
-                  );
-                })}
-              </div>
             </article>
           )}
         </div>
@@ -2048,166 +2019,147 @@ export default function ContentDetailPage() {
 
             <article className="glass-callout detail-side-summary">
               <strong>{displayText(materialReadiness.title)}</strong>
-              <div className="pill-row detail-side-summary-pills">
-                {sideStatusItems.map((item) => (
-                  <span className="pill" key={item}>{displayText(item)}</span>
-                ))}
-              </div>
+              <p className="muted-text">{displayText(materialReadiness.description)}</p>
             </article>
 
-            {!!quickAskPreviewItems.length && (
-              <div className="chip-grid detail-side-shortcuts">
-                {quickAskPreviewItems.map((item) => (
-                  <Link
-                    key={item}
-                    className="secondary-button button-link suggestion-chip detail-quick-ask-chip"
-                    to={buildScopedChatLink(item, { contentId: contentQuery.data.id, title: contentQuery.data.title })}
-                  >
-                    {displayText(item)}
-                  </Link>
-                ))}
-              </div>
-            )}
+            <details className="detail-side-disclosure detail-side-stack">
+              <summary>{displayText("更多")}</summary>
 
-            {historicalNoteVersions.length > 0 && (
-              <details className="card detail-section-card glass-panel detail-section-card-compact detail-side-disclosure bili-note-history-card">
-                <summary>{displayText(`版本 · ${historicalNoteVersions.length}`)}</summary>
-                <div className="bili-note-history-list">
-                  {noteVersionItems.map((item, index) => {
-                    const selected = selectedNoteVersion.id === item.id;
-                    return (
-                      <button
-                        key={`${item.id}-${index}`}
-                        type="button"
-                        className={selected ? "bili-note-history-item bili-note-history-item-active" : "bili-note-history-item"}
-                        onClick={() => setSelectedVersionId(item.id)}
-                      >
-                        <div className="bili-note-history-item-head">
-                          <div className="pill-row">
-                            <span className="pill">{displayText(getNoteVersionSourceLabel(item.source))}</span>
+              {historicalNoteVersions.length > 0 && (
+                <section className="detail-side-subsection">
+                  <div className="detail-side-subsection-head">
+                    <strong>{displayText(`版本 ${historicalNoteVersions.length}`)}</strong>
+                  </div>
+                  <div className="bili-note-history-list">
+                    {noteVersionItems.map((item, index) => {
+                      const selected = selectedNoteVersion.id === item.id;
+                      return (
+                        <button
+                          key={`${item.id}-${index}`}
+                          type="button"
+                          className={selected ? "bili-note-history-item bili-note-history-item-active" : "bili-note-history-item"}
+                          onClick={() => setSelectedVersionId(item.id)}
+                        >
+                          <div className="bili-note-history-item-head">
+                            <div className="pill-row">
+                              <span className="pill">{displayText(getNoteVersionSourceLabel(item.source))}</span>
+                            </div>
+                            <span className="muted-text">{displayText(item.capturedAt ? formatDateTime(item.capturedAt) : "未记录时间")}</span>
                           </div>
-                          <span className="muted-text">{displayText(item.capturedAt ? formatDateTime(item.capturedAt) : "未记录时间")}</span>
-                        </div>
-                        <strong>{displayText(item.summaryFocus || item.title || "未命名版本")}</strong>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <div className="bili-note-preview-block">
-                  <div className="bili-note-preview-head">
-                    <div>
-                      <p className="eyebrow">{displayText("当前选中版本")}</p>
-                      <h3>{displayText(selectedNoteVersion.summaryFocus || selectedNoteVersion.title || "未命名版本")}</h3>
-                    </div>
-                    <div className="pill-row">
-                      <span className="pill">{displayText(getNoteVersionSourceLabel(selectedNoteVersion.source))}</span>
-                    </div>
+                          <strong>{displayText(item.summaryFocus || item.title || "未命名版本")}</strong>
+                        </button>
+                      );
+                    })}
                   </div>
 
-                  <div className="bili-note-preview-meta">
-                    <article className="bili-note-preview-meta-card">
-                      <span>{displayText("保存时间")}</span>
-                      <strong>{displayText(selectedNoteVersion.capturedAt ? formatDateTime(selectedNoteVersion.capturedAt) : "当前页面")}</strong>
-                    </article>
-                    <article className="bili-note-preview-meta-card">
-                      <span>{displayText("正文来源")}</span>
-                      <strong>{displayText(getTranscriptSourceLabel(selectedNoteVersion.transcriptSource || metadata?.transcript_source))}</strong>
-                    </article>
-                  </div>
-
-                  {!!selectedVersionStageDigestItems.length && (
-                    <StageDigest
-                      eyebrow="版本"
-                      title="重点"
-                      items={selectedVersionStageDigestItems}
-                      compact
-                      className="detail-version-stage-digest"
-                    />
-                  )}
-
-                  {!selectedVersionStageDigestItems.length && !!selectedNoteVersion.keyPoints.length && (
-                    <div className="bilinote-bullet-list">
-                      {selectedNoteVersion.keyPoints.slice(0, 4).map((point) => (
-                        <p key={`${selectedNoteVersion.id}-${point}`}>{displayText(`• ${point}`)}</p>
-                      ))}
+                  <div className="bili-note-preview-block">
+                    <div className="bili-note-preview-head">
+                      <div>
+                        <p className="eyebrow">{displayText("当前选中版本")}</p>
+                        <h3>{displayText(selectedNoteVersion.summaryFocus || selectedNoteVersion.title || "未命名版本")}</h3>
+                      </div>
+                      <div className="pill-row">
+                        <span className="pill">{displayText(getNoteVersionSourceLabel(selectedNoteVersion.source))}</span>
+                      </div>
                     </div>
-                  )}
 
-                  <div className="header-actions bili-note-preview-actions">
-                    <button
-                      className="secondary-button"
-                      type="button"
-                      onClick={() => void handleCopyText(selectedNoteVersion.noteMarkdown || selectedNoteVersion.summary || "", "当前版本快照")}
-                    >
-                      {displayText("复制这版笔记")}
-                    </button>
-                    {selectedNoteVersion.id !== "current" && (
+                    <div className="bili-note-preview-meta">
+                      <article className="bili-note-preview-meta-card">
+                        <span>{displayText("保存时间")}</span>
+                        <strong>{displayText(selectedNoteVersion.capturedAt ? formatDateTime(selectedNoteVersion.capturedAt) : "当前页面")}</strong>
+                      </article>
+                      <article className="bili-note-preview-meta-card">
+                        <span>{displayText("正文来源")}</span>
+                        <strong>{displayText(getTranscriptSourceLabel(selectedNoteVersion.transcriptSource || metadata?.transcript_source))}</strong>
+                      </article>
+                    </div>
+
+                    {!!selectedVersionStageDigestItems.length && (
+                      <StageDigest
+                        eyebrow="版本"
+                        title="重点"
+                        items={selectedVersionStageDigestItems}
+                        compact
+                        className="detail-version-stage-digest"
+                      />
+                    )}
+
+                    {!selectedVersionStageDigestItems.length && !!selectedNoteVersion.keyPoints.length && (
+                      <div className="bilinote-bullet-list">
+                        {selectedNoteVersion.keyPoints.slice(0, 4).map((point) => (
+                          <p key={`${selectedNoteVersion.id}-${point}`}>{displayText(`- ${point}`)}</p>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="header-actions bili-note-preview-actions">
                       <button
-                        className="primary-button"
+                        className="secondary-button"
                         type="button"
-                        onClick={handleRestoreSelectedVersion}
-                        disabled={restoreNoteVersionMutation.isPending}
+                        onClick={() => void handleCopyText(selectedNoteVersion.noteMarkdown || selectedNoteVersion.summary || "", "当前版本快照")}
                       >
-                        {restoreNoteVersionMutation.isPending ? displayText("恢复中...") : displayText("恢复为当前版本")}
+                        {displayText("复制这版笔记")}
                       </button>
-                    )}
-                    {selectedNoteVersion.id !== "current" && (
-                      <button className="secondary-button" type="button" onClick={() => setSelectedVersionId("current")}>
-                        {displayText("回到当前版本")}
-                      </button>
-                    )}
+                      {selectedNoteVersion.id !== "current" && (
+                        <button
+                          className="primary-button"
+                          type="button"
+                          onClick={handleRestoreSelectedVersion}
+                          disabled={restoreNoteVersionMutation.isPending}
+                        >
+                          {restoreNoteVersionMutation.isPending ? displayText("恢复中...") : displayText("恢复为当前版本")}
+                        </button>
+                      )}
+                      {selectedNoteVersion.id !== "current" && (
+                        <button className="secondary-button" type="button" onClick={() => setSelectedVersionId("current")}>
+                          {displayText("回到当前版本")}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              </details>
-            )}
-
-            <details className="card detail-section-card glass-panel detail-section-card-compact detail-side-disclosure">
-              <summary>{displayText("来源与标签")}</summary>
-              {(materialSeedPoints.length > 0 || sourceDescription) && (
-                <div className="detail-side-group">
-                  {materialSeedPoints.length > 0 ? (
-                    <div className="detail-material-list">
-                      {materialSeedPoints.slice(0, 4).map((item) => (
-                        <article className="detail-material-item" key={item}>
-                          <p>{displayText(item)}</p>
-                        </article>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="glass-callout">
-                      <strong>{displayText("来源简介")}</strong>
-                      <p className="muted-text">{displayText(sourceDescription)}</p>
-                    </div>
-                  )}
-                </div>
+                </section>
               )}
 
-              <div className="info-list compact-info-list">
-                {detailInfoItems.map((item) => (
-                  <div key={`${item.label}-${item.value}`}>
-                    <dt>{displayText(item.label)}</dt>
-                    <dd>{displayText(item.value)}</dd>
+              <section className="detail-side-subsection">
+                <div className="detail-side-subsection-head">
+                  <strong>{displayText("来源与标签")}</strong>
+                </div>
+                {(materialSeedPoints.length > 0 || sourceDescription) && (
+                  <div className="detail-side-group">
+                    {materialSeedPoints.length > 0 ? (
+                      <div className="detail-material-list">
+                        {materialSeedPoints.slice(0, 4).map((item) => (
+                          <article className="detail-material-item" key={item}>
+                            <p>{displayText(item)}</p>
+                          </article>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="glass-callout">
+                        <strong>{displayText("来源简介")}</strong>
+                        <p className="muted-text">{displayText(sourceDescription)}</p>
+                      </div>
+                    )}
                   </div>
-                ))}
-              </div>
+                )}
 
-              <div className="tag-row-soft">
-                {contentQuery.data.tags.length ? contentQuery.data.tags.map((tag) => <span className="pill" key={tag}>{displayText(tag)}</span>) : <span className="pill">{displayText("暂无标签")}</span>}
-              </div>
-            </details>
-          </article>
+                <div className="info-list compact-info-list">
+                  {detailInfoItems.map((item) => (
+                    <div key={`${item.label}-${item.value}`}>
+                      <dt>{displayText(item.label)}</dt>
+                      <dd>{displayText(item.value)}</dd>
+                    </div>
+                  ))}
+                </div>
 
-          {/* 派生面板：思维导图 + 测验 */}
-          <article className="card detail-section-card glass-panel detail-section-card-compact">
-            <div className="detail-side-disclosure">
-              <button className="detail-side-disclosure-toggle" type="button" onClick={() => setShowDerivePanel((v) => !v)}>
-                <span>{displayText("派生内容")}</span>
-                <span className="muted-text">{displayText(showDerivePanel ? "收起" : "展开")}</span>
-              </button>
-              {showDerivePanel && (
-              <div className="derive-content">
-                <div className="derive-panel-head">
+                <div className="tag-row-soft">
+                  {contentQuery.data.tags.length ? contentQuery.data.tags.map((tag) => <span className="pill" key={tag}>{displayText(tag)}</span>) : <span className="pill">{displayText("暂无标签")}</span>}
+                </div>
+              </section>
+
+              <section className="detail-side-subsection">
+                <div className="detail-side-subsection-head">
+                  <strong>{displayText("派生内容")}</strong>
                   <div className="pill-row">
                     <button
                       type="button"
@@ -2225,6 +2177,10 @@ export default function ContentDetailPage() {
                     </button>
                   </div>
                 </div>
+
+                {deriveView === "none" && (
+                  <p className="muted-text">{displayText("按需展开思维导图或测验，需要时再生成。")}</p>
+                )}
 
                 {deriveView === "mindmap" && (
                   <div className="derive-content">
@@ -2365,33 +2321,32 @@ export default function ContentDetailPage() {
                     )}
                   </div>
                 )}
-              </div>
-              )}
-            </div>
-          </article>
+              </section>
 
-          <article className="card detail-section-card glass-panel">
-            <details className="metadata-details advanced-details">
-              <summary>{displayText("维护")}</summary>
-              <div className="form-grid detail-form-grid">
-                <label className="form-block">
-                  <span className="field-label">{displayText("分类")}</span>
-                  <input className="search-input" value={category} onChange={(event) => setCategory(event.target.value)} />
-                </label>
-              </div>
-              <div className="header-actions">
-                <button className="primary-button" type="button" onClick={() => updateMutation.mutate()} disabled={updateMutation.isPending}>
-                  {updateMutation.isPending ? displayText("保存中...") : displayText("保存分类")}
-                </button>
-                <button className="secondary-button" type="button" onClick={() => reindexMutation.mutate()} disabled={reindexMutation.isPending}>
-                  {reindexMutation.isPending ? displayText("重建中...") : displayText("重建片段索引")}
-                </button>
-                <button className="danger-button" type="button" onClick={handleDelete} disabled={deleteMutation.isPending}>
-                  {deleteMutation.isPending ? displayText("移入中...") : displayText("移入回收站")}
-                </button>
-              </div>
-              {reindexMutation.isSuccess && <p className="success-text">{displayText(reindexMutation.data.message)}</p>}
-              {reindexMutation.isError && <p className="error-text">{displayText("片段索引重建失败，请稍后重试。")}</p>}
+              <section className="detail-side-subsection">
+                <div className="detail-side-subsection-head">
+                  <strong>{displayText("维护")}</strong>
+                </div>
+                <div className="form-grid detail-form-grid">
+                  <label className="form-block">
+                    <span className="field-label">{displayText("分类")}</span>
+                    <input className="search-input" value={category} onChange={(event) => setCategory(event.target.value)} />
+                  </label>
+                </div>
+                <div className="header-actions">
+                  <button className="primary-button" type="button" onClick={() => updateMutation.mutate()} disabled={updateMutation.isPending}>
+                    {updateMutation.isPending ? displayText("保存中...") : displayText("保存分类")}
+                  </button>
+                  <button className="secondary-button" type="button" onClick={() => reindexMutation.mutate()} disabled={reindexMutation.isPending}>
+                    {reindexMutation.isPending ? displayText("重建中...") : displayText("重建片段索引")}
+                  </button>
+                  <button className="danger-button" type="button" onClick={handleDelete} disabled={deleteMutation.isPending}>
+                    {deleteMutation.isPending ? displayText("移入中...") : displayText("移入回收站")}
+                  </button>
+                </div>
+                {reindexMutation.isSuccess && <p className="success-text">{displayText(reindexMutation.data.message)}</p>}
+                {reindexMutation.isError && <p className="error-text">{displayText("片段索引重建失败，请稍后重试。")}</p>}
+              </section>
             </details>
           </article>
         </div>

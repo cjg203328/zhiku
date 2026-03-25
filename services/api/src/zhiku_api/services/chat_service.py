@@ -7,6 +7,7 @@ from ..config import AppSettings
 from .content_link_service import build_seek_url
 from .llm_gateway import LlmGateway
 from .note_quality_service import NoteQualityService
+from .online_search_service import OnlineSearchService
 from .query_builder import QueryBuilderMixin
 from .retrieval import RetrievalMixin
 
@@ -16,6 +17,11 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
         self.settings = settings
         self.llm_gateway = LlmGateway(settings) if settings is not None else None
         self.note_quality_service = NoteQualityService()
+        self.online_search_service = (
+            OnlineSearchService(timeout_seconds=getattr(settings, "llm_timeout_seconds", 12.0))
+            if settings is not None
+            else None
+        )
 
     def answer(
         self,
@@ -26,9 +32,13 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
         content_id: str | None = None,
         chunk_id: str | None = None,
         session_messages: list[dict[str, Any]] | None = None,
+        web_search_enabled: bool = False,
     ) -> dict[str, Any]:
         scoped = bool(content_id or chunk_id)
         query_intent = self._infer_query_intent(query)
+        assistant_meta_answer = self._build_assistant_meta_answer(query, query_intent=query_intent)
+        if assistant_meta_answer is not None and not scoped:
+            return assistant_meta_answer
         context_payload = self._build_session_context_payload(session_messages or []) if not scoped else {}
         follow_up_context = bool(
             not scoped
@@ -113,6 +123,7 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
             focus_content=focus_context.get("content"),
             focus_context=focus_context,
             query_intent=query_intent,
+            web_search_enabled=web_search_enabled,
         )
         result["retrieval"] = {
             "query_variants": query_variants,
@@ -151,6 +162,117 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
         }
         result["quality"] = result.get("quality") or quality
         return result
+
+    def _build_assistant_meta_answer(
+        self,
+        query: str,
+        *,
+        query_intent: str | None = None,
+    ) -> dict[str, Any] | None:
+        normalized = re.sub(r"\s+", "", query or "").lower()
+        if not normalized:
+            return None
+
+        meta_markers = (
+            "你是什么模型",
+            "你是啥模型",
+            "你现在是什么模型",
+            "你当前是什么模型",
+            "你用什么模型",
+            "你现在用什么模型",
+            "你当前用什么模型",
+            "现在接的是什么模型",
+            "当前接的是什么模型",
+            "现在调用的是什么模型",
+            "当前调用的是什么模型",
+            "现在用的是哪个模型",
+            "当前用的是哪个模型",
+            "你是谁",
+            "你是哪个模型",
+            "你现在是谁",
+        )
+        if not any(marker in normalized for marker in meta_markers):
+            return None
+
+        provider = str(getattr(self.settings, "model_provider", "") or "").strip() if self.settings is not None else ""
+        chat_model = str(getattr(self.settings, "chat_model", "") or "").strip() if self.settings is not None else ""
+        base_url = str(getattr(self.settings, "llm_api_base_url", "") or "").strip() if self.settings is not None else ""
+        llm_enabled = bool(self.llm_gateway is not None and self.llm_gateway.is_enabled())
+
+        provider_label = "OpenAI 兼容远端模型" if provider == "openai_compatible" else provider or "未配置"
+        model_label = chat_model or "未配置"
+        endpoint_label = base_url or "未配置"
+
+        if llm_enabled:
+            answer = self._format_answer_sections(
+                conclusion=f"当前全局问答默认接入的是 {model_label}。",
+                status_line="这条回答直接来自系统已保存的模型配置，不依赖知识库检索。",
+                evidence_title="当前生效配置",
+                evidence_lines=[
+                    f"模型提供方式：{provider_label}",
+                    f"聊天模型：{model_label}",
+                    f"接口地址：{endpoint_label}",
+                    "当知识库命中足够证据时，系统会优先做检索增强；当问题属于通用问答或系统自问时，会直接使用当前主模型回答。",
+                ],
+                next_title="你现在可以继续这样验证",
+                next_steps=[
+                    "继续追问一句通用问题，观察回答是否走当前主模型。",
+                    "切到设置页重新点一次“检查连接”，确认仍然返回成功。",
+                    "如果你想看知识库增强效果，再问一条和已导入内容强相关的问题。",
+                ],
+            )
+            quality = {
+                "level": "config",
+                "label": "系统配置",
+                "summary": "当前回答直接来自已保存的模型配置，不依赖知识库检索。",
+                "recommended_action": "如需验证实时连通性，可到设置页重新检查连接。",
+                "grounded": True,
+                "degraded": False,
+                "source": "system_config",
+                "answer_strategy": "config_meta",
+                "query_intent": query_intent or "explain",
+            }
+        else:
+            answer = self._format_answer_sections(
+                conclusion="当前全局问答还没有启用可直接调用的主模型。",
+                status_line="这条回答来自系统配置检查结果，不是知识库检索结论。",
+                evidence_title="当前状态",
+                evidence_lines=[
+                    f"模型提供方式：{provider_label}",
+                    f"聊天模型：{model_label}",
+                    f"接口地址：{endpoint_label}",
+                    "只要模型地址、模型名和 Key 有任一项未真正生效，全局问答就会优先回退到检索兜底。",
+                ],
+                next_title="建议下一步",
+                next_steps=[
+                    "到设置页确认主模型配置已经保存。",
+                    "重新执行一次“检查连接”。",
+                    "确认全局问答请求时使用的是同一套已保存配置。",
+                ],
+            )
+            quality = {
+                "level": "config",
+                "label": "系统配置",
+                "summary": "当前回答来自系统配置检查，主模型还没有完全进入可直答状态。",
+                "recommended_action": "先在设置页保存并检查主模型配置。",
+                "grounded": True,
+                "degraded": True,
+                "source": "system_config",
+                "answer_strategy": "config_meta",
+                "query_intent": query_intent or "explain",
+            }
+
+        return {
+            "answer": answer,
+            "citations": [],
+            "follow_ups": [
+                "当前全局问答到底走的是知识库增强还是模型直答？",
+                "告诉我现在这套配置里最需要注意的风险点",
+                "如果我要验证模型真的参与了回答，接下来该怎么测",
+            ],
+            "mode": "assistant_model_info",
+            "quality": quality,
+        }
 
     # -------------------------------------------------------------------------
     # Section: Query Builder — query variant generation and session context
@@ -518,6 +640,7 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
         focus_content: dict[str, Any] | None = None,
         focus_context: dict[str, Any] | None = None,
         query_intent: str | None = None,
+        web_search_enabled: bool = False,
     ) -> dict[str, Any]:
         if not matches:
             return self.answer_from_matches(
@@ -526,6 +649,7 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
                 quality=quality,
                 query_intent=query_intent,
                 session_messages=session_messages,
+                web_search_enabled=web_search_enabled,
             )
 
         top_matches = matches[:4]
@@ -587,6 +711,60 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
                 "quality": quality,
             }
 
+        web_search_result = self._answer_with_web_search(
+            query,
+            local_matches=top_matches,
+            local_citations=citations,
+            quality=quality,
+            focus_context=focus_context,
+            query_intent=query_intent,
+            session_messages=session_messages,
+            web_search_enabled=web_search_enabled,
+        )
+        if web_search_result is not None:
+            return web_search_result
+
+        if self._should_prefer_general_llm_answer(
+            query,
+            top_matches,
+            quality=quality,
+            focus_context=focus_context,
+            query_intent=query_intent,
+        ):
+            llm_result = (
+                self.llm_gateway.generate_weak_retrieval_answer(
+                    query,
+                    top_matches,
+                    quality=quality,
+                    query_intent=query_intent,
+                    conversation_context=session_messages,
+                )
+                if self.llm_gateway is not None
+                else None
+            )
+            if llm_result is not None:
+                general_quality = dict(quality or {})
+                general_quality.update(
+                    {
+                        "source": "general_model",
+                        "grounded": False,
+                        "degraded": True,
+                        "label": "弱检索转模型直答",
+                        "summary": "当前只命中到弱相关线索，本轮优先交给通用模型做谨慎直答；如果你希望答案贴合知识库资料，请继续缩小到具体内容或片段。",
+                        "recommended_action": "如果你想要基于资料证据继续回答，请指定一条内容、片段或时间点再追问。",
+                    }
+                )
+                return {
+                    "answer": self._polish_generated_answer(llm_result.text),
+                    "citations": [],
+                    "follow_ups": self._build_general_model_follow_ups(
+                        query,
+                        query_intent=general_quality.get("query_intent") or query_intent,
+                    ),
+                    "mode": "llm_weak_retrieval_answer",
+                    "quality": general_quality,
+                }
+
         if answer_strategy["prefers_agent"] and answer_strategy["llm_available"] and strategy_content is not None and self.llm_gateway is not None:
             llm_result = self.llm_gateway.generate_scoped_content_answer(
                 query,
@@ -623,10 +801,16 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
                 "quality": quality,
             }
 
-        if self.llm_gateway is not None:
+        if self._should_use_fused_llm_answer(
+            query,
+            quality=quality,
+            answer_strategy=answer_strategy,
+            query_intent=query_intent,
+        ) and self.llm_gateway is not None:
             llm_result = self.llm_gateway.generate_answer(
                 query,
                 top_matches,
+                quality=quality,
                 conversation_context=session_messages,
                 query_intent=query_intent,
             )
@@ -655,9 +839,25 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
         quality: dict[str, Any] | None = None,
         query_intent: str | None = None,
         session_messages: list[dict[str, Any]] | None = None,
+        web_search_enabled: bool = False,
     ) -> dict[str, Any]:
         if not matches:
-            if self.llm_gateway is not None:
+            web_search_result = self._answer_with_web_search(
+                query,
+                local_matches=[],
+                local_citations=[],
+                quality=quality or {},
+                focus_context=None,
+                query_intent=query_intent,
+                session_messages=session_messages,
+                web_search_enabled=web_search_enabled,
+            )
+            if web_search_result is not None:
+                return web_search_result
+            if self.llm_gateway is not None and self._query_deserves_general_model_budget(
+                query,
+                query_intent=query_intent,
+            ):
                 llm_result = self.llm_gateway.generate_general_answer(
                     query,
                     query_intent=query_intent or self._infer_query_intent(query),
@@ -676,24 +876,12 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
                         }
                     )
                     return {
-                        "answer": self._format_answer_sections(
-                            conclusion="当前没有命中知识库，这里先给你一版通用回答，适合先做方向判断。",
-                            status_line=fallback_quality.get("summary"),
-                            evidence_title="通用回答",
-                            evidence_lines=[self._polish_generated_answer(llm_result.text)],
-                            next_title="如果你想让后续回答更贴近你的资料",
-                            next_steps=[
-                                "先导入一条与这个主题直接相关的内容。",
-                                "把问题缩小到一个更明确的目标后再问。",
-                                "继续追问时，尽量带上场景、对象或限制条件。",
-                            ],
-                        ),
+                        "answer": self._polish_generated_answer(llm_result.text),
                         "citations": [],
-                        "follow_ups": [
-                            "把这个问题拆成 3 个更具体的小问题",
-                            "先导入一条和这个主题相关的内容再继续追问",
-                            "请给我一份可执行的入门学习路径",
-                        ],
+                        "follow_ups": self._build_general_model_follow_ups(
+                            query,
+                            query_intent=fallback_quality.get("query_intent") or query_intent,
+                        ),
                         "mode": "llm_general_answer",
                         "quality": fallback_quality,
                     }
@@ -755,6 +943,435 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
             "mode": "retrieval_only",
             "quality": quality,
         }
+
+    def _query_deserves_general_model_budget(
+        self,
+        query: str,
+        *,
+        query_intent: str | None = None,
+    ) -> bool:
+        normalized = re.sub(r"\s+", "", query or "").lower()
+        if not normalized:
+            return False
+        participation_mode = self._get_model_participation_mode()
+        summary_like = self._query_is_summary_like(query)
+
+        high_value_markers = (
+            "为什么",
+            "原理",
+            "本质",
+            "理解",
+            "区别",
+            "差异",
+            "对比",
+            "方案",
+            "策略",
+            "框架",
+            "设计",
+            "取舍",
+            "风险",
+            "路线",
+            "思路",
+            "判断",
+            "适合",
+            "优先",
+            "排查",
+            "诊断",
+            "决策",
+        )
+        low_value_markers = (
+            "打开",
+            "关闭",
+            "点击",
+            "按钮",
+            "页面",
+            "设置页",
+            "配置页",
+            "保存",
+            "刷新",
+            "重启",
+            "启动",
+            "停止",
+            "导入",
+            "导出",
+            "上传",
+            "下载",
+            "接口",
+            "端口",
+            "路径",
+            "目录",
+            "日志",
+            "报错",
+            "api",
+            "apikey",
+            "apikey",
+            "host",
+            "git",
+            "push",
+            "commit",
+        )
+        has_high_value_marker = any(marker in normalized for marker in high_value_markers)
+        has_low_value_marker = any(marker in normalized for marker in low_value_markers)
+        if has_low_value_marker and not has_high_value_marker:
+            return False
+
+        if summary_like and self._query_needs_context(query):
+            return False
+
+        intent = query_intent or self._infer_query_intent(query)
+        if summary_like:
+            if intent not in {"summary", "explain", "action"}:
+                return False
+            if participation_mode == "budget":
+                return has_high_value_marker or len(normalized) >= 14
+            if participation_mode == "intensive":
+                return has_high_value_marker or len(normalized) >= 8
+            return has_high_value_marker or len(normalized) >= 10
+
+        if intent in {"reason", "compare", "decision"}:
+            return True
+        if intent == "action":
+            if participation_mode == "budget":
+                return has_high_value_marker and len(normalized) >= 10
+            if participation_mode == "intensive":
+                return has_high_value_marker or len(normalized) >= 8
+            return has_high_value_marker or len(normalized) >= 12
+        if intent == "explain":
+            if participation_mode == "budget":
+                return has_high_value_marker and len(normalized) >= 12
+            if participation_mode == "intensive":
+                return has_high_value_marker or len(normalized) >= 10
+            return has_high_value_marker or len(normalized) >= 14
+        return False
+
+    def _should_prefer_general_llm_answer(
+        self,
+        query: str,
+        matches: list[dict[str, Any]],
+        *,
+        quality: dict[str, Any],
+        focus_context: dict[str, Any] | None = None,
+        query_intent: str | None = None,
+    ) -> bool:
+        if self.llm_gateway is None or not self.llm_gateway.is_enabled():
+            return False
+        if not matches or not bool(quality.get("degraded")):
+            return False
+        if str(quality.get("level") or "").strip() == "blocked":
+            return False
+        if not self._query_deserves_general_model_budget(
+            query,
+            query_intent=query_intent,
+        ):
+            return False
+        if self._query_needs_context(query) or self._query_targets_specific_material(query, matches, focus_context=focus_context):
+            return False
+        participation_mode = self._get_model_participation_mode()
+
+        focus_mode = str((focus_context or {}).get("focus_mode") or "").strip()
+        auto_focused = bool((focus_context or {}).get("auto_focused"))
+        matched_count = int((focus_context or {}).get("matched_count") or 0)
+        score_share_raw = (focus_context or {}).get("score_share")
+        try:
+            score_share = float(score_share_raw or 0)
+        except (TypeError, ValueError):
+            score_share = 0.0
+
+        if focus_mode == "scoped":
+            return False
+        if auto_focused and (matched_count >= 2 or score_share >= 0.56):
+            return False
+
+        citation_count = int(quality.get("citation_count") or 0)
+        try:
+            top_score = float(quality.get("top_score") or 0)
+        except (TypeError, ValueError):
+            top_score = 0.0
+        if participation_mode == "budget" and citation_count >= 1 and top_score >= 2.8 and (matched_count >= 1 or score_share >= 0.32):
+            return False
+        if citation_count >= 2 and top_score >= (3.0 if participation_mode == "intensive" else 3.5) and (matched_count >= 2 or score_share >= 0.45):
+            return False
+        return True
+
+    def _should_use_fused_llm_answer(
+        self,
+        query: str,
+        *,
+        quality: dict[str, Any],
+        answer_strategy: dict[str, Any],
+        query_intent: str | None = None,
+    ) -> bool:
+        if self.llm_gateway is None or not self.llm_gateway.is_enabled():
+            return False
+
+        participation_mode = self._get_model_participation_mode()
+        if participation_mode in {"balanced", "intensive"}:
+            return True
+
+        if answer_strategy.get("prefers_agent"):
+            return True
+        if self._query_is_summary_like(query):
+            return True
+
+        intent = query_intent or quality.get("query_intent") or self._infer_query_intent(query)
+        if intent in {"reason", "compare", "decision"}:
+            return True
+
+        citation_count = int(quality.get("citation_count") or 0)
+        try:
+            top_score = float(quality.get("top_score") or 0)
+        except (TypeError, ValueError):
+            top_score = 0.0
+        return citation_count >= 3 and top_score >= 8.0
+
+    def _answer_with_web_search(
+        self,
+        query: str,
+        *,
+        local_matches: list[dict[str, Any]],
+        local_citations: list[dict[str, Any]],
+        quality: dict[str, Any],
+        focus_context: dict[str, Any] | None,
+        query_intent: str | None,
+        session_messages: list[dict[str, Any]] | None,
+        web_search_enabled: bool,
+    ) -> dict[str, Any] | None:
+        if not self._should_use_network_search(
+            query,
+            local_matches,
+            quality=quality,
+            focus_context=focus_context,
+            query_intent=query_intent,
+            web_search_enabled=web_search_enabled,
+        ):
+            return None
+        if self.online_search_service is None or self.llm_gateway is None:
+            return None
+
+        web_results = self.online_search_service.search(query, limit=5)
+        if not web_results:
+            return None
+
+        llm_result = self.llm_gateway.generate_web_search_answer(
+            query,
+            web_results,
+            local_matches=local_matches,
+            local_quality=quality,
+            query_intent=query_intent,
+            conversation_context=session_messages,
+        )
+        if llm_result is None:
+            return None
+
+        external_citations = self._build_web_search_citations(web_results)
+        combined_citations = [*local_citations, *external_citations] if local_citations else external_citations
+        local_supported = bool(local_matches)
+        response_quality = dict(quality or {})
+        response_quality.update(
+            {
+                "source": "web_search",
+                "grounded": False,
+                "degraded": True,
+                "label": "本地优先 + 联网补充" if local_supported else "联网补充回答",
+                "summary": "本轮先检查了本地知识库，在本地证据不足时再补充了联网搜索结果。",
+                "recommended_action": "如果你希望只基于本地资料继续追问，保持联网搜索关闭即可。",
+            }
+        )
+        return {
+            "answer": self._polish_generated_answer(llm_result.text),
+            "citations": combined_citations,
+            "follow_ups": self._build_general_model_follow_ups(
+                query,
+                query_intent=response_quality.get("query_intent") or query_intent,
+            ),
+            "mode": "web_search_augmented_answer" if local_supported else "web_search_answer",
+            "quality": response_quality,
+        }
+
+    def _should_use_network_search(
+        self,
+        query: str,
+        local_matches: list[dict[str, Any]],
+        *,
+        quality: dict[str, Any],
+        focus_context: dict[str, Any] | None,
+        query_intent: str | None,
+        web_search_enabled: bool,
+    ) -> bool:
+        if not web_search_enabled:
+            return False
+        if self.online_search_service is None or self.llm_gateway is None or not self.llm_gateway.is_enabled():
+            return False
+        if str(quality.get("level") or "").strip() == "blocked":
+            return False
+        if local_matches and not bool(quality.get("degraded")):
+            return False
+        if self._query_needs_context(query):
+            return False
+        if self._query_targets_specific_material(query, local_matches, focus_context=focus_context):
+            return False
+        return self._query_deserves_network_search(query, query_intent=query_intent)
+
+    def _query_deserves_network_search(
+        self,
+        query: str,
+        *,
+        query_intent: str | None = None,
+    ) -> bool:
+        normalized = re.sub(r"\s+", "", query or "").lower()
+        if not normalized or self._query_is_summary_like(query):
+            return False
+
+        timeliness_markers = (
+            "最新",
+            "最近",
+            "今天",
+            "今日",
+            "本周",
+            "当前",
+            "现在哪",
+            "官网",
+            "新闻",
+            "价格",
+            "发布",
+            "更新",
+            "版本",
+        )
+        if any(marker in normalized for marker in timeliness_markers):
+            return True
+
+        if self._query_deserves_general_model_budget(query, query_intent=query_intent):
+            return True
+        return False
+
+    def _build_web_search_citations(self, web_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        citations: list[dict[str, Any]] = []
+        for index, item in enumerate(web_results[:5], start=1):
+            citations.append(
+                {
+                    "content_id": f"web:{index}",
+                    "chunk_id": None,
+                    "chunk_index": None,
+                    "heading": "联网结果",
+                    "title": str(item.get("title") or "").strip() or f"外部来源 {index}",
+                    "snippet": str(item.get("snippet") or "").strip(),
+                    "score": max(0.1, 5.0 - index * 0.2),
+                    "platform": "web",
+                    "source_url": str(item.get("url") or "").strip() or None,
+                    "start_ms": None,
+                    "end_ms": None,
+                    "seek_url": str(item.get("url") or "").strip() or None,
+                }
+            )
+        return citations
+
+    def _get_model_participation_mode(self) -> str:
+        if self.settings is None:
+            return "balanced"
+        value = str(getattr(self.settings, "llm_participation_mode_normalized", "") or "").strip()
+        return value or "balanced"
+
+    def _query_targets_specific_material(
+        self,
+        query: str,
+        matches: list[dict[str, Any]],
+        *,
+        focus_context: dict[str, Any] | None = None,
+    ) -> bool:
+        normalized_query = self._normalize_reference_text(query)
+        if not normalized_query:
+            return False
+
+        material_markers = (
+            "这篇",
+            "这个视频",
+            "这个文章",
+            "这条内容",
+            "原文",
+            "文中",
+            "文里",
+            "视频里",
+            "这段",
+            "片段",
+            "作者",
+            "up主",
+            "博主",
+            "该文",
+            "该视频",
+            "本片",
+            "本期",
+            "笔记里",
+        )
+        if any(marker in normalized_query for marker in material_markers):
+            return True
+
+        titles: list[str] = []
+        focus_title = str((focus_context or {}).get("title") or "").strip()
+        if focus_title:
+            titles.append(focus_title)
+        for item in matches[:3]:
+            title = str(item.get("title") or "").strip()
+            if title and title not in titles:
+                titles.append(title)
+
+        for title in titles:
+            normalized_title = self._normalize_reference_text(title)
+            if normalized_title and len(normalized_title) >= 6 and normalized_title in normalized_query:
+                return True
+            for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]{3,}|[\u4e00-\u9fff]{4,12}", title):
+                normalized_token = self._normalize_reference_text(token)
+                if normalized_token and len(normalized_token) >= 4 and normalized_token in normalized_query:
+                    return True
+        return False
+
+    def _normalize_reference_text(self, value: str) -> str:
+        normalized = re.sub(r"\s+", "", str(value or "").lower())
+        return re.sub(r"[^\w\u4e00-\u9fff]+", "", normalized)
+
+    def _build_general_model_follow_ups(
+        self,
+        query: str,
+        *,
+        query_intent: str | None = None,
+    ) -> list[str]:
+        intent = query_intent or self._infer_query_intent(query)
+        if intent == "reason":
+            suggestions = [
+                "把这个判断拆成结论、依据和反例三部分继续讲。",
+                "如果换一个场景，这个结论最容易在哪一步失效？",
+                "如果你想改成基于资料回答，指定一条内容或片段再追问。",
+            ]
+        elif intent == "compare":
+            suggestions = [
+                "把对比维度改成成本、效果和适用场景三栏继续展开。",
+                "如果只能选一个方向，先帮我做取舍判断。",
+                "如果你想改成基于资料回答，指定一条内容或片段再追问。",
+            ]
+        elif intent == "decision":
+            suggestions = [
+                "按高把握、待验证、高风险三层再帮我收束一版。",
+                "如果现在就要做选择，先帮我列最关键的判断条件。",
+                "如果你想改成基于资料回答，指定一条内容或片段再追问。",
+            ]
+        elif intent == "action":
+            suggestions = [
+                "把刚才的思路改成可直接执行的 3 到 5 步。",
+                "如果我是新手，先告诉我最容易做错的地方。",
+                "如果你想改成基于资料回答，指定一条内容或片段再追问。",
+            ]
+        else:
+            suggestions = [
+                "把这个问题缩到一个具体场景，我再给你更实用的一版。",
+                "把它拆成 3 个更具体的小问题继续展开。",
+                "如果你想改成基于资料回答，指定一条内容或片段再追问。",
+            ]
+
+        deduped: list[str] = []
+        for item in suggestions:
+            cleaned = item.strip()
+            if cleaned and cleaned not in deduped:
+                deduped.append(cleaned)
+        return deduped[:3]
 
     def _evaluate_quality(
         self,
@@ -2178,7 +2795,13 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
         if not isinstance(metadata, dict):
             return {}
         note_quality = metadata.get("note_quality")
-        if isinstance(note_quality, dict) and "semantic_score" in note_quality and "agent_ready" in note_quality:
+        if (
+            isinstance(note_quality, dict)
+            and "semantic_score" in note_quality
+            and "agent_ready" in note_quality
+            and "capture_gap_report" in note_quality
+            and "note_coverage_report" in note_quality
+        ):
             return note_quality
 
         try:
@@ -2197,9 +2820,15 @@ class ChatService(QueryBuilderMixin, RetrievalMixin):
             "summary",
             "recommended_action",
             "question_answer_ready",
+            "high_confidence_answer_ready",
             "semantic_score",
             "agent_ready",
             "llm_enhanced",
+            "source_reliability_score",
+            "coverage_score",
+            "note_structure_score",
+            "capture_gap_report",
+            "note_coverage_report",
             "dimensions",
             "sort_score",
         ):

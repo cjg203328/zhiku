@@ -4,6 +4,7 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { formatMilliseconds, formatTimeRange } from "../lib/utils";
 import {
   deleteChatSession,
+  fetchModelCatalog,
   getChatSession,
   getSettings,
   listChatSessions,
@@ -16,21 +17,40 @@ import {
 } from "../lib/api";
 import { useLanguage } from "../lib/language";
 
+const CHAT_MODEL_OVERRIDE_STORAGE_KEY = "zhiku:chat:model-override:v1";
+const CHAT_WEB_SEARCH_STORAGE_KEY = "zhiku:chat:web-search:v1";
+
 const GLOBAL_SUGGESTED_QUESTIONS = [
-  "我的知识库里有哪些关于学习方法的内容？",
-  "最近收录的内容里有什么值得深入研究的？",
-  "帮我找找知识库里关于效率和时间管理的片段",
-  "哪条内容最值得今天重新看一遍？",
+  "最近有哪些值得深挖的内容？",
+  "帮我找学习方法相关的片段",
+  "今天最值得回看的内容是什么？",
 ];
 
 const SCOPED_SUGGESTED_QUESTIONS = [
-  "这个视频主要讲了什么，核心结论是什么？",
-  "UP主提到了哪些具体方法或步骤？",
-  "这里有哪些观点我可以直接用？",
-  "帮我找出最值得二刷的片段",
+  "这条内容的核心结论是什么？",
+  "这里有哪些可直接拿来用的方法？",
+  "最值得回看的片段是哪几段？",
 ];
 
+function readStoredChatModelOverride() {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem(CHAT_MODEL_OVERRIDE_STORAGE_KEY)?.trim() || "";
+}
+
+function readStoredChatWebSearchEnabled() {
+  if (typeof window === "undefined") return false;
+  return window.localStorage.getItem(CHAT_WEB_SEARCH_STORAGE_KEY) === "1";
+}
+
+function isExternalCitation(citation: ChatCitation) {
+  const contentId = citation.content_id?.trim();
+  return !contentId || contentId.startsWith("web:");
+}
+
 function formatChunkLabel(citation: ChatCitation) {
+  if (isExternalCitation(citation)) {
+    return citation.platform?.trim() === "web" ? "联网来源" : citation.heading?.trim() || "外部来源";
+  }
   const timestampLabel = formatTimeRange(citation.start_ms, citation.end_ms);
   if (typeof citation.chunk_index !== "number") {
     return citation.heading?.trim() || timestampLabel;
@@ -91,6 +111,9 @@ function buildChatLink(options: {
 }
 
 function buildCitationDetailLink(citation: ChatCitation) {
+  if (isExternalCitation(citation)) {
+    return null;
+  }
   const search = new URLSearchParams();
   const normalizedChunkId = citation.chunk_id?.trim();
   if (normalizedChunkId) search.set("chunkId", normalizedChunkId);
@@ -98,9 +121,7 @@ function buildCitationDetailLink(citation: ChatCitation) {
   if (typeof citation.start_ms === "number") search.set("startMs", String(citation.start_ms));
   if (typeof citation.end_ms === "number") search.set("endMs", String(citation.end_ms));
 
-  if (normalizedChunkId) {
-    search.set("view", "chunks");
-  } else if (typeof citation.start_ms === "number" || typeof citation.end_ms === "number") {
+  if (normalizedChunkId || typeof citation.start_ms === "number" || typeof citation.end_ms === "number") {
     search.set("view", "transcript");
   }
 
@@ -219,13 +240,17 @@ function renderAnswerBody(text: string, displayText: (value: string) => string) 
 }
 
 function getAnswerModeLabel(mode?: string) {
+  if (mode === "assistant_model_info") return "系统配置回答";
   if (mode === "rag_agent_answer") return "Agent 理解回答";
   if (mode === "rag_fused_answer") return "模型融合回答";
   if (mode === "rag_fused_retrieval") return "检索整理回答";
   if (mode === "rag_agent_pending") return "待接入模型增强";
   if (mode === "rag_weak_evidence") return "弱证据谨慎回答";
   if (mode === "rag_source_blocked") return "源内容待补全";
+  if (mode === "llm_weak_retrieval_answer") return "弱检索模型直答";
   if (mode === "llm_general_answer") return "通用模型补答";
+  if (mode === "web_search_answer") return "联网补充回答";
+  if (mode === "web_search_augmented_answer") return "本地优先 + 联网补充";
   if (mode === "retrieval_only") return "仅检索命中";
   return "";
 }
@@ -319,7 +344,7 @@ function buildQualityFollowUpQuestion(quality: QualityMeta) {
 }
 
 function pickRecommendedCitations(items: ChatCitation[]) {
-  const ranked = [...items].sort((left, right) => {
+  const ranked = items.filter((item) => !isExternalCitation(item)).sort((left, right) => {
     const leftHasTime = typeof left.start_ms === "number" || typeof left.end_ms === "number";
     const rightHasTime = typeof right.start_ms === "number" || typeof right.end_ms === "number";
     if (leftHasTime !== rightHasTime) {
@@ -338,6 +363,18 @@ function pickRecommendedCitations(items: ChatCitation[]) {
     if (picked.length >= 2) break;
   }
   return picked;
+}
+
+function buildCompactQualitySummary(quality: QualityMeta, mode?: string) {
+  if (quality.level === "blocked") return "当前材料还不完整。";
+  if (quality.source === "web_search" || mode === "web_search_answer" || mode === "web_search_augmented_answer") {
+    return "本轮先看本地，再补了联网结果。";
+  }
+  if (mode === "llm_general_answer") return "本地未命中，已转为通用回答。";
+  if (mode === "llm_weak_retrieval_answer") return "本地线索偏弱，这轮由模型谨慎直答。";
+  if (quality.degraded) return "当前证据偏弱，结论更适合先参考。";
+  if (mode === "assistant_model_info") return "这轮直接来自系统配置。";
+  return "已结合当前资料完成回答。";
 }
 
 export default function ChatPage() {
@@ -362,6 +399,8 @@ export default function ChatPage() {
   const [answerQuality, setAnswerQuality] = useState<QualityMeta>({});
   const [answerRetrieval, setAnswerRetrieval] = useState<RetrievalMeta | null>(null);
   const [answerMode, setAnswerMode] = useState<ChatResponse["mode"] | "">("");
+  const [selectedChatModel, setSelectedChatModel] = useState(() => readStoredChatModelOverride());
+  const [webSearchEnabled, setWebSearchEnabled] = useState(() => readStoredChatWebSearchEnabled());
 
   const scopedContentId = searchParams.get("contentId")?.trim() || "";
   const scopedChunkId = searchParams.get("chunkId")?.trim() || "";
@@ -385,6 +424,21 @@ export default function ChatPage() {
     queryKey: ["settings"],
     queryFn: getSettings,
     retry: 1,
+  });
+  const modelCatalogQuery = useQuery({
+    queryKey: [
+      "chat-model-catalog",
+      settingsQuery.data?.model.provider,
+      settingsQuery.data?.model.llm_api_base_url,
+    ],
+    enabled: Boolean(settingsQuery.data?.model.llm_api_base_url?.trim()),
+    retry: 1,
+    staleTime: 5 * 60 * 1000,
+    queryFn: () =>
+      fetchModelCatalog({
+        provider: settingsQuery.data?.model.provider || "openai_compatible",
+        api_base_url: settingsQuery.data?.model.llm_api_base_url || "",
+      }),
   });
 
   const saveTurnMutation = useMutation({
@@ -444,6 +498,16 @@ export default function ChatPage() {
   }, [searchParams]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(CHAT_MODEL_OVERRIDE_STORAGE_KEY, selectedChatModel.trim());
+  }, [selectedChatModel]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(CHAT_WEB_SEARCH_STORAGE_KEY, webSearchEnabled ? "1" : "0");
+  }, [webSearchEnabled]);
+
+  useEffect(() => {
     const leavingSessionId = prevSessionIdRef.current;
     prevSessionIdRef.current = activeSessionId;
 
@@ -480,6 +544,15 @@ export default function ChatPage() {
     if (scopedContentId) return scopedTitle || "单条内容";
     return "全库";
   }, [scopedChunkId, scopedChunkLabel, scopedContentId, scopedTitle]);
+  const currentChatModel = settingsQuery.data?.model.chat_model?.trim() || "";
+  const availableChatModels = useMemo(() => {
+    const values = [
+      currentChatModel,
+      ...(modelCatalogQuery.data?.models ?? []),
+      selectedChatModel,
+    ];
+    return Array.from(new Set(values.map((item) => item.trim()).filter(Boolean)));
+  }, [currentChatModel, modelCatalogQuery.data?.models, selectedChatModel]);
 
   const sessionMessages = activeSessionQuery.data?.messages ?? [];
   const latestUserQuestion = useMemo(
@@ -548,31 +621,48 @@ export default function ChatPage() {
     if (feedbackRoutes?.hierarchical) tags.push("层级检索");
     if ((feedbackRoutes?.content_targets ?? 0) > 0) tags.push(`候选内容 ${feedbackRoutes?.content_targets}`);
     if (answerQuality.source === "general_model") tags.push("通用模型补答");
+    if (answerQuality.source === "web_search") tags.push("联网补充");
     return tags;
   }, [answerQuality.degraded, answerQuality.source, feedbackContext?.follow_up, feedbackFocus?.auto_focused, feedbackRoutes?.content_targets, feedbackRoutes?.hierarchical]);
   const feedbackVariantLabels = useMemo(() => {
     if (feedbackVariants.length <= 1) return [];
     return feedbackVariants.slice(1, 4).map((item) => shortenText(item));
   }, [feedbackVariants]);
+  const compactQualitySummary = useMemo(
+    () => buildCompactQualitySummary(answerQuality, answerMode),
+    [answerMode, answerQuality],
+  );
   const showFeedbackPanel = Boolean(
-    answerQuality.label ||
-      answerQuality.summary ||
-      feedbackModeLabel ||
-      feedbackRoutes ||
-      feedbackPaths.length,
+    answerMode &&
+      (
+        answerQuality.degraded ||
+        answerQuality.level === "blocked" ||
+        [
+          "assistant_model_info",
+          "llm_general_answer",
+          "llm_weak_retrieval_answer",
+          "web_search_answer",
+          "web_search_augmented_answer",
+          "rag_source_blocked",
+        ].includes(answerMode)
+      ),
   );
   const primaryFeedbackSignals = feedbackSignals.slice(0, 3);
   const secondaryFeedbackSignals = feedbackSignals.slice(3).filter((item) => item.value.trim());
   const compactFeedbackTags = feedbackTags.slice(0, 3);
   const feedbackPathItems = feedbackPaths.slice(0, 2);
   const showFeedbackDetails = Boolean(secondaryFeedbackSignals.length || feedbackVariantLabels.length);
+  const firstLocalCitation = useMemo(
+    () => citations.find((item) => !isExternalCitation(item)) ?? null,
+    [citations],
+  );
   const primaryContentId = useMemo(
-    () => feedbackFocus?.content_id?.trim() || citations[0]?.content_id?.trim() || scopedContentId,
-    [citations, feedbackFocus?.content_id, scopedContentId],
+    () => feedbackFocus?.content_id?.trim() || firstLocalCitation?.content_id?.trim() || scopedContentId,
+    [feedbackFocus?.content_id, firstLocalCitation?.content_id, scopedContentId],
   );
   const primaryContentTitle = useMemo(
-    () => feedbackFocus?.title?.trim() || citations[0]?.title?.trim() || scopedTitle,
-    [citations, feedbackFocus?.title, scopedTitle],
+    () => feedbackFocus?.title?.trim() || firstLocalCitation?.title?.trim() || scopedTitle,
+    [feedbackFocus?.title, firstLocalCitation?.title, scopedTitle],
   );
   const qualityBannerTone = useMemo(() => getQualityBannerTone(answerQuality), [answerQuality]);
   const qualityFollowUpQuestion = useMemo(() => buildQualityFollowUpQuestion(answerQuality), [answerQuality]);
@@ -711,6 +801,8 @@ export default function ChatPage() {
           contentId: scopedContentId || undefined,
           chunkId: scopedChunkId || undefined,
           sessionId: activeSessionId || undefined,
+          chatModel: selectedChatModel.trim() || undefined,
+          webSearchEnabled,
         },
       );
 
@@ -955,6 +1047,8 @@ export default function ChatPage() {
             </div>
             <div className="pill-row">
               <span className="pill">{displayText(scopeLabel)}</span>
+              <span className="pill">{displayText(selectedChatModel.trim() ? selectedChatModel : currentChatModel || "默认模型")}</span>
+              <span className="pill">{displayText(webSearchEnabled ? "联网补充" : "本地优先")}</span>
               {feedbackModeLabel && <span className="pill">{displayText(feedbackModeLabel)}</span>}
               {answerQuality.label && <span className="pill">{displayText(answerQuality.label)}</span>}
               {!!citations.length && <span className="pill">{displayText(`${citations.length} 条引用`)}</span>}
@@ -972,7 +1066,7 @@ export default function ChatPage() {
               <div className={`qa-quality-banner qa-quality-banner-${qualityBannerTone}`}>
                 <div>
                   <strong>{displayText(answerQuality.label || feedbackModeLabel || "本轮回答状态")}</strong>
-                  <p>{displayText(answerQuality.summary || "已生成检索与证据。")}</p>
+                  <p>{displayText(compactQualitySummary)}</p>
                 </div>
                 {!!qualityActionItems.length && (
                   <div className="qa-quality-actions">
@@ -1026,12 +1120,14 @@ export default function ChatPage() {
                         <strong>{displayText(citation.title)}</strong>
                         <p>{displayText(citation.snippet)}</p>
                         <div className="header-actions">
-                          <Link className="secondary-button button-link" to={detailLink}>
-                            {displayText("详情")}
-                          </Link>
+                          {detailLink && (
+                            <Link className="secondary-button button-link" to={detailLink}>
+                              {displayText("详情")}
+                            </Link>
+                          )}
                           {jumpUrl && (
                             <a className="primary-button button-link" href={jumpUrl} target="_blank" rel="noreferrer">
-                              {displayText("回看")}
+                              {displayText(isExternalCitation(citation) ? "打开" : "回看")}
                             </a>
                           )}
                         </div>
@@ -1058,10 +1154,10 @@ export default function ChatPage() {
                     ? renderAnswerBody(message.message_text, displayText)
                     : <pre className="content-pre glass-pre qa-bubble-pre">{displayText(message.message_text)}</pre>}
 
-                  {isAssistant && message.isLive && message.quality?.summary && (
+                  {isAssistant && message.isLive && message.quality?.summary && (message.quality.degraded || message.quality.level === "blocked") && (
                     <div className="glass-callout">
                       <strong>{displayText(message.quality.label || "回答状态")}</strong>
-                      <p className="muted-text">{displayText(message.quality.summary)}</p>
+                      <p className="muted-text">{displayText(compactQualitySummary)}</p>
                     </div>
                   )}
 
@@ -1085,12 +1181,14 @@ export default function ChatPage() {
                               <strong>{displayText(citation.title)}</strong>
                               <p className="muted-text">{displayText(citation.snippet)}</p>
                               <div className="header-actions">
-                                <Link className="secondary-button button-link" to={detailLink}>
-                                  {displayText("详情")}
-                                </Link>
+                                {detailLink && (
+                                  <Link className="secondary-button button-link" to={detailLink}>
+                                    {displayText("详情")}
+                                  </Link>
+                                )}
                                 {jumpUrl && (
                                   <a className="secondary-button button-link" href={jumpUrl} target="_blank" rel="noreferrer">
-                                    {displayText("回看")}
+                                    {displayText(isExternalCitation(citation) ? "打开" : "回看")}
                                   </a>
                                 )}
                               </div>
@@ -1153,6 +1251,40 @@ export default function ChatPage() {
                 ))}
               </div>
             )}
+
+            <div className="qa-composer-toolbar">
+              <div className="qa-composer-toolbar-group">
+                <label className="qa-inline-control">
+                  <span>{displayText("模型")}</span>
+                  <select
+                    className="search-input qa-inline-select"
+                    value={selectedChatModel}
+                    onChange={(event) => setSelectedChatModel(event.target.value)}
+                  >
+                    <option value="">{displayText(currentChatModel ? `跟随默认 · ${currentChatModel}` : "跟随默认")}</option>
+                    {availableChatModels
+                      .filter((item) => item !== currentChatModel)
+                      .map((item) => (
+                        <option key={item} value={item}>
+                          {displayText(item)}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+
+                <label className={webSearchEnabled ? "qa-toggle-chip qa-toggle-chip-active" : "qa-toggle-chip"}>
+                  <input
+                    type="checkbox"
+                    checked={webSearchEnabled}
+                    onChange={(event) => setWebSearchEnabled(event.target.checked)}
+                  />
+                  <span>{displayText("联网补充")}</span>
+                </label>
+
+                <span className="subtle-pill">{displayText("本地优先")}</span>
+                {modelCatalogQuery.isFetching && <span className="subtle-pill">{displayText("模型读取中")}</span>}
+              </div>
+            </div>
 
             <textarea
               className="text-area qa-chat-input"

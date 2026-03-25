@@ -15,6 +15,10 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_INHERITED_ASR_MODEL = "whisper-1"
 DEFAULT_LOCAL_ASR_MODEL = "small"
 LOCAL_ASR_PROVIDER = "local_whisper"
+DEFAULT_LLM_PARTICIPATION_MODE = "balanced"
+LLM_PARTICIPATION_MODES = ("budget", "balanced", "intensive")
+DEFAULT_NOTE_GENERATION_MODE = "hybrid"
+NOTE_GENERATION_MODES = ("local_only", "hybrid", "model_draft")
 SHARED_ASR_HOST_ALLOWLIST = (
     "open.bigmodel.cn",
     "api.openai.com",
@@ -97,6 +101,7 @@ class AppSettings(BaseSettings):
     llm_api_base_url: str = ""
     llm_api_key: str = ""
     llm_timeout_seconds: float = 45.0
+    llm_participation_mode: str = DEFAULT_LLM_PARTICIPATION_MODE
 
     asr_provider: str = ""
     asr_model: str = ""
@@ -163,6 +168,13 @@ class AppSettings(BaseSettings):
             and bool(self.llm_api_key.strip())
             and bool(self.chat_model.strip())
         )
+
+    @property
+    def llm_participation_mode_normalized(self) -> str:
+        candidate = self.llm_participation_mode.strip().lower()
+        if candidate in LLM_PARTICIPATION_MODES:
+            return candidate
+        return DEFAULT_LLM_PARTICIPATION_MODE
 
     @property
     def llm_shared_asr_supported(self) -> bool:

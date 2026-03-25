@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 from typing import Any, Callable
 
-from ..config import AppSettings, REPO_ROOT
+from ..config import AppSettings, DEFAULT_NOTE_GENERATION_MODE, NOTE_GENERATION_MODES, REPO_ROOT
 from .asr_gateway import AsrGateway
 from .asr_runtime_service import AsrRuntimeService
 from .bilibili_client import BilibiliHttpClient, BilibiliParseError as _BilibiliParseError
@@ -43,6 +43,13 @@ VTT_BLOCK_PATTERN = re.compile(
     r"(.*?)(?=\n{2,}(?:\d+\s*\n)?\d{2}:\d{2}:\d{2}[.]\d{3}\s*-->|$)",
     re.DOTALL,
 )
+
+
+def _normalize_note_generation_mode(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in NOTE_GENERATION_MODES:
+        return candidate
+    return DEFAULT_NOTE_GENERATION_MODE
 YTDLP_SUBTITLE_LANGS = (
     "zh-Hans",
     "zh-CN",
@@ -154,8 +161,10 @@ class BilibiliService:
         *,
         note_style: str = "structured",
         summary_focus: str = "",
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
         progress_callback: Callable[[str, int, str | None, dict[str, Any] | None], None] | None = None,
     ) -> dict[str, Any]:
+        resolved_note_generation_mode = _normalize_note_generation_mode(note_generation_mode)
         def emit_progress(
             step: str,
             progress: int,
@@ -434,11 +443,19 @@ class BilibiliService:
             content_text=content_text,
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=resolved_note_generation_mode,
         )
         if llm_enhanced is not None:
             summary = llm_enhanced.get("summary") or summary
             key_points = llm_enhanced.get("key_points") or key_points
-            if note_style == "bilinote":
+            llm_note_markdown = str(llm_enhanced.get("note_markdown") or "").strip()
+            if llm_note_markdown:
+                note_markdown = self._merge_llm_note_markdown(
+                    llm_note_markdown,
+                    fallback_markdown=note_markdown,
+                    note_style=note_style,
+                )
+            elif note_style == "bilinote":
                 note_markdown = self._build_note_markdown(
                     video,
                     canonical_source_url,
@@ -453,8 +470,6 @@ class BilibiliService:
                     timestamps_available=timestamps_available,
                     timestamps_estimated=timestamps_estimated,
                 )
-            else:
-                note_markdown = llm_enhanced.get("note_markdown") or note_markdown
 
         emit_progress(
             "capturing_screenshots",
@@ -548,6 +563,7 @@ class BilibiliService:
                 "noisy_asr_detected": noisy_asr_detected,
                 "note_style": note_style,
                 "summary_focus": summary_focus,
+                "note_generation_mode": resolved_note_generation_mode,
                 "note_markdown": note_markdown,
                 "refined_note_markdown": note_markdown,
                 "raw_transcript_markdown": raw_transcript_markdown,
@@ -2453,6 +2469,62 @@ class BilibiliService:
         ])
         return "\n".join(lines)
 
+    def _merge_llm_note_markdown(
+        self,
+        llm_note_markdown: str,
+        *,
+        fallback_markdown: str,
+        note_style: str,
+    ) -> str:
+        primary = self._normalize_llm_note_markdown(llm_note_markdown)
+        if not primary:
+            return fallback_markdown
+        if note_style != "bilinote":
+            return primary
+        return self._append_missing_note_sections(
+            primary,
+            fallback_markdown,
+            section_titles=("时间线笔记", "片段整理"),
+        )
+
+    def _normalize_llm_note_markdown(self, markdown: str) -> str:
+        cleaned = str(markdown or "").replace("\r\n", "\n").strip()
+        if not cleaned:
+            return ""
+        required_titles = ("## 核心结论", "## 精炼正文", "## 重点摘录")
+        if not all(title in cleaned for title in required_titles):
+            return ""
+        return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    def _append_missing_note_sections(
+        self,
+        primary_markdown: str,
+        fallback_markdown: str,
+        *,
+        section_titles: tuple[str, ...],
+    ) -> str:
+        merged = primary_markdown.strip()
+        for title in section_titles:
+            if f"## {title}" in merged:
+                continue
+            section = self._extract_note_section(fallback_markdown, title)
+            if not section:
+                continue
+            merged = f"{merged}\n\n{section.strip()}"
+        return re.sub(r"\n{3,}", "\n\n", merged).strip()
+
+    def _extract_note_section(self, markdown: str, title: str) -> str:
+        if not markdown.strip():
+            return ""
+        pattern = rf"(?ms)^##\s+{re.escape(title)}\s*\n(.*?)(?=^##\s+|\Z)"
+        match = re.search(pattern, markdown)
+        if not match:
+            return ""
+        body = match.group(1).strip()
+        if not body:
+            return ""
+        return f"## {title}\n\n{body}"
+
     def _build_bilinote_markdown(
         self,
         *,
@@ -2584,10 +2656,16 @@ class BilibiliService:
         for index, segment in enumerate(selected_segments, start=1):
             label = self._format_segment_range(segment.start_ms, segment.end_ms) or self._format_timestamp(segment.start_ms) or f"片段 {index}"
             heading = f"### {label}"
+            capture_marker = self._build_screenshot_marker(self._select_capture_timestamp_ms(segment))
             lines.extend([
                 heading,
                 "",
             ])
+            if capture_marker:
+                lines.extend([
+                    capture_marker,
+                    "",
+                ])
             segment_text = segment.text.strip() or "当前片段暂无正文。"
             lines.append(segment_text)
             lines.append("")
@@ -3135,8 +3213,11 @@ class BilibiliService:
         content_text: str,
         note_style: str,
         summary_focus: str,
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
     ) -> dict[str, Any] | None:
         if self.llm_gateway is None:
+            return None
+        if _normalize_note_generation_mode(note_generation_mode) == "local_only":
             return None
         return self.llm_gateway.enhance_import_result(
             title=video.title,

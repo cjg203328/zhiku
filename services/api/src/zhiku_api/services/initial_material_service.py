@@ -286,6 +286,8 @@ class InitialMaterialService:
             cleaned = cleaned.replace("?", "？")
             cleaned = cleaned.replace("!", "！")
             cleaned = re.sub(r"(?<=[\u4e00-\u9fff]):(?=[\u4e00-\u9fffA-Za-z0-9])", "：", cleaned)
+            cleaned = self._restore_missing_punctuation(cleaned)
+            cleaned = "".join(self._split_overlong_sentences(cleaned)).strip() or cleaned
 
         cleaned = re.sub(r"\s*([，。！？；：])\s*", r"\1", cleaned)
         cleaned = re.sub(r"([，。！？；：…])\1+", r"\1", cleaned)
@@ -293,3 +295,86 @@ class InitialMaterialService:
         if cleaned and cleaned[-1] not in "。！？；…":
             cleaned += "。"
         return cleaned
+
+    def _split_overlong_sentences(self, text: str, *, hard_cap: int = 70) -> list[str]:
+        parts = [item.strip() for item in re.split(r"(?<=[。！？；])\s*", text) if item.strip()]
+        if not parts:
+            return []
+
+        sentences: list[str] = []
+        connector_pattern = (
+            r"(?<=[\u4e00-\u9fffA-Za-z0-9）】」])"
+            r"(?=(?:但是|不过|然而|所以|因此|另外|同时|接下来|随后|最后|总之|换句话说|这也说明|这意味着|"
+            r"首先|其次|其中|尤其|比如|例如|其实|现在|这就是|问题是|更重要的是))"
+        )
+        for part in parts:
+            if len(part) <= hard_cap:
+                sentences.append(part)
+                continue
+            terminal = part[-1] if part[-1] in "。！？；" else "。"
+            body = part[:-1].strip() if part[-1] in "。！？；" else part
+            clauses = [item.strip() for item in re.split(r"(?<=[，；])", body) if item.strip()]
+            if len(clauses) <= 1:
+                clauses = [item.strip() for item in re.split(connector_pattern, body) if item.strip()]
+            if len(clauses) <= 1:
+                clauses = [item.strip() for item in re.findall(r".{1,30}", body) if item.strip()]
+
+            buffer = ""
+            for clause in clauses:
+                normalized_clause = clause.lstrip("，；、").strip()
+                if not normalized_clause:
+                    continue
+                candidate = f"{buffer}{normalized_clause}" if buffer.endswith(("，", "；")) else (f"{buffer}，{normalized_clause}" if buffer else normalized_clause)
+                if buffer and len(candidate) > hard_cap:
+                    sentences.append(self._ensure_sentence_terminal(buffer, "。"))
+                    buffer = normalized_clause
+                    continue
+                buffer = candidate
+            if buffer:
+                sentences.append(self._ensure_sentence_terminal(buffer, terminal))
+        return [item for item in sentences if item]
+
+    def _ensure_sentence_terminal(self, text: str, terminal: str = "。") -> str:
+        cleaned = text.strip().rstrip("，；、,; ")
+        if not cleaned:
+            return ""
+        if cleaned.endswith(("。", "！", "？", "；", "...", "…")):
+            return cleaned
+        return f"{cleaned}{terminal}"
+
+    def _restore_missing_punctuation(self, text: str) -> str:
+        compact = re.sub(r"\s+", " ", text or "").strip()
+        if len(compact) < 28:
+            return compact
+
+        punctuation_count = len(re.findall(r"[，。！？；：、“”,.!?;:]", compact))
+        punctuation_density = punctuation_count / max(len(compact), 1)
+        if punctuation_density >= 0.014:
+            return compact
+
+        repaired = compact
+        repaired = re.sub(
+            r"(?<=[\u4e00-\u9fffA-Za-z0-9）】」])(?=(?:但是|不过|然而|所以|因此|另外|同时|接下来|最后|总之|换句话说))",
+            "。",
+            repaired,
+        )
+        repaired = re.sub(
+            r"(?<=[\u4e00-\u9fffA-Za-z0-9）】」])(?=(?:而是|因为|如果|并且|而且|其中|尤其|比如|例如))",
+            "，",
+            repaired,
+        )
+        repaired = re.sub(
+            r"(?<=[\u4e00-\u9fffA-Za-z0-9）】」])(?=(?:这就是|问题是|更重要的是|核心在于|现在|随后|接着))",
+            "。",
+            repaired,
+        )
+        if not re.search(r"[。！？；]", repaired) and len(repaired) >= 72:
+            chunks = [item.strip() for item in re.findall(r".{1,28}", repaired) if item.strip()]
+            if len(chunks) > 1:
+                repaired = "".join(
+                    f"{chunk}{'。' if index == len(chunks) - 1 else '，'}"
+                    if chunk[-1] not in "，。！？；"
+                    else chunk
+                    for index, chunk in enumerate(chunks)
+                )
+        return repaired

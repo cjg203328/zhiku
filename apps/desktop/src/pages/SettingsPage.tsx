@@ -25,12 +25,15 @@ const OPENAI_COMPAT_PROVIDER = "openai_compatible";
 const DEFAULT_EMBEDDING_MODEL = "bge-m3";
 const DEFAULT_REMOTE_ASR_MODEL = "whisper-1";
 const DEFAULT_LOCAL_ASR_MODEL = "small";
+const MODEL_PROFILE_STORAGE_KEY = "zhiku:model-profiles:v1";
+const MODEL_PROFILE_EXPORT_TYPE = "zhiku_model_profile";
+const DEFAULT_OPENAI_COMPAT_API_PATH = "/v1";
 
 const PROVIDER_PRESETS = [
   {
     id: "ollama",
     label: "Ollama",
-    description: "本地运行，数据不出机器，适合隐私优先场景。",
+    description: "本机模型",
     hint: "本地已安装 Ollama 后即可读取模型。",
     chatModel: "qwen2.5:7b",
     chatOptions: ["qwen2.5:7b", "qwen2.5:14b", "llama3.2:3b", "deepseek-r1:7b"],
@@ -40,8 +43,8 @@ const PROVIDER_PRESETS = [
   {
     id: "deepseek",
     label: "DeepSeek",
-    description: "性价比高，适合长文档理解和中文问答。",
-    hint: "填写 Key 后可读取模型列表。",
+    description: "远端 API",
+    hint: "本地只负责发起请求；填写 Key 后可读取模型列表。",
     chatModel: "deepseek-chat",
     chatOptions: ["deepseek-chat", "deepseek-reasoner"],
     embeddingModel: DEFAULT_EMBEDDING_MODEL,
@@ -50,8 +53,8 @@ const PROVIDER_PRESETS = [
   {
     id: "moonshot",
     label: "Moonshot",
-    description: "适合把视频和网页整理成更自然的中文回答。",
-    hint: "填写 Key 后可读取模型列表。",
+    description: "远端 API",
+    hint: "本地只负责发起请求；填写 Key 后可读取模型列表。",
     chatModel: "kimi-latest",
     chatOptions: ["kimi-latest"],
     embeddingModel: DEFAULT_EMBEDDING_MODEL,
@@ -60,8 +63,8 @@ const PROVIDER_PRESETS = [
   {
     id: "zhipu",
     label: "智谱",
-    description: "适合快速接通在线理解和问答链路。",
-    hint: "支持按厂商接入，也可手动更换模型。",
+    description: "远端 API",
+    hint: "支持按厂商接入；本地只作为客户端调用远端模型。",
     chatModel: "glm-4-flash-250414",
     chatOptions: ["glm-4-flash-250414"],
     embeddingModel: DEFAULT_EMBEDDING_MODEL,
@@ -70,8 +73,8 @@ const PROVIDER_PRESETS = [
   {
     id: "custom",
     label: "自定义",
-    description: "适配任意 OpenAI 兼容接口。",
-    hint: "适合之后接入更多线上模型平台。",
+    description: "OpenAI 兼容",
+    hint: "适合填写你自己的 GPT-5.4 网关、主机地址或 OpenAI 兼容平台。",
     chatModel: "",
     chatOptions: [],
     embeddingModel: DEFAULT_EMBEDDING_MODEL,
@@ -79,9 +82,53 @@ const PROVIDER_PRESETS = [
   },
 ] as const;
 
+const MODEL_PARTICIPATION_OPTIONS = [
+  {
+    id: "budget",
+    label: "省 token",
+    summary: "检索优先",
+    description: "复杂问题再让模型接手。",
+  },
+  {
+    id: "balanced",
+    label: "平衡",
+    summary: "默认推荐",
+    description: "简单问题负责整理，复杂问题负责最终答案。",
+  },
+  {
+    id: "intensive",
+    label: "高智能",
+    summary: "模型更主动",
+    description: "更积极参与整理、判断和补答。",
+  },
+] as const;
+
+type ModelParticipationMode = (typeof MODEL_PARTICIPATION_OPTIONS)[number]["id"];
+
+function normalizeParticipationMode(value?: string): ModelParticipationMode {
+  if (value === "budget" || value === "balanced" || value === "intensive") return value;
+  return "balanced";
+}
+
+function getParticipationModeLabel(value?: string) {
+  return MODEL_PARTICIPATION_OPTIONS.find((item) => item.id === normalizeParticipationMode(value))?.label || "平衡";
+}
+
 type ProviderPreset = (typeof PROVIDER_PRESETS)[number];
 type ProviderId = ProviderPreset["id"];
 type AsrModeChoice = "shared" | "dedicated" | "local";
+type ModelConfigProfile = {
+  id: string;
+  name: string;
+  providerId: ProviderId;
+  apiHost: string;
+  apiPath: string;
+  apiKey: string;
+  chatModel: string;
+  embeddingModel: string;
+  createdAt: string;
+  updatedAt: string;
+};
 
 function mapAsrModeChoice(configMode?: string): AsrModeChoice {
   if (configMode === "local") return "local";
@@ -113,6 +160,191 @@ function uniqueValues(values: Array<string | null | undefined>) {
   );
 }
 
+function normalizeOpenAiCompatibleBaseUrl(baseUrl: string) {
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+  if (!trimmed) return "";
+  return trimmed.replace(
+    /\/(?:chat\/completions|responses|models|embeddings|audio\/transcriptions)$/i,
+    "",
+  );
+}
+
+function createModelProfileId() {
+  return `profile_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function isProviderId(value: string): value is ProviderId {
+  return PROVIDER_PRESETS.some((preset) => preset.id === value);
+}
+
+function sanitizeModelProfile(value: unknown): ModelConfigProfile | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const providerValue = typeof record.providerId === "string" && isProviderId(record.providerId) ? record.providerId : "custom";
+  const name = typeof record.name === "string" ? record.name.trim() : "";
+  if (!name) return null;
+  return {
+    id: typeof record.id === "string" && record.id.trim() ? record.id.trim() : createModelProfileId(),
+    name,
+    providerId: providerValue,
+    apiHost: typeof record.apiHost === "string" ? record.apiHost.trim() : "",
+    apiPath: typeof record.apiPath === "string" ? normalizeApiPath(record.apiPath) : "",
+    apiKey: typeof record.apiKey === "string" ? record.apiKey.trim() : "",
+    chatModel: typeof record.chatModel === "string" ? record.chatModel.trim() : "",
+    embeddingModel:
+      typeof record.embeddingModel === "string" && record.embeddingModel.trim()
+        ? record.embeddingModel.trim()
+        : DEFAULT_EMBEDDING_MODEL,
+    createdAt: typeof record.createdAt === "string" && record.createdAt.trim() ? record.createdAt.trim() : new Date().toISOString(),
+    updatedAt: typeof record.updatedAt === "string" && record.updatedAt.trim() ? record.updatedAt.trim() : new Date().toISOString(),
+  };
+}
+
+function readStoredModelProfiles() {
+  if (typeof window === "undefined") return [] as ModelConfigProfile[];
+  try {
+    const raw = window.localStorage.getItem(MODEL_PROFILE_STORAGE_KEY);
+    if (!raw) return [] as ModelConfigProfile[];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [] as ModelConfigProfile[];
+    return parsed
+      .map((item) => sanitizeModelProfile(item))
+      .filter((item): item is ModelConfigProfile => Boolean(item))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  } catch {
+    return [] as ModelConfigProfile[];
+  }
+}
+
+function writeStoredModelProfiles(profiles: ModelConfigProfile[]) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(MODEL_PROFILE_STORAGE_KEY, JSON.stringify(profiles));
+}
+
+function splitOpenAiCompatibleBaseUrl(baseUrl: string) {
+  const normalized = normalizeOpenAiCompatibleBaseUrl(baseUrl);
+  if (!normalized) {
+    return {
+      apiHost: "",
+      apiPath: "",
+    };
+  }
+
+  try {
+    const url = new URL(normalized);
+    return {
+      apiHost: `${url.protocol}//${url.host}`,
+      apiPath: url.pathname === "/" ? "" : url.pathname.replace(/\/+$/, ""),
+    };
+  } catch {
+    return {
+      apiHost: normalized,
+      apiPath: "",
+    };
+  }
+}
+
+function normalizeApiPath(apiPath: string) {
+  const trimmed = apiPath.trim();
+  if (!trimmed) return "";
+  const normalized = trimmed.replace(/\/+$/, "");
+  return normalized.startsWith("/") ? normalized : `/${normalized.replace(/^\/+/, "")}`;
+}
+
+function joinOpenAiCompatibleBaseUrl(apiHost: string, apiPath: string) {
+  const trimmedHost = apiHost.trim();
+  if (!trimmedHost) return "";
+
+  if (/^https?:\/\//i.test(trimmedHost) && !apiPath.trim()) {
+    return normalizeOpenAiCompatibleBaseUrl(trimmedHost);
+  }
+
+  const normalizedHost = trimmedHost.replace(/\/+$/, "");
+  const normalizedPath = normalizeApiPath(apiPath);
+  return `${normalizedHost}${normalizedPath}`;
+}
+
+function extractOpenAiCompatiblePathFromHost(apiHost: string) {
+  const trimmedHost = apiHost.trim();
+  if (!trimmedHost || !/^https?:\/\//i.test(trimmedHost)) return "";
+  try {
+    const normalized = new URL(normalizeOpenAiCompatibleBaseUrl(trimmedHost));
+    const normalizedPath = normalized.pathname.replace(/\/+$/, "");
+    return normalizedPath && normalizedPath !== "/" ? normalizedPath : "";
+  } catch {
+    return "";
+  }
+}
+
+function resolveProviderApiDraft(providerId: ProviderId, apiHost: string, apiPath: string) {
+  const normalizedPath = normalizeApiPath(apiPath);
+  const embeddedPath = extractOpenAiCompatiblePathFromHost(apiHost);
+  const autoAppliedPath =
+    providerId === "custom" &&
+    isRemoteApiProvider(providerId) &&
+    Boolean(apiHost.trim()) &&
+    !normalizedPath &&
+    !embeddedPath;
+  const effectivePath = normalizedPath || (autoAppliedPath ? DEFAULT_OPENAI_COMPAT_API_PATH : "");
+  return {
+    effectivePath,
+    baseUrl: joinOpenAiCompatibleBaseUrl(apiHost, effectivePath),
+    autoAppliedPath,
+  };
+}
+
+function pickImportedString(record: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function parseImportedModelProfile(text: string) {
+  const parsed = JSON.parse(text) as unknown;
+  const source =
+    parsed && typeof parsed === "object" && "profile" in parsed && parsed.profile && typeof parsed.profile === "object"
+      ? (parsed.profile as Record<string, unknown>)
+      : parsed && typeof parsed === "object"
+      ? (parsed as Record<string, unknown>)
+      : null;
+
+  if (!source) {
+    throw new Error("配置 JSON 无法识别，请检查格式。");
+  }
+
+  const providerValue = pickImportedString(source, "providerId", "provider");
+  const providerId = isProviderId(providerValue) ? providerValue : "custom";
+  const apiHost = pickImportedString(source, "apiHost", "api_host", "host");
+  const apiPath = pickImportedString(source, "apiPath", "api_path", "path");
+  const chatModel = pickImportedString(source, "chatModel", "chat_model", "model");
+  const embeddingModel =
+    pickImportedString(source, "embeddingModel", "embedding_model") || DEFAULT_EMBEDDING_MODEL;
+  const apiKey = pickImportedString(source, "apiKey", "api_key");
+  const name = pickImportedString(source, "name", "profileName", "profile_name");
+
+  if (!apiHost && !chatModel) {
+    throw new Error("导入的配置至少需要包含 API Host 或聊天模型名。");
+  }
+
+  return {
+    name,
+    providerId,
+    apiHost,
+    apiPath: normalizeApiPath(apiPath),
+    apiKey,
+    chatModel,
+    embeddingModel,
+  };
+}
+
+function resolveOpenAiCompatibleEndpoint(baseUrl: string, target: "chat" | "models") {
+  const normalized = normalizeOpenAiCompatibleBaseUrl(baseUrl);
+  if (!normalized) return "";
+  return `${normalized}/${target === "chat" ? "chat/completions" : "models"}`;
+}
+
 function findMatchingPreset(baseUrl: string, chatModel: string): ProviderPreset | null {
   const normalizedBaseUrl = baseUrl.trim().replace(/\/$/, "").toLowerCase();
   const normalizedChatModel = chatModel.trim().toLowerCase();
@@ -127,6 +359,10 @@ function findMatchingPreset(baseUrl: string, chatModel: string): ProviderPreset 
 
 function isKnownPreset(providerId: ProviderId) {
   return providerId !== "custom";
+}
+
+function isRemoteApiProvider(providerId: ProviderId) {
+  return providerId !== "ollama";
 }
 
 export default function SettingsPage() {
@@ -195,8 +431,13 @@ export default function SettingsPage() {
   const [providerId, setProviderId] = useState<ProviderId>("custom");
   const [chatModel, setChatModel] = useState("");
   const [embeddingModel, setEmbeddingModel] = useState(DEFAULT_EMBEDDING_MODEL);
-  const [baseUrl, setBaseUrl] = useState("");
+  const [modelParticipationMode, setModelParticipationMode] = useState<ModelParticipationMode>("balanced");
+  const [apiHost, setApiHost] = useState("");
+  const [apiPath, setApiPath] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [savedModelProfiles, setSavedModelProfiles] = useState<ModelConfigProfile[]>([]);
+  const [profileDraftName, setProfileDraftName] = useState("");
+  const [profileJsonDraft, setProfileJsonDraft] = useState("");
   const [asrModeChoice, setAsrModeChoice] = useState<AsrModeChoice>("shared");
   const [asrModel, setAsrModel] = useState(DEFAULT_LOCAL_ASR_MODEL);
   const [asrBaseUrl, setAsrBaseUrl] = useState("");
@@ -215,11 +456,15 @@ export default function SettingsPage() {
     setProviderId(matchedPreset?.id ?? "custom");
     setChatModel(settingsQuery.data.model.chat_model || "");
     setEmbeddingModel(settingsQuery.data.model.embedding_model || DEFAULT_EMBEDDING_MODEL);
-    setBaseUrl(settingsQuery.data.model.llm_api_base_url || "");
+    setModelParticipationMode(normalizeParticipationMode(settingsQuery.data.model.participation_mode));
+    const nextBaseUrl = settingsQuery.data.model.llm_api_base_url || "";
+    const { apiHost: nextApiHost, apiPath: nextApiPath } = splitOpenAiCompatibleBaseUrl(nextBaseUrl);
+    setApiHost(nextApiHost);
+    setApiPath(nextApiPath);
     setApiKey("");
     setAsrModeChoice(mapAsrModeChoice(settingsQuery.data.asr?.config_mode));
     setAsrModel(settingsQuery.data.asr?.model || DEFAULT_LOCAL_ASR_MODEL);
-    setAsrBaseUrl(settingsQuery.data.asr?.api_base_url || settingsQuery.data.model.llm_api_base_url || "");
+    setAsrBaseUrl(settingsQuery.data.asr?.api_base_url || nextBaseUrl);
     setAsrApiKey("");
     setBrowserBridgeEnabled(Boolean(settingsQuery.data.bilibili?.browser_bridge_enabled ?? true));
     setCookieEnabled(Boolean(settingsQuery.data.bilibili?.cookie_enabled));
@@ -228,20 +473,87 @@ export default function SettingsPage() {
   }, [settingsQuery.data]);
 
   useEffect(() => {
+    setSavedModelProfiles(readStoredModelProfiles());
+  }, []);
+
+  const resolvedApiDraft = useMemo(
+    () => resolveProviderApiDraft(providerId, apiHost, apiPath),
+    [apiHost, apiPath, providerId],
+  );
+  const effectiveBaseUrl = resolvedApiDraft.baseUrl;
+  const effectiveApiPath = resolvedApiDraft.effectivePath;
+  const customProviderAutoPathActive = resolvedApiDraft.autoAppliedPath;
+
+  useEffect(() => {
     modelCatalogMutation.reset();
     modelProbeMutation.reset();
-  }, [apiKey, baseUrl]);
+  }, [apiKey, effectiveBaseUrl]);
 
   const activePreset = useMemo(
     () => PROVIDER_PRESETS.find((item) => item.id === providerId) ?? PROVIDER_PRESETS[PROVIDER_PRESETS.length - 1],
     [providerId],
   );
-  const detectedPreset = useMemo(() => findMatchingPreset(baseUrl, chatModel), [baseUrl, chatModel]);
+  const detectedPreset = useMemo(() => findMatchingPreset(effectiveBaseUrl, chatModel), [effectiveBaseUrl, chatModel]);
   const modelKeyConfigured = Boolean(settingsQuery.data?.model.llm_api_key_configured);
   const modelCatalog = modelCatalogMutation.data?.models ?? [];
   const modelCatalogUsesSavedKey = !apiKey.trim() && modelKeyConfigured;
   const modelProbeResult: ModelProbeResult | null = modelProbeMutation.data?.probe ?? null;
   const modelProbeUsesSavedKey = !apiKey.trim() && modelKeyConfigured;
+  const resolvedChatEndpoint = resolveOpenAiCompatibleEndpoint(effectiveBaseUrl, "chat");
+  const resolvedModelsEndpoint = resolveOpenAiCompatibleEndpoint(effectiveBaseUrl, "models");
+  const remoteApiMode = isRemoteApiProvider(providerId);
+  const modelAuthReady = !remoteApiMode || Boolean(apiKey.trim() || modelKeyConfigured);
+  const providerAccessModeLabel = remoteApiMode ? "远端 API" : "本机运行";
+  const providerTransportLabel = remoteApiMode ? "OpenAI 兼容" : "Ollama 本地";
+  const providerConnectionStateDisplay = !effectiveBaseUrl.trim()
+    ? "待补全地址"
+    : remoteApiMode && !modelAuthReady
+      ? "待填密钥"
+      : !chatModel.trim()
+        ? "待选择模型"
+        : modelProbeMutation.isPending
+          ? "检测中"
+          : modelProbeMutation.isError || (modelProbeResult ? !modelProbeResult.ok : false)
+            ? "检测失败"
+            : modelProbeResult?.ok
+              ? "连接成功"
+              : "待检测";
+  const modelCatalogStatusDisplay = modelCatalogMutation.isPending
+    ? "读取中..."
+    : modelCatalogMutation.isError
+      ? "读取失败"
+      : modelCatalog.length > 0
+        ? `${modelCatalog.length} 个模型`
+        : effectiveBaseUrl.trim() && modelAuthReady
+          ? "待读取"
+          : remoteApiMode && !modelAuthReady
+            ? "待填密钥"
+            : "待补全";
+  const modelProbeStatusDisplay = modelProbeMutation.isPending
+    ? "检测中..."
+    : modelProbeMutation.isError
+      ? "检测失败"
+      : modelProbeResult
+        ? modelProbeResult.ok
+          ? "连接成功"
+          : modelProbeResult.http_status
+            ? `HTTP ${modelProbeResult.http_status}`
+            : "检测失败"
+        : effectiveBaseUrl.trim() && chatModel.trim()
+          ? "待检测"
+          : "待补全";
+  const customProviderPathHintVisible =
+    providerId === "custom" && remoteApiMode && Boolean(apiHost.trim()) && !apiPath.trim();
+  const suggestedProfileName = useMemo(() => {
+    const providerLabel = detectedPreset?.label || activePreset.label;
+    const modelLabel = chatModel.trim() || (remoteApiMode ? "远端模型" : "本地模型");
+    return `${providerLabel} · ${modelLabel}`;
+  }, [activePreset.label, chatModel, detectedPreset?.label, remoteApiMode]);
+  const currentProviderProfiles = useMemo(
+    () => savedModelProfiles.filter((item) => item.providerId === providerId),
+    [providerId, savedModelProfiles],
+  );
+  const otherProviderProfilesCount = savedModelProfiles.length - currentProviderProfiles.length;
 
   const asrSettings = settingsQuery.data?.asr;
   const asrAvailable = Boolean(asrSettings?.available ?? asrSettings?.configured);
@@ -303,7 +615,7 @@ export default function SettingsPage() {
       },
       {
         label: "回答方式",
-        value: modelKeyConfigured ? "模型理解 + 检索证据" : "检索优先，模型可补强",
+        value: getParticipationModeLabel(modelParticipationMode),
       },
       {
         label: "B 站流程",
@@ -313,7 +625,7 @@ export default function SettingsPage() {
     [
       bilibiliFlowLabel,
       chatModel,
-      modelKeyConfigured,
+      modelParticipationMode,
       settingsQuery.data?.model.chat_model,
     ],
   );
@@ -341,7 +653,9 @@ export default function SettingsPage() {
       return;
     }
 
-    setBaseUrl(nextPreset.baseUrl);
+    const { apiHost: nextApiHost, apiPath: nextApiPath } = splitOpenAiCompatibleBaseUrl(nextPreset.baseUrl);
+    setApiHost(nextApiHost);
+    setApiPath(nextApiPath);
     setEmbeddingModel(nextPreset.embeddingModel);
     if (!chatModel.trim() || detectedPreset?.id === providerId || !isKnownPreset(providerId)) {
       setChatModel(nextPreset.chatModel);
@@ -355,12 +669,138 @@ export default function SettingsPage() {
     setLocalMessage(`已切换到 ${nextPreset.label}。`);
   }
 
+  function persistModelProfiles(nextProfiles: ModelConfigProfile[]) {
+    const normalized = [...nextProfiles].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    setSavedModelProfiles(normalized);
+    writeStoredModelProfiles(normalized);
+  }
+
+  function buildCurrentModelProfile(nameOverride?: string, existingProfile?: ModelConfigProfile | null): ModelConfigProfile {
+    const now = new Date().toISOString();
+    return {
+      id: existingProfile?.id || createModelProfileId(),
+      name: (nameOverride?.trim() || existingProfile?.name || suggestedProfileName).trim(),
+      providerId,
+      apiHost: apiHost.trim(),
+      apiPath: effectiveApiPath,
+      apiKey: apiKey.trim() || existingProfile?.apiKey || "",
+      chatModel: chatModel.trim(),
+      embeddingModel: embeddingModel.trim() || DEFAULT_EMBEDDING_MODEL,
+      createdAt: existingProfile?.createdAt || now,
+      updatedAt: now,
+    };
+  }
+
+  function applyModelProfile(profile: ModelConfigProfile, successMessage?: string) {
+    setProviderId(profile.providerId);
+    setApiHost(profile.apiHost);
+    setApiPath(profile.apiPath);
+    setApiKey(profile.apiKey || "");
+    setChatModel(profile.chatModel);
+    setEmbeddingModel(profile.embeddingModel || DEFAULT_EMBEDDING_MODEL);
+    modelCatalogMutation.reset();
+    modelProbeMutation.reset();
+    if (asrModeChoice === "dedicated" && !asrBaseUrl.trim()) {
+      setAsrBaseUrl(joinOpenAiCompatibleBaseUrl(profile.apiHost, profile.apiPath));
+    }
+    setProfileDraftName(profile.name);
+    if (successMessage) setLocalMessage(successMessage);
+  }
+
+  function handleSaveCurrentProfile() {
+    const name = profileDraftName.trim() || suggestedProfileName;
+    const existingProfile =
+      savedModelProfiles.find((item) => item.name.trim().toLowerCase() === name.trim().toLowerCase()) || null;
+    const nextProfile = buildCurrentModelProfile(name, existingProfile);
+    const nextProfiles = existingProfile
+      ? savedModelProfiles.map((item) => (item.id === existingProfile.id ? nextProfile : item))
+      : [nextProfile, ...savedModelProfiles];
+    persistModelProfiles(nextProfiles);
+    setProfileDraftName(nextProfile.name);
+    setLocalMessage(existingProfile ? `已更新本地档案：${nextProfile.name}` : `已保存本地档案：${nextProfile.name}`);
+  }
+
+  function handleDeleteModelProfile(profile: ModelConfigProfile) {
+    if (!window.confirm(`确定删除本地档案“${profile.name}”吗？`)) return;
+    persistModelProfiles(savedModelProfiles.filter((item) => item.id !== profile.id));
+    setLocalMessage(`已删除本地档案：${profile.name}`);
+  }
+
+  function buildModelProfileExportText(profile: ModelConfigProfile, includeApiKey = false) {
+    return JSON.stringify(
+      {
+        type: MODEL_PROFILE_EXPORT_TYPE,
+        version: 1,
+        profile: {
+          name: profile.name,
+          providerId: profile.providerId,
+          apiHost: profile.apiHost,
+          apiPath: profile.apiPath,
+          ...(includeApiKey && profile.apiKey ? { apiKey: profile.apiKey } : {}),
+          chatModel: profile.chatModel,
+          embeddingModel: profile.embeddingModel,
+        },
+      },
+      null,
+      2,
+    );
+  }
+
+  async function handleExportCurrentProfile() {
+    const currentProfile = buildCurrentModelProfile(profileDraftName.trim() || suggestedProfileName);
+    const exportText = buildModelProfileExportText(currentProfile);
+    setProfileJsonDraft(exportText);
+    await handleCopy(exportText, `${currentProfile.name} 配置 JSON`);
+  }
+
+  async function handleExportSavedProfile(profile: ModelConfigProfile) {
+    const exportText = buildModelProfileExportText(profile);
+    setProfileJsonDraft(exportText);
+    await handleCopy(exportText, `${profile.name} 配置 JSON`);
+  }
+
+  function applySuggestedApiPath() {
+    if (!customProviderAutoPathActive) return;
+    setApiPath(effectiveApiPath);
+  }
+
+  function handleImportProfileJson() {
+    try {
+      const imported = parseImportedModelProfile(profileJsonDraft);
+      const fallbackName =
+        imported.name || `${PROVIDER_PRESETS.find((item) => item.id === imported.providerId)?.label || "自定义"} · ${imported.chatModel || "导入配置"}`;
+      const existingProfile =
+        savedModelProfiles.find((item) => item.name.trim().toLowerCase() === fallbackName.trim().toLowerCase()) || null;
+      const now = new Date().toISOString();
+      const nextProfile: ModelConfigProfile = {
+        id: existingProfile?.id || createModelProfileId(),
+        name: fallbackName,
+        providerId: imported.providerId,
+        apiHost: imported.apiHost,
+        apiPath: imported.apiPath,
+        apiKey: imported.apiKey,
+        chatModel: imported.chatModel,
+        embeddingModel: imported.embeddingModel,
+        createdAt: existingProfile?.createdAt || now,
+        updatedAt: now,
+      };
+      const nextProfiles = existingProfile
+        ? savedModelProfiles.map((item) => (item.id === existingProfile.id ? nextProfile : item))
+        : [nextProfile, ...savedModelProfiles];
+      persistModelProfiles(nextProfiles);
+      applyModelProfile(nextProfile, `已导入并套用档案：${nextProfile.name}`);
+    } catch (error) {
+      setLocalMessage(error instanceof Error ? error.message : "导入配置失败，请检查 JSON。");
+    }
+  }
+
   function handleLoadModelCatalog() {
     setLocalMessage("");
+    applySuggestedApiPath();
     modelCatalogMutation.mutate(
       {
         provider: OPENAI_COMPAT_PROVIDER,
-        api_base_url: baseUrl.trim(),
+        api_base_url: effectiveBaseUrl.trim(),
         ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
       },
       {
@@ -380,7 +820,7 @@ export default function SettingsPage() {
       setAsrModel(DEFAULT_LOCAL_ASR_MODEL);
     }
     if (mode === "dedicated") {
-      if (!asrBaseUrl.trim()) setAsrBaseUrl(baseUrl.trim());
+      if (!asrBaseUrl.trim()) setAsrBaseUrl(effectiveBaseUrl.trim());
       if (!asrModel.trim() || asrModel === DEFAULT_LOCAL_ASR_MODEL) {
         setAsrModel(DEFAULT_REMOTE_ASR_MODEL);
       }
@@ -399,12 +839,14 @@ export default function SettingsPage() {
 
   function handleSaveModelConfig() {
     setLocalMessage("");
+    applySuggestedApiPath();
     saveMutation.mutate({
       model: {
         provider: OPENAI_COMPAT_PROVIDER,
         chat_model: chatModel.trim(),
         embedding_model: embeddingModel.trim(),
-        llm_api_base_url: baseUrl.trim(),
+        llm_api_base_url: effectiveBaseUrl.trim(),
+        participation_mode: modelParticipationMode,
         ...(apiKey.trim() ? { llm_api_key: apiKey.trim() } : modelKeyConfigured ? {} : { llm_api_key: "" }),
       },
     });
@@ -412,10 +854,11 @@ export default function SettingsPage() {
 
   function handleProbeModelConfig() {
     setLocalMessage("");
+    applySuggestedApiPath();
     modelProbeMutation.mutate({
       provider: OPENAI_COMPAT_PROVIDER,
       chat_model: chatModel.trim(),
-      api_base_url: baseUrl.trim(),
+      api_base_url: effectiveBaseUrl.trim(),
       ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
     });
   }
@@ -465,9 +908,27 @@ export default function SettingsPage() {
     });
   }
 
-  const canSaveModel = Boolean(baseUrl.trim() && chatModel.trim() && (apiKey.trim() || modelKeyConfigured));
-  const canProbeModel = Boolean(baseUrl.trim() && chatModel.trim());
-  const canLoadCatalog = Boolean(baseUrl.trim() && (apiKey.trim() || modelKeyConfigured));
+  const canSaveModel = Boolean(effectiveBaseUrl.trim() && chatModel.trim() && modelAuthReady);
+  const canProbeModel = Boolean(effectiveBaseUrl.trim() && chatModel.trim());
+  const canLoadCatalog = Boolean(effectiveBaseUrl.trim() && modelAuthReady);
+  const canSaveCurrentProfile = Boolean(apiHost.trim() && chatModel.trim());
+  const canExportCurrentProfile = Boolean(apiHost.trim() || chatModel.trim());
+
+  function handleApiHostChange(value: string) {
+    const { apiHost: nextApiHost, apiPath: nextApiPath } = splitOpenAiCompatibleBaseUrl(value);
+    if (nextApiPath) {
+      setApiHost(nextApiHost);
+      setApiPath(nextApiPath);
+      return;
+    }
+    setApiHost(value);
+  }
+
+  function handleDirectBaseUrlChange(value: string) {
+    const { apiHost: nextApiHost, apiPath: nextApiPath } = splitOpenAiCompatibleBaseUrl(value);
+    setApiHost(nextApiHost);
+    setApiPath(nextApiPath);
+  }
   const canSaveAsr =
     asrModeChoice === "shared"
       ? true
@@ -561,210 +1022,475 @@ export default function SettingsPage() {
         >
           <div className="panel-heading">
             <div>
-              <p className="eyebrow">{displayText("主模型")}</p>
-              <h3>{displayText("主模型")}</h3>
+              <p className="eyebrow">{displayText("Provider Console")}</p>
+              <h3>{displayText("模型接入")}</h3>
+              <p className="muted-text">{displayText("集中管理 provider、接口和本地档案。")}</p>
             </div>
           </div>
 
-          <div className="settings-step-list">
-            <section className="settings-step-card">
-              <div className="settings-step-head">
-                <div>
-                  <p className="eyebrow">{displayText("连接方式")}</p>
-                  <h4>{displayText("厂商")}</h4>
+          <div className="settings-provider-console-shell">
+            <div className="settings-provider-console">
+              <aside className="settings-provider-console-sidebar">
+                <div className="settings-provider-console-sidebar-head">
+                  <p className="eyebrow">{displayText("Providers")}</p>
+                  <h4>{displayText("模型入口")}</h4>
+                  <p className="muted-text">{displayText("左侧切换，右侧完成连接与模型。")}</p>
                 </div>
-                <span className="subtle-pill">{displayText(detectedPreset?.label || activePreset.label)}</span>
-              </div>
 
-              <div className="settings-provider-list">
-                {PROVIDER_PRESETS.map((preset) => {
-                  const active = preset.id === providerId;
-                  return (
-                    <button
-                      key={preset.id}
-                      className={active ? "settings-provider-option settings-provider-option-active" : "settings-provider-option"}
-                      type="button"
-                      onClick={() => applyProviderPreset(preset)}
-                    >
-                      <strong>{displayText(preset.label)}</strong>
-                      <span>{displayText(preset.description)}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
+                <div className="settings-provider-nav-stack">
+                  {PROVIDER_PRESETS.map((preset) => {
+                    const active = preset.id === providerId;
+                    const presetProfileCount = savedModelProfiles.filter((item) => item.providerId === preset.id).length;
+                    const presetRemoteApiMode = isRemoteApiProvider(preset.id);
+                    return (
+                      <button
+                        key={preset.id}
+                        className={active ? "settings-provider-nav-item settings-provider-nav-item-active" : "settings-provider-nav-item"}
+                        type="button"
+                        onClick={() => applyProviderPreset(preset)}
+                      >
+                        <div className="settings-provider-nav-top">
+                          <div className="settings-provider-nav-main">
+                            <strong>{displayText(preset.label)}</strong>
+                            <span>{displayText(preset.description)}</span>
+                          </div>
+                          <span className={active ? "settings-provider-status-dot settings-provider-status-dot-active" : "settings-provider-status-dot"} />
+                        </div>
 
-            <section className="settings-step-card">
-              <div className="settings-step-head">
-                <div>
-                  <p className="eyebrow">{displayText("凭证")}</p>
-                  <h4>{displayText("API Key")}</h4>
+                        <div className="settings-provider-nav-meta">
+                          <span className="subtle-pill">{displayText(presetRemoteApiMode ? "远端 API" : "本机运行")}</span>
+                          <span className="subtle-pill">{displayText(presetProfileCount ? `${presetProfileCount} 组档案` : "暂无档案")}</span>
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
-                <span className="subtle-pill">{displayText(modelKeyConfigured ? "已保存旧 Key" : "等待 Key")}</span>
-              </div>
 
-              <label className="form-block form-block-full">
-                <span className="field-label">{displayText("API Key")}</span>
-                <input
-                  className="search-input"
-                  type="password"
-                  placeholder={displayText(modelKeyConfigured ? "留空则保留当前 Key" : "粘贴厂商提供的 API Key")}
-                  value={apiKey}
-                  onChange={(event) => setApiKey(event.target.value)}
-                />
-              </label>
-
-              <div className="header-actions">
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={handleLoadModelCatalog}
-                  disabled={modelCatalogMutation.isPending || !canLoadCatalog}
-                >
-                  {modelCatalogMutation.isPending ? displayText("读取中...") : displayText("读取模型列表")}
-                </button>
-                <button
-                  className="secondary-button"
-                  type="button"
-                  onClick={handleProbeModelConfig}
-                  disabled={modelProbeMutation.isPending || !canProbeModel}
-                >
-                  {modelProbeMutation.isPending ? displayText("测试中...") : displayText("测试连接")}
-                </button>
-              </div>
-            </section>
-
-            <section className="settings-step-card">
-              <div className="settings-step-head">
-                <div>
-                  <p className="eyebrow">{displayText("模型")}</p>
-                  <h4>{displayText("聊天模型")}</h4>
+                <div className="settings-provider-console-sidebar-foot">
+                  <span className="subtle-pill">{displayText("当前选中")}</span>
+                  <strong>{displayText(activePreset.label)}</strong>
+                  <p className="field-hint">{displayText("预置会带默认地址；自定义适合第三方 OpenAI 兼容网关。")}</p>
                 </div>
-                <span className="subtle-pill">{displayText(modelCatalog.length ? `已读取 ${modelCatalog.length} 个` : "可后置处理")}</span>
-              </div>
+              </aside>
 
-              {!!modelCatalog.length && (
-                <div className="pill-row settings-model-chip-row">
-                  {modelCatalog.slice(0, 10).map((item) => (
-                    <button
-                      key={item}
-                      className={chatModel === item ? "primary-button" : "secondary-button"}
-                      type="button"
-                      onClick={() => setChatModel(item)}
-                    >
-                      {displayText(item)}
-                    </button>
-                  ))}
-                </div>
-              )}
-
-              <label className="form-block form-block-full">
-                <span className="field-label">{displayText("聊天模型")}</span>
-                <input
-                  className="search-input"
-                  list="chat-model-options"
-                  placeholder={displayText(activePreset.chatModel || "可手动输入模型名")}
-                  value={chatModel}
-                  onChange={(event) => setChatModel(event.target.value)}
-                />
-                <datalist id="chat-model-options">
-                  {chatModelSuggestions.map((item) => (
-                    <option key={item} value={item} />
-                  ))}
-                </datalist>
-              </label>
-            </section>
-          </div>
-
-          <div className="header-actions">
-            <button
-              className="primary-button"
-              type="button"
-              onClick={handleSaveModelConfig}
-              disabled={saveMutation.isPending || !canSaveModel}
-            >
-              {saveMutation.isPending ? displayText("保存中...") : displayText("保存模型")}
-            </button>
-          </div>
-
-          <details className="metadata-details advanced-details">
-            <summary>{displayText("高级")}</summary>
-            <div className="form-grid">
-              <label className="form-block">
-                <span className="field-label">{displayText("接口地址")}</span>
-                <input className="search-input" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
-              </label>
-              <label className="form-block">
-                <span className="field-label">{displayText("向量模型")}</span>
-                <input
-                  className="search-input"
-                  list="embedding-model-options"
-                  value={embeddingModel}
-                  onChange={(event) => setEmbeddingModel(event.target.value)}
-                />
-                <datalist id="embedding-model-options">
-                  {embeddingSuggestions.map((item) => (
-                    <option key={item} value={item} />
-                  ))}
-                </datalist>
-                {statusQuery.data?.models.embedding_model_mismatch && (
-                  <div className="field-hint field-hint-warning" style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-                    <span style={{ flex: 1 }}>
-                      ⚠ 当前向量模型（{embeddingModel}）与建索引时的模型（{statusQuery.data.models.index_embedding_model}）不一致，检索可能偏移。
-                    </span>
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-secondary"
-                      onClick={() => reindexMutation.mutate()}
-                      disabled={reindexMutation.isPending}
-                      style={{ flexShrink: 0 }}
-                    >
-                      {reindexMutation.isPending ? "重建中…" : "重建索引"}
-                    </button>
+              <div className="settings-provider-workspace">
+                <section className="settings-provider-workspace-hero">
+                  <div className="settings-provider-hero-main">
+                    <span className="settings-provider-hero-mark">{activePreset.label.slice(0, 1)}</span>
+                    <div>
+                      <p className="eyebrow">{displayText("Current Provider")}</p>
+                      <h4>{displayText(activePreset.label)}</h4>
+                      <p className="muted-text">{displayText(`${activePreset.description} · ${getParticipationModeLabel(modelParticipationMode)}`)}</p>
+                    </div>
                   </div>
-                )}
-              </label>
-            </div>
-          </details>
 
-          {(modelCatalogMutation.isPending || modelCatalogMutation.isError || modelCatalog.length > 0) && (
-            <article className="advanced-sheet settings-advanced-sheet">
-              {modelCatalogMutation.isPending && <p className="muted-text">{displayText("读取模型中...")}</p>}
-              {modelCatalogMutation.isError && <p className="error-text">{displayText((modelCatalogMutation.error as Error).message)}</p>}
-              {modelCatalog.length > 0 && (
-                <p className="muted-text">
-                  {displayText(
-                    modelCatalogUsesSavedKey ? "使用已保存 Key。" : "使用刚填写的 Key。",
-                  )}
-                </p>
-              )}
-            </article>
-          )}
+                  <div className="settings-provider-hero-badges">
+                    <span className="subtle-pill">{displayText(providerAccessModeLabel)}</span>
+                    <span className="subtle-pill">{displayText(providerTransportLabel)}</span>
+                    <span className="subtle-pill">
+                      {displayText(remoteApiMode ? (modelAuthReady ? "密钥已就绪" : "待填密钥") : "本机无需密钥")}
+                    </span>
+                  </div>
+                </section>
 
-          {(modelProbeMutation.isPending || modelProbeMutation.isError || modelProbeResult) && (
-            <article className="advanced-sheet settings-advanced-sheet">
-              {modelProbeMutation.isPending && <p className="muted-text">{displayText("测试中...")}</p>}
-              {modelProbeMutation.isError && <p className="error-text">{displayText((modelProbeMutation.error as Error).message)}</p>}
-              {modelProbeResult && (
-                <div className="simple-health-grid">
-                  <article className="metric-card">
-                    <span className="metric-label">{displayText("状态")}</span>
-                    <strong>{displayText(modelProbeResult.http_status ? `HTTP ${modelProbeResult.http_status}` : "已返回")}</strong>
+                <div className="settings-provider-summary-strip">
+                  <article className="settings-provider-summary-metric">
+                    <span>{displayText("运行方式")}</span>
+                    <strong>{displayText(providerAccessModeLabel)}</strong>
                   </article>
-                  <article className="metric-card">
-                    <span className="metric-label">{displayText("延迟")}</span>
-                    <strong>{displayText(modelProbeResult.latency_ms !== null ? `${modelProbeResult.latency_ms} ms` : "未返回")}</strong>
+                  <article className="settings-provider-summary-metric">
+                    <span>{displayText("接口协议")}</span>
+                    <strong>{displayText(providerTransportLabel)}</strong>
                   </article>
-                  <article className="metric-card">
-                    <span className="metric-label">{displayText("实际模型")}</span>
-                    <strong>{displayText(modelProbeResult.model || "未返回")}</strong>
+                  <article className="settings-provider-summary-metric">
+                    <span>{displayText("当前模型")}</span>
+                    <strong>{displayText(chatModel.trim() || "未填写")}</strong>
                   </article>
-                  {modelProbeUsesSavedKey && <p className="muted-text settings-inline-note">{displayText("使用已保存 Key。")}</p>}
+                  <article className="settings-provider-summary-metric">
+                    <span>{displayText("工作状态")}</span>
+                    <strong>{displayText(providerConnectionStateDisplay)}</strong>
+                  </article>
                 </div>
-              )}
-            </article>
-          )}
-        </article>
+
+                <div className="settings-provider-workspace-grid">
+
+                  <section className="settings-provider-sheet settings-provider-sheet-main">
+                    <div className="settings-provider-sheet-head">
+                      <div>
+                        <p className="eyebrow">{displayText("Connection")}</p>
+                        <h4>{displayText("连接配置")}</h4>
+                      </div>
+                      <div className="header-actions settings-provider-inline-actions">
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={handleLoadModelCatalog}
+                          disabled={modelCatalogMutation.isPending || !canLoadCatalog}
+                        >
+                          {modelCatalogMutation.isPending ? displayText("读取中...") : displayText("获取模型")}
+                        </button>
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={handleProbeModelConfig}
+                          disabled={modelProbeMutation.isPending || !canProbeModel}
+                        >
+                          {modelProbeMutation.isPending ? displayText("检查中...") : displayText("检查连接")}
+                        </button>
+                        <button
+                          className="primary-button"
+                          type="button"
+                          onClick={handleSaveModelConfig}
+                          disabled={saveMutation.isPending || !canSaveModel}
+                        >
+                          {saveMutation.isPending ? displayText("保存中...") : displayText("保存当前配置")}
+                        </button>
+                      </div>
+                    </div>
+
+                    <label className="form-block form-block-full">
+                      <span className="field-label">{displayText("API Key")}</span>
+                      <input
+                        className="search-input"
+                        type="password"
+                        placeholder={displayText(
+                          remoteApiMode
+                            ? modelKeyConfigured
+                              ? "留空则保留当前 Key"
+                              : "粘贴厂商提供的 API Key"
+                            : "本机模式通常不需要填写",
+                        )}
+                        value={apiKey}
+                        onChange={(event) => setApiKey(event.target.value)}
+                      />
+                    </label>
+
+                    <div className="form-grid">
+                      <label className="form-block">
+                        <span className="field-label">{displayText("API Host")}</span>
+                        <input
+                          className="search-input"
+                          placeholder={remoteApiMode ? "https://your-host.example.com" : "http://localhost:11434"}
+                          value={apiHost}
+                          onChange={(event) => handleApiHostChange(event.target.value)}
+                        />
+                      </label>
+                      <label className="form-block">
+                        <span className="field-label">{displayText("API Path（可选）")}</span>
+                        <input
+                          className="search-input"
+                          placeholder={remoteApiMode ? "留空时默认按 /v1 识别" : "/v1"}
+                          value={apiPath}
+                          onChange={(event) => setApiPath(event.target.value)}
+                        />
+                      </label>
+                    </div>
+
+                    {customProviderPathHintVisible && (
+                      <div className="field-hint field-hint-warning" style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                        <span style={{ flex: 1 }}>
+                          {displayText(
+                            customProviderAutoPathActive
+                              ? `当前只填了域名根地址，系统会先按 ${effectiveApiPath} 识别并生成接口地址。若你的平台文档写的是别的路径，再手动改 API Path 即可。`
+                              : "如果平台文档给的是完整 OpenAI 兼容地址，也可以直接粘贴到 API Host，系统会自动拆分出路径。",
+                          )}
+                        </span>
+                        {customProviderAutoPathActive && (
+                          <button className="secondary-button" type="button" onClick={applySuggestedApiPath}>
+                            {displayText("写入 /v1")}
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    <label className="form-block form-block-full">
+                      <span className="field-label">{displayText("聊天模型")}</span>
+                      <input
+                        className="search-input"
+                        list="chat-model-options"
+                        placeholder={displayText(activePreset.chatModel || "可手动输入模型名")}
+                        value={chatModel}
+                        onChange={(event) => setChatModel(event.target.value)}
+                      />
+                      <datalist id="chat-model-options">
+                        {chatModelSuggestions.map((item) => (
+                          <option key={item} value={item} />
+                        ))}
+                      </datalist>
+                    </label>
+
+                    {!!modelCatalog.length && (
+                      <div className="pill-row settings-model-chip-row">
+                        {modelCatalog.slice(0, 12).map((item) => (
+                          <button
+                            key={item}
+                            className={chatModel === item ? "primary-button" : "secondary-button"}
+                            type="button"
+                            onClick={() => setChatModel(item)}
+                          >
+                            {displayText(item)}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    <section className="settings-model-policy-panel">
+                      <div className="settings-provider-sheet-head">
+                        <div>
+                          <p className="eyebrow">{displayText("Policy")}</p>
+                          <h4>{displayText("模型参与策略")}</h4>
+                        </div>
+                        <span className="subtle-pill">{displayText(getParticipationModeLabel(modelParticipationMode))}</span>
+                      </div>
+
+                      <div className="settings-model-policy-grid">
+                        {MODEL_PARTICIPATION_OPTIONS.map((item) => (
+                          <button
+                            key={item.id}
+                            type="button"
+                            className={
+                              modelParticipationMode === item.id
+                                ? "settings-model-policy-card settings-model-policy-card-active"
+                                : "settings-model-policy-card"
+                            }
+                            onClick={() => setModelParticipationMode(item.id)}
+                          >
+                            <div>
+                              <strong>{displayText(item.label)}</strong>
+                              <span>{displayText(item.summary)}</span>
+                            </div>
+                            <p>{displayText(item.description)}</p>
+                          </button>
+                        ))}
+                      </div>
+                    </section>
+
+                    <p className="field-hint">
+                      {displayText(
+                        remoteApiMode
+                          ? providerId === "custom"
+                            ? "常见 OpenAI 兼容网关可直接填 Host + Key；留空 Path 时默认按 /v1 识别。"
+                            : "支持填写 Host + /v1，也支持直接贴完整 OpenAI 兼容地址。"
+                          : "本机模式通常只需要 localhost:11434 与 /v1。",
+                      )}
+                    </p>
+
+                    <details className="metadata-details advanced-details">
+                      <summary>{displayText("高级")}</summary>
+                      <div className="form-grid">
+                        <label className="form-block">
+                          <span className="field-label">{displayText("直接编辑 Base URL")}</span>
+                          <input
+                            className="search-input"
+                            value={effectiveBaseUrl}
+                            onChange={(event) => handleDirectBaseUrlChange(event.target.value)}
+                          />
+                        </label>
+                        <label className="form-block">
+                          <span className="field-label">{displayText("向量模型")}</span>
+                          <input
+                            className="search-input"
+                            list="embedding-model-options"
+                            value={embeddingModel}
+                            onChange={(event) => setEmbeddingModel(event.target.value)}
+                          />
+                          <datalist id="embedding-model-options">
+                            {embeddingSuggestions.map((item) => (
+                              <option key={item} value={item} />
+                            ))}
+                          </datalist>
+                          {statusQuery.data?.models.embedding_model_mismatch && (
+                            <div className="field-hint field-hint-warning" style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                              <span style={{ flex: 1 }}>
+                                ⚠ 当前向量模型（{embeddingModel}）与建索引时的模型（{statusQuery.data.models.index_embedding_model}）不一致，检索可能偏移。
+                              </span>
+                              <button
+                                type="button"
+                                className="btn btn-sm btn-secondary"
+                                onClick={() => reindexMutation.mutate()}
+                                disabled={reindexMutation.isPending}
+                                style={{ flexShrink: 0 }}
+                              >
+                                {reindexMutation.isPending ? "重建中…" : "重建索引"}
+                              </button>
+                            </div>
+                          )}
+                        </label>
+                      </div>
+                    </details>
+                  </section>
+
+                  <div className="settings-provider-side-stack">
+                    <section className="settings-provider-sheet">
+                      <div className="settings-provider-sheet-head">
+                        <div>
+                          <p className="eyebrow">{displayText("Endpoint")}</p>
+                          <h4>{displayText("端点与状态")}</h4>
+                        </div>
+                      </div>
+
+                      <div className="settings-provider-endpoint-list">
+                        <article className="settings-provider-endpoint-item">
+                          <span>{displayText("聊天请求")}</span>
+                          <strong>{displayText(resolvedChatEndpoint || "等待填写 Host / Path")}</strong>
+                        </article>
+                        <article className="settings-provider-endpoint-item">
+                          <span>{displayText("模型目录")}</span>
+                          <strong>{displayText(resolvedModelsEndpoint || "等待填写 Host / Path")}</strong>
+                        </article>
+                      </div>
+
+                      <div className="simple-health-grid">
+                        <article className="metric-card">
+                          <span className="metric-label">{displayText("模型目录")}</span>
+                          <strong>{displayText(modelCatalogStatusDisplay)}</strong>
+                        </article>
+                        <article className="metric-card">
+                          <span className="metric-label">{displayText("连接检测")}</span>
+                          <strong>{displayText(modelProbeStatusDisplay)}</strong>
+                        </article>
+                        <article className="metric-card">
+                          <span className="metric-label">{displayText("延迟")}</span>
+                          <strong>{displayText(modelProbeResult?.latency_ms !== null && modelProbeResult?.latency_ms !== undefined ? `${modelProbeResult.latency_ms} ms` : "—")}</strong>
+                        </article>
+                        <article className="metric-card">
+                          <span className="metric-label">{displayText("实际模型")}</span>
+                          <strong>{displayText(modelProbeResult?.model || chatModel.trim() || "—")}</strong>
+                        </article>
+                      </div>
+
+                      {modelCatalogMutation.isError && <p className="error-text">{displayText((modelCatalogMutation.error as Error).message)}</p>}
+                      {modelProbeMutation.isError && <p className="error-text">{displayText((modelProbeMutation.error as Error).message)}</p>}
+                      {modelCatalog.length > 0 && (
+                        <p className="field-hint">
+                          {displayText(
+                            modelCatalogUsesSavedKey ? `已读取 ${modelCatalog.length} 个模型，使用已保存 Key。` : `已读取 ${modelCatalog.length} 个模型。`,
+                          )}
+                        </p>
+                      )}
+                      {modelProbeResult && modelProbeUsesSavedKey && <p className="field-hint">{displayText("本次检测使用已保存 Key。")}</p>}
+                    </section>
+
+                    <section className="settings-provider-sheet settings-provider-profile-panel">
+                      <div className="settings-provider-sheet-head">
+                        <div>
+                          <p className="eyebrow">{displayText("Profiles")}</p>
+                          <h4>{displayText("本地档案")}</h4>
+                        </div>
+                        <span className="subtle-pill">
+                          {displayText(currentProviderProfiles.length ? `当前 provider ${currentProviderProfiles.length} 组` : "当前 provider 暂无档案")}
+                        </span>
+                      </div>
+
+                      <div className="settings-provider-profile-toolbar">
+                        <label className="form-block">
+                          <span className="field-label">{displayText("档案名称")}</span>
+                          <input
+                            className="search-input"
+                            placeholder={suggestedProfileName}
+                            value={profileDraftName}
+                            onChange={(event) => setProfileDraftName(event.target.value)}
+                          />
+                        </label>
+
+                        <div className="header-actions settings-provider-inline-actions">
+                          <button
+                            className="secondary-button"
+                            type="button"
+                            onClick={handleSaveCurrentProfile}
+                            disabled={!canSaveCurrentProfile}
+                          >
+                            {displayText("保存当前为档案")}
+                          </button>
+                          <button
+                            className="secondary-button"
+                            type="button"
+                            onClick={() => void handleExportCurrentProfile()}
+                            disabled={!canExportCurrentProfile}
+                          >
+                            {displayText("导出当前 JSON")}
+                          </button>
+                        </div>
+                      </div>
+
+                      {currentProviderProfiles.length > 0 ? (
+                        <div className="settings-profile-list">
+                          {currentProviderProfiles.map((profile) => {
+                            const profileBaseUrl = joinOpenAiCompatibleBaseUrl(profile.apiHost, profile.apiPath);
+                            const profileProvider = PROVIDER_PRESETS.find((item) => item.id === profile.providerId);
+                            return (
+                              <article className="settings-profile-card" key={profile.id}>
+                                <div className="settings-profile-meta">
+                                  <strong>{displayText(profile.name)}</strong>
+                                  <p className="muted-text">
+                                    {displayText(
+                                      `${profileProvider?.label || "自定义"} · ${profile.chatModel || "未填写模型"} · ${profileBaseUrl || "未填写地址"}`,
+                                    )}
+                                  </p>
+                                </div>
+                                <div className="header-actions">
+                                  <button
+                                    className="secondary-button"
+                                    type="button"
+                                    onClick={() => applyModelProfile(profile, `已套用档案：${profile.name}`)}
+                                  >
+                                    {displayText("套用")}
+                                  </button>
+                                  <button
+                                    className="secondary-button"
+                                    type="button"
+                                    onClick={() => void handleExportSavedProfile(profile)}
+                                  >
+                                    {displayText("导出 JSON")}
+                                  </button>
+                                  <button
+                                    className="secondary-button"
+                                    type="button"
+                                    onClick={() => handleDeleteModelProfile(profile)}
+                                  >
+                                    {displayText("删除")}
+                                  </button>
+                                </div>
+                              </article>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <article className="settings-provider-empty">
+                          <strong>{displayText("还没有本地档案")}</strong>
+                          <p className="muted-text">{displayText("保存当前配置后，这里就能快速切换。")}</p>
+                        </article>
+                      )}
+
+                      {otherProviderProfilesCount > 0 && (
+                        <p className="field-hint">{displayText(`另外还有 ${otherProviderProfilesCount} 组其他 provider 档案。`)}</p>
+                      )}
+
+                      <details className="metadata-details advanced-details">
+                        <summary>{displayText("导入 / 导出 JSON")}</summary>
+                        <textarea
+                          className="text-area"
+                          rows={8}
+                          placeholder={displayText("粘贴配置 JSON")}
+                          value={profileJsonDraft}
+                          onChange={(event) => setProfileJsonDraft(event.target.value)}
+                        />
+                        <div className="header-actions settings-provider-inline-actions" style={{ marginTop: 8 }}>
+                          <button className="secondary-button" type="button" onClick={handleImportProfileJson} disabled={!profileJsonDraft.trim()}>
+                            {displayText("导入并套用")}
+                          </button>
+                          <button className="secondary-button" type="button" onClick={() => setProfileJsonDraft("")} disabled={!profileJsonDraft.trim()}>
+                            {displayText("清空 JSON")}
+                          </button>
+                        </div>
+                      </details>
+                    </section>
+                  </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </article>
       </div>
 
       <div className="settings-secondary-grid">

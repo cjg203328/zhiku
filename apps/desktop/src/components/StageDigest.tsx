@@ -43,6 +43,10 @@ export default function StageDigest({
 
       <div className="stage-digest-grid">
         {items.map((item) => {
+          const summaryParagraphs = item.summary
+            .split(/\n+/)
+            .map((part) => part.trim())
+            .filter(Boolean);
           const content = (
             <>
               {item.imageUrl ? (
@@ -54,7 +58,13 @@ export default function StageDigest({
               <div className="stage-digest-copy">
                 <span className="eyebrow">{displayText(item.eyebrow)}</span>
                 <strong>{displayText(item.title)}</strong>
-                <p>{displayText(item.summary || "已保留阶段摘要。")}</p>
+                {summaryParagraphs.length > 0 ? (
+                  summaryParagraphs.map((paragraph, index) => (
+                    <p key={`${item.id}-summary-${index}`}>{displayText(paragraph)}</p>
+                  ))
+                ) : (
+                  <p>{displayText("已保留阶段摘要。")}</p>
+                )}
               </div>
             </>
           );

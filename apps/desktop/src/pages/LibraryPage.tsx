@@ -238,17 +238,6 @@ function formatDateTime(value: string | null | undefined) {
   return date.toLocaleString();
 }
 
-function buildQuickQuestions(detail: ContentDetail | undefined) {
-  if (!detail) return [];
-  const title = detail.title.trim();
-  if (!title) return [];
-  return [
-    `请概括《${title}》最值得记住的三个结论`,
-    `围绕《${title}》，还可以继续展开哪些问题`,
-    `如果把《${title}》整理成一页复盘，应该保留哪些信息`,
-  ];
-}
-
 const mockCards: LibraryCardItem[] = [
   {
     id: "demo-bilibili-001",
@@ -256,7 +245,7 @@ const mockCards: LibraryCardItem[] = [
     source: "Bilibili",
     sourceUrl: null,
     sourceFile: null,
-    summary: "把视频里的观点沉淀成结构化笔记，再继续追问和回看证据。",
+    summary: "把视频里的观点沉淀成结构化笔记，再继续追问和回看原文。",
     tags: ["学习", "AI", "知识管理"],
     coverUrl: null,
     parseMode: null,
@@ -505,8 +494,6 @@ export default function LibraryPage() {
   const noteCount = dedupedCards.filter((item) => item.noteStyle).length;
   const pendingJobs = pendingJobsQuery.data?.items ?? [];
   const notePreview = getNotePreview(detailQuery.data);
-  const quickQuestions = buildQuickQuestions(detailQuery.data);
-  const visibleQuickQuestions = quickQuestions.slice(0, 2);
   const transcriptSegmentCount = getTranscriptSegmentCount(detailQuery.data);
   const qualityScore = getQualityScore(detailQuery.data);
   const detailMetadata = getMetadata(detailQuery.data);
@@ -534,12 +521,6 @@ export default function LibraryPage() {
     [previewScreenshots, previewStageSeeds],
   );
 
-  function handleDelete(contentId: string, title: string) {
-    if (!window.confirm(displayText(`确认将《${title}》移入回收站吗？`))) {
-      return;
-    }
-    deleteMutation.mutate(contentId);
-  }
 
   function handleImportCompleted(payload: PendingFocusItem) {
     setActiveFilter("all");
@@ -585,101 +566,107 @@ export default function LibraryPage() {
             <ImportPanel onImportCompleted={handleImportCompleted} />
           </div>
 
-          <article className="card glass-panel bili-note-collection-card">
-            <div className="bili-note-section-head">
+          <details className="card glass-panel bili-note-collection-card">
+            <summary className="bili-note-collection-summary">
               <div>
-                <p className="eyebrow">{displayText("分组管理")}</p>
+                <p className="eyebrow">{displayText("分组")}</p>
                 <h3>{displayText("内容分组")}</h3>
               </div>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => setShowCollectionPanel((value) => !value)}
-              >
-                {displayText(showCollectionPanel ? "收起" : "新建分组")}
-              </button>
-            </div>
+              <span className="pill">{displayText(`${collections.length} 组`)}</span>
+            </summary>
 
-            {showCollectionPanel && (
-              <div className="bili-note-collection-create">
-                <input
-                  className="search-input"
-                  placeholder={displayText("输入分组名称")}
-                  value={newCollectionName}
-                  onChange={(event) => setNewCollectionName(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && newCollectionName.trim()) {
-                      createCollectionMutation.mutate(newCollectionName.trim());
-                    }
-                  }}
-                />
+            <div className="bili-note-collection-card-body">
+              <div className="header-actions">
                 <button
                   type="button"
-                  className="primary-button"
-                  disabled={!newCollectionName.trim() || createCollectionMutation.isPending}
-                  onClick={() => createCollectionMutation.mutate(newCollectionName.trim())}
+                  className="secondary-button"
+                  onClick={() => setShowCollectionPanel((value) => !value)}
                 >
-                  {displayText(createCollectionMutation.isPending ? "创建中..." : "创建")}
+                  {displayText(showCollectionPanel ? "收起" : "新建分组")}
                 </button>
               </div>
-            )}
 
-            <div className="bili-note-collection-list">
-              <button
-                type="button"
-                className={activeCollectionId === null ? "collection-item collection-item-active" : "collection-item"}
-                onClick={() => setActiveCollectionId(null)}
-              >
-                <span className="collection-item-icon">●</span>
-                <span className="collection-item-name">{displayText("全部内容")}</span>
-              </button>
-              {collections.map((collection: Collection) => (
-                <div className="bili-note-collection-row" key={collection.id}>
+              {showCollectionPanel && (
+                <div className="bili-note-collection-create">
+                  <input
+                    className="search-input"
+                    placeholder={displayText("输入分组名称")}
+                    value={newCollectionName}
+                    onChange={(event) => setNewCollectionName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && newCollectionName.trim()) {
+                        createCollectionMutation.mutate(newCollectionName.trim());
+                      }
+                    }}
+                  />
                   <button
                     type="button"
-                    className={activeCollectionId === collection.id ? "collection-item collection-item-active" : "collection-item"}
-                    onClick={() => setActiveCollectionId(collection.id)}
+                    className="primary-button"
+                    disabled={!newCollectionName.trim() || createCollectionMutation.isPending}
+                    onClick={() => createCollectionMutation.mutate(newCollectionName.trim())}
                   >
-                    <span className="collection-item-icon" style={{ color: collection.color }}>{collection.icon}</span>
-                    <span className="collection-item-name">{collection.name}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="collection-item-delete collection-item-delete-visible"
-                    title={displayText("删除分组")}
-                    onClick={() => deleteCollectionMutation.mutate(collection.id)}
-                  >
-                    ×
+                    {displayText(createCollectionMutation.isPending ? "创建中..." : "创建")}
                   </button>
                 </div>
-              ))}
-            </div>
+              )}
 
-            {selectedCard && !selectedCard.isDemo && collections.length > 0 && (
-              <div className="bili-note-collection-assign">
-                <p className="eyebrow">{displayText("当前卡片快捷归档")}</p>
-                <div className="pill-row">
-                  {collections.map((collection) => (
+              <div className="bili-note-collection-list">
+                <button
+                  type="button"
+                  className={activeCollectionId === null ? "collection-item collection-item-active" : "collection-item"}
+                  onClick={() => setActiveCollectionId(null)}
+                >
+                  <span className="collection-item-icon">{"●"}</span>
+                  <span className="collection-item-name">{displayText("全部内容")}</span>
+                </button>
+                {collections.map((collection: Collection) => (
+                  <div className="bili-note-collection-row" key={collection.id}>
                     <button
-                      key={collection.id}
+                      type="button"
+                      className={activeCollectionId === collection.id ? "collection-item collection-item-active" : "collection-item"}
+                      onClick={() => setActiveCollectionId(collection.id)}
+                    >
+                      <span className="collection-item-icon" style={{ color: collection.color }}>{collection.icon}</span>
+                      <span className="collection-item-name">{collection.name}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="collection-item-delete collection-item-delete-visible"
+                      title={displayText("删除分组")}
+                      onClick={() => deleteCollectionMutation.mutate(collection.id)}
+                    >
+                      {"×"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              {selectedCard && !selectedCard.isDemo && collections.length > 0 && (
+                <div className="bili-note-collection-assign">
+                  <p className="eyebrow">{displayText("当前卡片快捷归档")}</p>
+                  <div className="pill-row">
+                    {collections.map((collection) => (
+                      <button
+                        key={collection.id}
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => assignCollectionMutation.mutate({ contentId: selectedCard.id, collectionId: collection.id })}
+                      >
+                        {displayText(collection.name)}
+                      </button>
+                    ))}
+                    <button
                       type="button"
                       className="secondary-button"
-                      onClick={() => assignCollectionMutation.mutate({ contentId: selectedCard.id, collectionId: collection.id })}
+                      onClick={() => assignCollectionMutation.mutate({ contentId: selectedCard.id, collectionId: null })}
                     >
-                      {displayText(collection.name)}
+                      {displayText("移出分组")}
                     </button>
-                  ))}
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => assignCollectionMutation.mutate({ contentId: selectedCard.id, collectionId: null })}
-                  >
-                    {displayText("移出分组")}
-                  </button>
+                  </div>
                 </div>
-              </div>
-            )}
-          </article>
+              )}
+            </div>
+          </details>
         </div>
 
         <div className="bili-note-column bili-note-column-center">
@@ -925,12 +912,14 @@ export default function LibraryPage() {
                       <strong>{displayText(getSourceDescription(selectedCard.source))}</strong>
                     </article>
                     <article className="bili-note-metric-card">
-                      <span>{displayText("片段")}</span>
+                      <span>{displayText("材料")}</span>
                       <strong>
                         {displayText(
                           transcriptSegmentCount > 0
-                            ? `${transcriptSegmentCount} 证据 / ${detailQuery.data.chunks.length} 检索`
-                            : `${detailQuery.data.chunks.length} 检索`,
+                            ? `原文 ${transcriptSegmentCount} 段`
+                            : detailQuery.data.chunks.length > 0
+                              ? `已整理 ${detailQuery.data.chunks.length} 段`
+                              : "待补齐",
                         )}
                       </strong>
                     </article>
@@ -964,28 +953,9 @@ export default function LibraryPage() {
                   )}
 
                   <article className="bili-note-preview-block bili-note-preview-block-compact">
-                    <div className="bili-note-preview-block-head">
-                      <div>
-                        <p className="eyebrow">{displayText("快捷入口")}</p>
-                      </div>
-                    </div>
-                    {!!visibleQuickQuestions.length && (
-                      <div className="pill-row chip-grid">
-                        {visibleQuickQuestions.map((question) => (
-                          <Link
-                            key={question}
-                            className="secondary-button button-link suggestion-chip"
-                            to={`/chat?q=${encodeURIComponent(question)}&contentId=${detailQuery.data.id}&title=${encodeURIComponent(detailQuery.data.title)}`}
-                          >
-                            {displayText(question)}
-                          </Link>
-                        ))}
-                      </div>
-                    )}
                     <div className="pill-row bili-note-preview-meta-pills">
                       <span className="pill">{displayText(`作者 ${detailQuery.data.author || "未知"}`)}</span>
                       <span className="pill">{displayText(`更新 ${formatDateTime(detailQuery.data.updated_at)}`)}</span>
-                      <span className="pill">{displayText(`检索 ${detailQuery.data.chunks.length}`)}</span>
                     </div>
                     <div className="tag-row-soft bili-note-preview-tag-row">
                       {(detailQuery.data.tags.length ? detailQuery.data.tags : ["暂无标签"]).slice(0, 4).map((tag) => (
@@ -1004,16 +974,8 @@ export default function LibraryPage() {
                       className="secondary-button button-link"
                       to={`/chat?q=${encodeURIComponent(detailQuery.data.title)}&contentId=${detailQuery.data.id}&title=${encodeURIComponent(detailQuery.data.title)}`}
                     >
-                      {displayText("提问")}
+                      {displayText("进入问答")}
                     </Link>
-                    <button
-                      className="danger-button"
-                      type="button"
-                      disabled={deleteMutation.isPending && deleteMutation.variables === detailQuery.data.id}
-                      onClick={() => handleDelete(detailQuery.data.id, detailQuery.data.title)}
-                    >
-                      {displayText(deleteMutation.isPending && deleteMutation.variables === detailQuery.data.id ? "删除中..." : "删除")}
-                    </button>
                   </div>
                 </>
               )

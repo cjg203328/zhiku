@@ -21,6 +21,8 @@ class ChatRequest(BaseModel):
     content_id: str | None = None
     chunk_id: str | None = None
     session_id: str | None = None
+    chat_model: str | None = None
+    web_search_enabled: bool = False
 
 
 class SaveNoteCitation(BaseModel):
@@ -56,30 +58,43 @@ class ChatSessionTurnRequest(BaseModel):
 
 @router.post("")
 def chat_once(payload: ChatRequest, request: Request) -> dict:
-    repository = LibraryRepository(request.app.state.container.settings.db_path)
+    runtime_settings = request.app.state.container.settings
+    if payload.chat_model and payload.chat_model.strip():
+        runtime_settings = runtime_settings.model_copy(deep=True)
+        runtime_settings.chat_model = payload.chat_model.strip()
+    repository = LibraryRepository(runtime_settings.db_path)
     session = repository.get_chat_session(payload.session_id.strip()) if payload.session_id else None
     try:
-        result = ChatService(request.app.state.container.settings).answer(
+        result = ChatService(runtime_settings).answer(
             payload.query,
             repository=repository,
             limit=payload.limit,
             content_id=payload.content_id,
             chunk_id=payload.chunk_id,
             session_messages=(session or {}).get("messages") if session else None,
+            web_search_enabled=payload.web_search_enabled,
         )
     except LlmGatewayError as exc:
         raise HTTPException(status_code=503, detail={"error": True, "error_code": exc.classification or "llm_unavailable", "message": str(exc)}) from exc
     return {
         "query": payload.query,
+        "runtime": {
+            "chat_model": runtime_settings.chat_model,
+            "web_search_enabled": payload.web_search_enabled,
+        },
         **result,
     }
 
 
 @router.post("/stream")
 def stream_chat(payload: ChatRequest, request: Request) -> StreamingResponse:
-    repository = LibraryRepository(request.app.state.container.settings.db_path)
+    runtime_settings = request.app.state.container.settings
+    if payload.chat_model and payload.chat_model.strip():
+        runtime_settings = runtime_settings.model_copy(deep=True)
+        runtime_settings.chat_model = payload.chat_model.strip()
+    repository = LibraryRepository(runtime_settings.db_path)
     session = repository.get_chat_session(payload.session_id.strip()) if payload.session_id else None
-    service = ChatService(request.app.state.container.settings)
+    service = ChatService(runtime_settings)
     try:
         result = service.answer(
             payload.query,
@@ -88,6 +103,7 @@ def stream_chat(payload: ChatRequest, request: Request) -> StreamingResponse:
             content_id=payload.content_id,
             chunk_id=payload.chunk_id,
             session_messages=(session or {}).get("messages") if session else None,
+            web_search_enabled=payload.web_search_enabled,
         )
     except LlmGatewayError as exc:
         error_payload = json.dumps({"error": True, "error_code": exc.classification or "llm_unavailable", "message": str(exc)}, ensure_ascii=False)
@@ -99,7 +115,7 @@ def stream_chat(payload: ChatRequest, request: Request) -> StreamingResponse:
     low_recall = bool(quality.get("low_recall") or quality.get("level") in ("low", "empty"))
 
     def event_stream():
-        yield f"event: meta\ndata: {json.dumps({'query': payload.query, 'mode': result['mode'], 'content_id': payload.content_id, 'chunk_id': payload.chunk_id, 'session_id': payload.session_id, 'retrieval': result.get('retrieval', {}), 'quality': quality}, ensure_ascii=False)}\n\n"
+        yield f"event: meta\ndata: {json.dumps({'query': payload.query, 'mode': result['mode'], 'content_id': payload.content_id, 'chunk_id': payload.chunk_id, 'session_id': payload.session_id, 'chat_model': runtime_settings.chat_model, 'web_search_enabled': payload.web_search_enabled, 'retrieval': result.get('retrieval', {}), 'quality': quality}, ensure_ascii=False)}\n\n"
         for chunk in answer_chunks:
             yield f"event: message\ndata: {json.dumps({'chunk': chunk}, ensure_ascii=False)}\n\n"
         yield f"event: done\ndata: {json.dumps({'citations': result['citations'], 'follow_ups': result.get('follow_ups', []), 'retrieval': result.get('retrieval', {}), 'quality': quality, 'low_recall': low_recall}, ensure_ascii=False)}\n\n"

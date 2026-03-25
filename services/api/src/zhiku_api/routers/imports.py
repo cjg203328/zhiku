@@ -8,8 +8,10 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from ..config import DEFAULT_NOTE_GENERATION_MODE
 from ..repositories import LibraryRepository
 from ..services import ImportService
+from ..services.import_service import normalize_note_generation_mode
 
 router = APIRouter(prefix="/api/v1/imports", tags=["imports"])
 
@@ -18,17 +20,24 @@ class UrlImportRequest(BaseModel):
     url: str = Field(min_length=1)
     note_style: str = Field(default="structured")
     summary_focus: str = Field(default="")
+    note_generation_mode: str = Field(default=DEFAULT_NOTE_GENERATION_MODE)
     async_mode: bool = False
 
 
 class FileImportRequest(BaseModel):
     file_path: str = Field(min_length=1)
+    note_style: str = Field(default="structured")
+    summary_focus: str = Field(default="")
+    note_generation_mode: str = Field(default=DEFAULT_NOTE_GENERATION_MODE)
     async_mode: bool = False
 
 
 class FileUploadRequest(BaseModel):
     filename: str = Field(min_length=1)
     content_base64: str = Field(min_length=1)
+    note_style: str = Field(default="structured")
+    summary_focus: str = Field(default="")
+    note_generation_mode: str = Field(default=DEFAULT_NOTE_GENERATION_MODE)
     async_mode: bool = False
 
 
@@ -103,8 +112,10 @@ def _run_import_job(
     source_value: str,
     note_style: str = "structured",
     summary_focus: str = "",
+    note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
     content_base64: str | None = None,
 ) -> None:
+    resolved_note_generation_mode = normalize_note_generation_mode(note_generation_mode)
     repository = LibraryRepository(getattr(settings, "db_path"))
     import_service = ImportService(settings, bilibili_session_broker=bilibili_session_broker)
     current = repository.get_import_job(job_id)
@@ -116,6 +127,7 @@ def _run_import_job(
             source_kind=source_kind,
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=resolved_note_generation_mode,
         )
     )
     runtime_preview = dict(fallback_preview)
@@ -263,6 +275,7 @@ def _run_import_job(
                 source_value,
                 note_style=note_style,
                 summary_focus=summary_focus,
+                note_generation_mode=resolved_note_generation_mode,
                 progress_callback=update_runtime_progress,
             )
         elif source_kind == "file":
@@ -270,6 +283,7 @@ def _run_import_job(
                 source_value,
                 note_style=note_style,
                 summary_focus=summary_focus,
+                note_generation_mode=resolved_note_generation_mode,
             )
         elif source_kind == "file_upload":
             if content_base64 is None:
@@ -279,6 +293,7 @@ def _run_import_job(
                 content_base64,
                 note_style=note_style,
                 summary_focus=summary_focus,
+                note_generation_mode=resolved_note_generation_mode,
             )
         else:
             raise ValueError(f"不支持的导入类型：{source_kind}")
@@ -343,8 +358,10 @@ def _handle_import(
     async_mode: bool,
     note_style: str = "structured",
     summary_focus: str = "",
+    note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
     content_base64: str | None = None,
 ) -> dict:
+    resolved_note_generation_mode = normalize_note_generation_mode(note_generation_mode)
     container = request.app.state.container
     settings = container.settings
     repository = LibraryRepository(settings.db_path)
@@ -356,6 +373,7 @@ def _handle_import(
             source_kind=source_kind,
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=resolved_note_generation_mode,
         )
         job = repository.create_import_job(
             source_kind=source_kind,
@@ -374,6 +392,7 @@ def _handle_import(
             source_value=source_value,
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=resolved_note_generation_mode,
             content_base64=content_base64,
         )
         return {"job": job, "content": None}
@@ -381,17 +400,27 @@ def _handle_import(
     try:
         if source_kind == "url":
             preview = import_service.import_url(
-                source_value, note_style=note_style, summary_focus=summary_focus
+                source_value,
+                note_style=note_style,
+                summary_focus=summary_focus,
+                note_generation_mode=resolved_note_generation_mode,
             )
         elif source_kind == "file":
             preview = import_service.build_file_preview(
-                source_value, note_style=note_style, summary_focus=summary_focus
+                source_value,
+                note_style=note_style,
+                summary_focus=summary_focus,
+                note_generation_mode=resolved_note_generation_mode,
             )
         elif source_kind == "file_upload":
             if content_base64 is None:
                 raise ValueError("上传文件内容缺失")
             preview = import_service.build_uploaded_file_preview(
-                source_value, content_base64, note_style=note_style, summary_focus=summary_focus
+                source_value,
+                content_base64,
+                note_style=note_style,
+                summary_focus=summary_focus,
+                note_generation_mode=resolved_note_generation_mode,
             )
         else:
             raise ValueError(f"不支持的导入类型：{source_kind}")
@@ -418,6 +447,7 @@ def import_url(payload: UrlImportRequest, request: Request, background_tasks: Ba
         async_mode=payload.async_mode,
         note_style=payload.note_style,
         summary_focus=payload.summary_focus,
+        note_generation_mode=payload.note_generation_mode,
     )
 
 
@@ -429,6 +459,9 @@ def import_file(payload: FileImportRequest, request: Request, background_tasks: 
         source_kind="file",
         source_value=payload.file_path,
         async_mode=payload.async_mode,
+        note_style=payload.note_style,
+        summary_focus=payload.summary_focus,
+        note_generation_mode=payload.note_generation_mode,
     )
 
 
@@ -440,6 +473,9 @@ def import_file_upload(payload: FileUploadRequest, request: Request, background_
         source_kind="file_upload",
         source_value=payload.filename,
         async_mode=payload.async_mode,
+        note_style=payload.note_style,
+        summary_focus=payload.summary_focus,
+        note_generation_mode=payload.note_generation_mode,
         content_base64=payload.content_base64,
     )
 

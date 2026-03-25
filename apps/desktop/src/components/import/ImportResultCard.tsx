@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 import { useLanguage } from "../../lib/language";
-import type { NoteQuality } from "../../lib/api";
+import type { NoteGenerationMode, NoteQuality } from "../../lib/api";
 import FailureGuideCard from "./FailureGuideCard";
 import StageDigest from "../StageDigest";
 import {
@@ -39,14 +39,37 @@ function getNoteStyleLabel(value: string) {
   return "结构版";
 }
 
-function getCaptureStrategyPill(metadata: Record<string, unknown>) {
-  if (metadata.subtitle_ytdlp_fallback_used === true || metadata.audio_ytdlp_fallback_used === true) {
-    return "yt-dlp 兜底";
+function getNoteGenerationModeLabel(value: unknown) {
+  if (value === "model_draft") return "模型成稿";
+  if (value === "local_only") return "本地整理";
+  return "混合模式";
+}
+
+function getCaptureGapItems(noteQuality: NoteQuality | null) {
+  const rawItems = noteQuality?.capture_gap_report?.items;
+  if (!Array.isArray(rawItems)) {
+    return [] as Array<{ label: string; detail: string; severity: string }>;
   }
-  if (typeof metadata.subtitle_fetch_strategy === "string" || typeof metadata.audio_fetch_strategy === "string") {
-    return "原生采集";
+  return rawItems
+    .map((item) => ({
+      label: item.label?.trim() || "",
+      detail: item.detail?.trim() || item.label?.trim() || "",
+      severity: item.severity || "info",
+    }))
+    .filter((item) => item.label || item.detail);
+}
+
+function getCoverageMissingSections(noteQuality: NoteQuality | null) {
+  const rawItems = noteQuality?.note_coverage_report?.missing_sections;
+  if (!Array.isArray(rawItems)) {
+    return [] as Array<{ label: string; excerpt: string }>;
   }
-  return "";
+  return rawItems
+    .map((item) => ({
+      label: item.label?.trim() || item.position?.trim() || "",
+      excerpt: item.excerpt?.trim() || "",
+    }))
+    .filter((item) => item.label || item.excerpt);
 }
 
 function buildSettingsLink(focus?: string) {
@@ -73,33 +96,39 @@ type Props = {
   shouldOfferReparse: boolean;
   recoveryHints: RecoveryHint[];
   shouldShowRecoveryPanel: boolean;
-  transcriptSegmentCount: number;
-  evidenceSnippet: string;
-  summaryFocus: string;
   isReparsePending: boolean;
   isReparseSuccess: boolean;
   reparseMessage?: string;
   isReparseError: boolean;
   reparseErrorMessage?: string;
+  reparseNoteGenerationMode: NoteGenerationMode;
+  onReparseNoteGenerationModeChange: (value: NoteGenerationMode) => void;
   onReparse: () => void;
   onReset: () => void;
 };
+
+const REPARSE_MODE_ITEMS: Array<{ value: NoteGenerationMode; label: string }> = [
+  { value: "model_draft", label: "模型成稿" },
+  { value: "hybrid", label: "混合模式" },
+  { value: "local_only", label: "本地整理" },
+];
 
 export default function ImportResultCard({
   preview, metadata, noteQuality, noteStyle,
   importDiagnostics, importIssues, importNeedsSettings,
   firstQuestions, shouldOfferReparse, recoveryHints, shouldShowRecoveryPanel,
-  transcriptSegmentCount, evidenceSnippet,
   isReparsePending, isReparseSuccess, reparseMessage, isReparseError, reparseErrorMessage,
+  reparseNoteGenerationMode, onReparseNoteGenerationModeChange,
   onReparse, onReset,
 }: Props) {
   const { displayText } = useLanguage();
   const statusTone = getStatusTone(preview.status);
-  const captureStrategyPill = getCaptureStrategyPill(metadata);
   const captureSummary = typeof metadata.capture_summary === "string" ? metadata.capture_summary.trim() : "";
   const captureAction = typeof metadata.capture_recommended_action === "string" ? metadata.capture_recommended_action.trim() : "";
   const visibleRecoveryHints = recoveryHints.slice(0, 3);
   const visibleFirstQuestions = firstQuestions.slice(0, 3);
+  const captureGapItems = getCaptureGapItems(noteQuality).slice(0, 3);
+  const coverageMissingSections = getCoverageMissingSections(noteQuality).slice(0, 3);
   const previewScreenshots = parseNoteScreenshots(metadata);
   const previewStageSeeds = preview.key_points.length
     ? buildStageDigestSeeds(preview.key_points, {
@@ -136,9 +165,7 @@ export default function ImportResultCard({
           <span className={`result-badge result-badge-${statusTone.tone}`}>{displayText(statusTone.label)}</span>
           <span className="pill">{displayText(preview.platform || "未知来源")}</span>
           <span className="pill">{displayText(getNoteStyleLabel(noteStyle))}</span>
-          {captureStrategyPill && <span className="pill">{displayText(captureStrategyPill)}</span>}
-          {typeof noteQuality?.score === "number" && <span className="pill">{displayText(`质量 ${noteQuality.score}`)}</span>}
-          {metadata.llm_enhanced === true && <span className="pill">{displayText("模型增强")}</span>}
+          <span className="pill">{displayText(getNoteGenerationModeLabel(metadata.note_generation_mode))}</span>
           {metadata.noisy_asr_detected === true && <span className="pill">{displayText("转写噪声")}</span>}
         </div>
       </div>
@@ -156,6 +183,32 @@ export default function ImportResultCard({
         <strong>{displayText(statusTone.hint)}</strong>
         <p>{displayText(resultCalloutBody)}</p>
       </article>
+
+      {(captureGapItems.length > 0 || coverageMissingSections.length > 0) && (
+        <details className="smart-inline-details smart-inline-details-block">
+          <summary>{displayText("缺口")}</summary>
+          <div className="smart-inline-panel">
+            {!!captureGapItems.length && (
+              <div className="smart-issue-list">
+                {captureGapItems.map((item) => (
+                  <p className="muted-text" key={`${item.label}-${item.detail}`}>
+                    {displayText(item.detail || item.label)}
+                  </p>
+                ))}
+              </div>
+            )}
+            {!!coverageMissingSections.length && (
+              <div className="smart-issue-list">
+                {coverageMissingSections.map((item) => (
+                  <p className="muted-text" key={`${item.label}-${item.excerpt}`}>
+                    {displayText(item.excerpt ? `${item.label}：${item.excerpt}` : item.label)}
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+        </details>
+      )}
 
       {isReparseSuccess && (
         <article className="result-callout">
@@ -184,25 +237,6 @@ export default function ImportResultCard({
           </div>
         </details>
       )}
-
-      <div className="result-metric-strip result-metric-strip-compact">
-        <article className="result-metric-card">
-          <span>{displayText("要点")}</span>
-          <strong>{displayText(String(preview.key_points.length))}</strong>
-        </article>
-        <article className="result-metric-card">
-          <span>{displayText("问答")}</span>
-          <strong>{displayText(
-            noteQuality?.question_answer_ready ? "可提问" : noteQuality?.retrieval_ready ? "可检索" : "待补强",
-          )}</strong>
-        </article>
-        <article className="result-metric-card">
-          <span>{displayText("证据")}</span>
-          <strong>{displayText(
-            transcriptSegmentCount > 0 ? String(transcriptSegmentCount) : evidenceSnippet ? "已生成" : "较弱",
-          )}</strong>
-        </article>
-      </div>
 
       {!!previewStageDigestItems.length && (
         <StageDigest
@@ -275,6 +309,24 @@ export default function ImportResultCard({
         >
           {displayText("问答")}
         </Link>
+        {shouldOfferReparse && preview.content_id && (
+          <div className="result-reparse-mode-box">
+            <span>{displayText("重解析成稿")}</span>
+            <div className="segment-rail result-reparse-mode-rail">
+              {REPARSE_MODE_ITEMS.map((item) => (
+                <button
+                  key={item.value}
+                  type="button"
+                  className={reparseNoteGenerationMode === item.value ? "segment-pill segment-pill-active" : "segment-pill"}
+                  onClick={() => onReparseNoteGenerationModeChange(item.value)}
+                  disabled={isReparsePending}
+                >
+                  {displayText(item.label)}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         {shouldOfferReparse && preview.content_id && (
           <button
             className="secondary-button"

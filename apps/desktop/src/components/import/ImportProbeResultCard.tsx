@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import { useLanguage } from "../../lib/language";
+import type { NoteGenerationMode } from "../../lib/api";
 import StageDigest from "../StageDigest";
 import { buildStageDigestCards, buildStageDigestSeeds, splitStageDigestText } from "../../lib/stageDigest";
 
@@ -30,6 +31,12 @@ function getNoteStyleLabel(value: string) {
   if (value === "qa") return "问答版";
   if (value === "brief") return "速览版";
   return "结构版";
+}
+
+function getNoteGenerationModeLabel(value: NoteGenerationMode) {
+  if (value === "model_draft") return "模型成稿";
+  if (value === "local_only") return "本地整理";
+  return "混合模式";
 }
 
 function getNoteStyleDescription(noteStyle: string, summaryFocus: string) {
@@ -64,6 +71,7 @@ type Props = {
   isProbePending: boolean;
   noteStyle: string;
   summaryFocus: string;
+  noteGenerationMode: NoteGenerationMode;
   onDirectImport: () => void;
   onCollapse: () => void;
 };
@@ -71,7 +79,7 @@ type Props = {
 export default function ImportProbeResultCard({
   probe, probeDiagnostics, probeIssues, probeNeedsSettings,
   urlValue, isUrlPending, isProbePending,
-  noteStyle, summaryFocus,
+  noteStyle, summaryFocus, noteGenerationMode,
   onDirectImport, onCollapse,
 }: Props) {
   const { displayText } = useLanguage();
@@ -107,6 +115,7 @@ export default function ImportProbeResultCard({
             {displayText(tone.label)}
           </span>
           <span className="pill">{displayText(noteStyleLabel)}</span>
+          <span className="pill">{displayText(getNoteGenerationModeLabel(noteGenerationMode))}</span>
         </div>
       </div>
       <div className="smart-diagnostic-strip">

@@ -7,11 +7,18 @@ from typing import Any
 from urllib import request as urllib_request
 from urllib.parse import urlparse
 
-from ..config import AppSettings
+from ..config import AppSettings, DEFAULT_NOTE_GENERATION_MODE, NOTE_GENERATION_MODES
 from .llm_gateway import LlmGateway
 
 
 CONTENT_HINTS = ("article", "content", "post", "entry", "main", "body", "text", "detail", "read")
+
+
+def _normalize_note_generation_mode(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in NOTE_GENERATION_MODES:
+        return candidate
+    return DEFAULT_NOTE_GENERATION_MODE
 
 
 class WebpageParseError(RuntimeError):
@@ -81,7 +88,15 @@ class WebpageService:
         self.timeout_seconds = timeout_seconds
         self.llm_gateway = LlmGateway(settings) if settings is not None else None
 
-    def parse(self, raw_url: str, *, note_style: str = "structured", summary_focus: str = "") -> dict[str, Any]:
+    def parse(
+        self,
+        raw_url: str,
+        *,
+        note_style: str = "structured",
+        summary_focus: str = "",
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
+    ) -> dict[str, Any]:
+        resolved_note_generation_mode = _normalize_note_generation_mode(note_generation_mode)
         url = self._normalize_url(raw_url)
         html = self._fetch_html(url)
         title = self._extract_title(html) or self._host_title(url)
@@ -113,22 +128,12 @@ class WebpageService:
             content_text=content_text,
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=resolved_note_generation_mode,
         )
         if llm_enhanced is not None:
             summary = llm_enhanced.get("summary") or summary
             key_points = llm_enhanced.get("key_points") or key_points
-            if note_style == "bilinote":
-                note_markdown = self._build_note_markdown(
-                    title=title,
-                    url=url,
-                    summary=summary,
-                    key_points=key_points,
-                    content_text=content_text,
-                    note_style=note_style,
-                    summary_focus=summary_focus,
-                )
-            else:
-                note_markdown = llm_enhanced.get("note_markdown") or note_markdown
+            note_markdown = llm_enhanced.get("note_markdown") or note_markdown
 
         return {
             "source_type": "url",
@@ -152,6 +157,7 @@ class WebpageService:
                 "extracted_text_length": len(content_text),
                 "note_style": note_style,
                 "summary_focus": summary_focus,
+                "note_generation_mode": resolved_note_generation_mode,
                 "note_markdown": note_markdown,
                 "llm_enhanced": bool(llm_enhanced),
                 "model_provider": self.settings.model_provider if self.settings is not None else "builtin",
@@ -331,8 +337,11 @@ class WebpageService:
         content_text: str,
         note_style: str,
         summary_focus: str,
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
     ) -> dict[str, Any] | None:
         if self.llm_gateway is None:
+            return None
+        if _normalize_note_generation_mode(note_generation_mode) == "local_only":
             return None
         return self.llm_gateway.enhance_import_result(
             title=title,

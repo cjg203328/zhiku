@@ -91,15 +91,54 @@ function normalizeReadableChinese(text: string) {
     return text;
   }
 
-  return text
+  const normalized = text
     .replace(/,/g, "，")
     .replace(/;/g, "；")
     .replace(/\?/g, "？")
     .replace(/!/g, "！")
     .replace(/(?<=[\u4e00-\u9fff]):(?=[\u4e00-\u9fffA-Za-z0-9])/g, "：")
+    .trim();
+  return restoreReadableChinesePunctuation(normalized)
     .replace(/\s*([，。！？；：])\s*/g, "$1")
     .replace(/([，。！？；：…])\1+/g, "$1")
     .trim();
+}
+
+function chunkLongChineseRun(text: string, chunkSize = 28) {
+  const chunks = text.match(new RegExp(`.{1,${chunkSize}}`, "g")) ?? [text];
+  return chunks
+    .map((chunk, index) => {
+      const cleaned = chunk.trim();
+      if (!cleaned) return "";
+      if (cleaned.endsWith("，") || cleaned.endsWith("。") || cleaned.endsWith("！") || cleaned.endsWith("？") || cleaned.endsWith("；")) {
+        return cleaned;
+      }
+      return `${cleaned}${index === chunks.length - 1 ? "。" : "，"}`;
+    })
+    .join("");
+}
+
+function restoreReadableChinesePunctuation(text: string) {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (!compact || compact.length < 28) {
+    return compact;
+  }
+
+  const punctuationDensity = (compact.match(/[，。！？；：、“”]/g)?.length ?? 0) / Math.max(compact.length, 1);
+  if (punctuationDensity >= 0.014) {
+    return compact;
+  }
+
+  let repaired = compact
+    .replace(/(?<=[\u4e00-\u9fffA-Za-z0-9）】」])(?=(?:但是|不过|然而|所以|因此|另外|同时|接下来|随后|最后|总之|换句话说|这也说明|这意味着))/g, "。")
+    .replace(/(?<=[\u4e00-\u9fffA-Za-z0-9）】」])(?=(?:而是|因为|如果|并且|而且|其中|尤其|比如|例如))/g, "，")
+    .replace(/(?<=[\u4e00-\u9fffA-Za-z0-9）】」])(?=(?:它|这|那|今年|现在|随后|接着|再往后))/g, "。");
+
+  if ((repaired.match(/[。！？；]/g)?.length ?? 0) === 0 && repaired.length >= 72) {
+    repaired = chunkLongChineseRun(repaired);
+  }
+
+  return repaired;
 }
 
 function looksPromotional(text: string) {
@@ -178,6 +217,17 @@ function splitReadableParagraphs(text: string) {
     .filter(Boolean);
   if (parts.length <= 1) {
     return [text];
+  }
+
+  if ((text.match(/[。！？；]/g)?.length ?? 0) === 0 && text.length >= 84) {
+    const repaired = restoreReadableChinesePunctuation(text);
+    const repairedParts = repaired
+      .split(/(?<=[。！？；])/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (repairedParts.length > 1) {
+      return regroupParagraphParts(repairedParts);
+    }
   }
 
   return regroupParagraphParts(parts);

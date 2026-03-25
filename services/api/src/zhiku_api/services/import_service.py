@@ -10,6 +10,7 @@ import re
 from typing import Any, Callable
 from uuid import uuid4
 
+from ..config import DEFAULT_NOTE_GENERATION_MODE, NOTE_GENERATION_MODES
 from .bilibili_service import BilibiliParseError, BilibiliService, TranscriptSegment
 from .bilibili_session_broker import BilibiliSessionBroker
 from .content_link_service import build_seek_url
@@ -64,6 +65,13 @@ BILIBILI_PATTERNS = (
 )
 
 
+def normalize_note_generation_mode(value: Any) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate in NOTE_GENERATION_MODES:
+        return candidate
+    return DEFAULT_NOTE_GENERATION_MODE
+
+
 class ImportService:
     def __init__(
         self,
@@ -89,8 +97,10 @@ class ImportService:
         *,
         note_style: str = "structured",
         summary_focus: str = "",
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
         progress_callback: Callable[[str, int, str | None, dict[str, Any] | None], None] | None = None,
     ) -> dict:
+        resolved_note_generation_mode = normalize_note_generation_mode(note_generation_mode)
         platform = self._detect_platform(url)
         if platform == "bilibili":
             try:
@@ -98,9 +108,16 @@ class ImportService:
                     url,
                     note_style=note_style,
                     summary_focus=summary_focus,
+                    note_generation_mode=resolved_note_generation_mode,
                     progress_callback=progress_callback,
                 )
-                return self._attach_import_metadata(parsed, import_mode="parsed", note_style=note_style, summary_focus=summary_focus)
+                return self._attach_import_metadata(
+                    parsed,
+                    import_mode="parsed",
+                    note_style=note_style,
+                    summary_focus=summary_focus,
+                    note_generation_mode=resolved_note_generation_mode,
+                )
             except BilibiliParseError as exc:
                 preview = self.build_url_preview(url)
                 error_code = _classify_error(exc)
@@ -115,11 +132,13 @@ class ImportService:
                 preview["metadata"]["error_code"] = error_code.value
                 preview["metadata"]["note_style"] = note_style
                 preview["metadata"]["summary_focus"] = summary_focus
+                preview["metadata"]["note_generation_mode"] = resolved_note_generation_mode
                 return self._attach_import_metadata(
                     preview,
                     import_mode="fallback_preview",
                     note_style=note_style,
                     summary_focus=summary_focus,
+                    note_generation_mode=resolved_note_generation_mode,
                 )
             except Exception as exc:
                 preview = self.build_url_preview(url)
@@ -135,16 +154,29 @@ class ImportService:
                 preview["metadata"]["error_code"] = error_code.value
                 preview["metadata"]["note_style"] = note_style
                 preview["metadata"]["summary_focus"] = summary_focus
+                preview["metadata"]["note_generation_mode"] = resolved_note_generation_mode
                 return self._attach_import_metadata(
                     preview,
                     import_mode="fallback_preview",
                     note_style=note_style,
                     summary_focus=summary_focus,
+                    note_generation_mode=resolved_note_generation_mode,
                 )
         if platform == "webpage":
             try:
-                parsed = self.webpage_service.parse(url, note_style=note_style, summary_focus=summary_focus)
-                return self._attach_import_metadata(parsed, import_mode="parsed", note_style=note_style, summary_focus=summary_focus)
+                parsed = self.webpage_service.parse(
+                    url,
+                    note_style=note_style,
+                    summary_focus=summary_focus,
+                    note_generation_mode=resolved_note_generation_mode,
+                )
+                return self._attach_import_metadata(
+                    parsed,
+                    import_mode="parsed",
+                    note_style=note_style,
+                    summary_focus=summary_focus,
+                    note_generation_mode=resolved_note_generation_mode,
+                )
             except WebpageParseError as exc:
                 preview = self.build_url_preview(url)
                 error_code = _classify_error(exc)
@@ -160,11 +192,13 @@ class ImportService:
                 preview["metadata"]["note_style"] = note_style
                 preview["metadata"]["summary_focus"] = summary_focus
                 preview["metadata"]["content_source"] = "unavailable"
+                preview["metadata"]["note_generation_mode"] = resolved_note_generation_mode
                 return self._attach_import_metadata(
                     preview,
                     import_mode="fallback_preview",
                     note_style=note_style,
                     summary_focus=summary_focus,
+                    note_generation_mode=resolved_note_generation_mode,
                 )
             except Exception as exc:
                 preview = self.build_url_preview(url)
@@ -181,14 +215,22 @@ class ImportService:
                 preview["metadata"]["note_style"] = note_style
                 preview["metadata"]["summary_focus"] = summary_focus
                 preview["metadata"]["content_source"] = "unavailable"
+                preview["metadata"]["note_generation_mode"] = resolved_note_generation_mode
                 return self._attach_import_metadata(
                     preview,
                     import_mode="fallback_preview",
                     note_style=note_style,
                     summary_focus=summary_focus,
+                    note_generation_mode=resolved_note_generation_mode,
                 )
         preview = self.build_url_preview(url)
-        return self._attach_import_metadata(preview, import_mode="preview", note_style=note_style, summary_focus=summary_focus)
+        return self._attach_import_metadata(
+            preview,
+            import_mode="preview",
+            note_style=note_style,
+            summary_focus=summary_focus,
+            note_generation_mode=resolved_note_generation_mode,
+        )
 
     def build_pending_preview(
         self,
@@ -197,7 +239,9 @@ class ImportService:
         source_kind: str,
         note_style: str = "structured",
         summary_focus: str = "",
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
     ) -> dict[str, Any]:
+        resolved_note_generation_mode = normalize_note_generation_mode(note_generation_mode)
         is_file_source = source_kind in {"file", "file_upload"}
         platform = self._detect_platform(source_value)
         source_name = Path(source_value).name if is_file_source else source_value.strip()
@@ -226,6 +270,7 @@ class ImportService:
                 "import_mode": "queued",
                 "note_style": note_style,
                 "summary_focus": summary_focus,
+                "note_generation_mode": resolved_note_generation_mode,
                 "content_source": "pending",
                 "job_source_kind": source_kind,
             },
@@ -264,13 +309,21 @@ class ImportService:
             "status": "preview_ready",
         }
 
-    def build_file_preview(self, file_path: str, *, note_style: str = "structured", summary_focus: str = "") -> dict:
+    def build_file_preview(
+        self,
+        file_path: str,
+        *,
+        note_style: str = "structured",
+        summary_focus: str = "",
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
+    ) -> dict:
         preview = self.file_parse_service.extract(file_path)
         return self._attach_import_metadata(
             preview,
             import_mode="parsed",
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=normalize_note_generation_mode(note_generation_mode),
         )
 
     def build_uploaded_file_preview(
@@ -280,6 +333,7 @@ class ImportService:
         *,
         note_style: str = "structured",
         summary_focus: str = "",
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
     ) -> dict:
         if not filename.strip():
             raise ValueError("文件名不能为空")
@@ -302,6 +356,7 @@ class ImportService:
             import_mode="parsed",
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=normalize_note_generation_mode(note_generation_mode),
         )
 
     def upgrade_existing_content(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -350,11 +405,13 @@ class ImportService:
         import_mode = str(metadata.get("import_mode") or "upgraded")
         note_style = str(metadata.get("note_style") or "structured")
         summary_focus = str(metadata.get("summary_focus") or "")
+        note_generation_mode = normalize_note_generation_mode(metadata.get("note_generation_mode"))
         return self._attach_import_metadata(
             upgraded,
             import_mode=import_mode,
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=note_generation_mode,
         )
 
     def _detect_platform(self, value: str) -> str:
@@ -380,16 +437,20 @@ class ImportService:
         import_mode: str,
         note_style: str,
         summary_focus: str,
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
     ) -> dict[str, Any]:
+        resolved_note_generation_mode = normalize_note_generation_mode(note_generation_mode)
         payload.setdefault("metadata", {})
         payload["metadata"]["import_mode"] = import_mode
         payload["metadata"]["note_style"] = note_style
         payload["metadata"]["summary_focus"] = summary_focus
+        payload["metadata"]["note_generation_mode"] = resolved_note_generation_mode
         self.initial_material_service.prepare(payload)
         self._apply_llm_note_enhancement(
             payload,
             note_style=note_style,
             summary_focus=summary_focus,
+            note_generation_mode=resolved_note_generation_mode,
         )
         self._refresh_refined_note_markdown(
             payload,
@@ -419,11 +480,17 @@ class ImportService:
         *,
         note_style: str,
         summary_focus: str,
+        note_generation_mode: str = DEFAULT_NOTE_GENERATION_MODE,
     ) -> None:
+        resolved_note_generation_mode = normalize_note_generation_mode(note_generation_mode)
         if self.llm_gateway is None or not self.llm_gateway.is_enabled():
             return
 
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        metadata["note_generation_mode"] = resolved_note_generation_mode
+        if resolved_note_generation_mode == "local_only":
+            payload["metadata"] = metadata
+            return
         if metadata.get("llm_enhanced") is True:
             return
 
@@ -436,7 +503,9 @@ class ImportService:
             return
         if status in {"preview_ready", "needs_cookie", "needs_asr", "asr_failed"}:
             return
-        if len(content_text) < 180 and len(summary) < 60:
+        if resolved_note_generation_mode != "model_draft" and len(content_text) < 120 and len(summary) < 48:
+            return
+        if resolved_note_generation_mode == "model_draft" and len(content_text) < 40 and len(summary) < 20:
             return
 
         source_reference = (
@@ -466,6 +535,7 @@ class ImportService:
             metadata["refined_note_markdown"] = note_markdown
         metadata["llm_enhanced"] = True
         metadata["llm_enhanced_source"] = "import_service"
+        metadata["note_generation_mode_resolved"] = "model_draft" if resolved_note_generation_mode == "model_draft" else "hybrid"
         payload["metadata"] = metadata
 
     def _refresh_refined_note_markdown(
@@ -483,14 +553,166 @@ class ImportService:
             note_style=note_style,
             summary_focus=summary_focus,
         )
-        if not clean_note:
-            return
-
         existing_note = str(metadata.get("refined_note_markdown") or metadata.get("note_markdown") or "").strip()
-        if existing_note and existing_note != clean_note and not metadata.get("baseline_note_markdown"):
+        preferred_note = self._select_preferred_refined_note_markdown(
+            payload,
+            note_style=note_style,
+            llm_note_markdown=existing_note if metadata.get("llm_enhanced") is True else "",
+            fallback_markdown=clean_note,
+        )
+        if not preferred_note:
+            return
+        stabilized_note = self._stabilize_refined_note_markdown(preferred_note)
+        metadata["note_output_quality"] = self._summarize_note_markdown_quality(stabilized_note)
+
+        if existing_note and existing_note != stabilized_note and not metadata.get("baseline_note_markdown"):
             metadata["baseline_note_markdown"] = existing_note
-        metadata["note_markdown"] = clean_note
-        metadata["refined_note_markdown"] = clean_note
+        metadata["note_markdown"] = stabilized_note
+        metadata["refined_note_markdown"] = stabilized_note
+
+    def _stabilize_refined_note_markdown(self, markdown: str) -> str:
+        lines = str(markdown or "").replace("\r\n", "\n").split("\n")
+        if not any(line.strip() for line in lines):
+            return ""
+
+        normalized_lines: list[str] = []
+        seen_paragraphs: set[str] = set()
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                if normalized_lines and normalized_lines[-1] != "":
+                    normalized_lines.append("")
+                continue
+
+            if re.match(r"^#{2,3}\s+", line):
+                if normalized_lines and normalized_lines[-1] != "":
+                    normalized_lines.append("")
+                normalized_lines.append(line)
+                normalized_lines.append("")
+                continue
+
+            if re.match(r"^[-*]\s+", line):
+                bullet_body = line[2:].strip()
+                bullet_text = self._polish_note_prose(bullet_body, max_length=120)
+                if not bullet_text or self._is_low_signal_note_line(bullet_text):
+                    continue
+                signature = re.sub(r"\s+", "", bullet_text.lower())
+                if signature in seen_paragraphs:
+                    continue
+                seen_paragraphs.add(signature)
+                normalized_lines.append(f"- {bullet_text}")
+                continue
+
+            paragraph_parts = self._build_note_paragraphs(line, max_length=260, max_sentences=2, max_chars=92)
+            for part in paragraph_parts:
+                paragraph = self._polish_note_prose(part, max_length=220)
+                if not paragraph or self._is_low_signal_note_line(paragraph):
+                    continue
+                signature = re.sub(r"\s+", "", paragraph.lower())
+                if signature in seen_paragraphs:
+                    continue
+                seen_paragraphs.add(signature)
+                normalized_lines.append(paragraph)
+                normalized_lines.append("")
+
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(normalized_lines)).strip()
+
+    def _summarize_note_markdown_quality(self, markdown: str) -> dict[str, Any]:
+        note = str(markdown or "").strip()
+        if not note:
+            return {
+                "section_count": 0,
+                "paragraph_count": 0,
+                "bullet_count": 0,
+                "max_paragraph_length": 0,
+                "duplicate_hits": 0,
+                "punctuation_density": 0.0,
+            }
+
+        sections = len(re.findall(r"(?m)^##\s+", note))
+        bullets = len(re.findall(r"(?m)^[-*]\s+", note))
+        paragraphs = [
+            line.strip()
+            for line in note.splitlines()
+            if line.strip() and not line.startswith("## ") and not line.startswith("### ") and not re.match(r"^[-*]\s+", line.strip())
+        ]
+        signatures: set[str] = set()
+        duplicate_hits = 0
+        for item in paragraphs:
+            signature = re.sub(r"\s+", "", item.lower())[:48]
+            if signature in signatures:
+                duplicate_hits += 1
+                continue
+            signatures.add(signature)
+        punctuation_density = len(re.findall(r"[，。；：、“”！？,.!?;:]", note)) / max(len(note), 1)
+        return {
+            "section_count": sections,
+            "paragraph_count": len(paragraphs),
+            "bullet_count": bullets,
+            "max_paragraph_length": max((len(item) for item in paragraphs), default=0),
+            "duplicate_hits": duplicate_hits,
+            "punctuation_density": round(punctuation_density, 4),
+        }
+
+    def _select_preferred_refined_note_markdown(
+        self,
+        payload: dict[str, Any],
+        *,
+        note_style: str,
+        llm_note_markdown: str,
+        fallback_markdown: str,
+    ) -> str:
+        fallback = str(fallback_markdown or "").strip()
+        primary = self._normalize_model_note_markdown(llm_note_markdown)
+        if not primary:
+            return fallback
+
+        platform = str(payload.get("platform") or "").strip().lower()
+        if note_style == "bilinote" and platform == "bilibili":
+            return self._append_missing_note_sections(
+                primary,
+                fallback,
+                section_titles=("时间线笔记", "片段整理"),
+            )
+        return primary
+
+    def _normalize_model_note_markdown(self, markdown: str) -> str:
+        cleaned = str(markdown or "").replace("\r\n", "\n").strip()
+        if not cleaned:
+            return ""
+        required_titles = ("## 核心结论", "## 精炼正文", "## 重点摘录")
+        if not all(title in cleaned for title in required_titles):
+            return ""
+        return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    def _append_missing_note_sections(
+        self,
+        primary_markdown: str,
+        fallback_markdown: str,
+        *,
+        section_titles: tuple[str, ...],
+    ) -> str:
+        merged = primary_markdown.strip()
+        for title in section_titles:
+            if f"## {title}" in merged:
+                continue
+            section = self._extract_note_section(fallback_markdown, title)
+            if not section:
+                continue
+            merged = f"{merged}\n\n{section.strip()}"
+        return re.sub(r"\n{3,}", "\n\n", merged).strip()
+
+    def _extract_note_section(self, markdown: str, title: str) -> str:
+        if not markdown.strip():
+            return ""
+        pattern = rf"(?ms)^##\s+{re.escape(title)}\s*\n(.*?)(?=^##\s+|\Z)"
+        match = re.search(pattern, markdown)
+        if not match:
+            return ""
+        body = match.group(1).strip()
+        if not body:
+            return ""
+        return f"## {title}\n\n{body}"
 
     def _build_refined_note_markdown(
         self,
@@ -1243,8 +1465,90 @@ class ImportService:
         return lines
 
     def _split_note_sentences(self, text: str) -> list[str]:
-        parts = re.split(r"(?<=[。！？；!?])\s*", text)
-        return [part.strip() for part in parts if part.strip()]
+        parts = [part.strip() for part in re.split(r"(?<=[。！？；!?])\s*", text) if part.strip()]
+        if not parts:
+            return []
+
+        sentences: list[str] = []
+        for part in parts:
+            sentences.extend(self._split_overlong_note_sentence(part))
+        return [item.strip() for item in sentences if item.strip()]
+
+    def _split_overlong_note_sentence(self, sentence: str, *, target_chars: int = 52, hard_cap: int = 74) -> list[str]:
+        cleaned = sentence.strip()
+        if not cleaned or len(cleaned) <= hard_cap:
+            return [cleaned] if cleaned else []
+
+        terminal = cleaned[-1] if cleaned[-1] in "。！？；" else "。"
+        body = cleaned[:-1].strip() if cleaned[-1] in "。！？；" else cleaned
+        clauses = self._split_note_clause_units(body)
+        if len(clauses) <= 1:
+            return [self._ensure_note_sentence_terminal(self._chunk_note_clause(body), terminal)]
+
+        sentences: list[str] = []
+        buffer = ""
+        for clause in clauses:
+            normalized_clause = clause.strip().lstrip("，；、")
+            if not normalized_clause:
+                continue
+            candidate = self._join_note_clause_units(buffer, normalized_clause) if buffer else normalized_clause
+            if buffer and (len(candidate) > hard_cap or len(buffer) >= target_chars):
+                sentences.append(self._ensure_note_sentence_terminal(buffer, "。"))
+                buffer = normalized_clause
+                continue
+            buffer = candidate
+
+        if buffer:
+            sentences.append(self._ensure_note_sentence_terminal(buffer, terminal))
+        return [item for item in sentences if item]
+
+    def _split_note_clause_units(self, text: str) -> list[str]:
+        cleaned = text.strip()
+        if not cleaned:
+            return []
+
+        comma_units = [item.strip() for item in re.split(r"(?<=[，；])", cleaned) if item.strip()]
+        expanded: list[str] = []
+        connector_pattern = (
+            r"(?<=[\u4e00-\u9fffA-Za-z0-9）】」])"
+            r"(?=(?:但是|不过|然而|所以|因此|另外|同时|接下来|随后|最后|总之|换句话说|这也说明|这意味着|"
+            r"首先|其次|其中|尤其|比如|例如|其实|现在|这就是|问题是|更重要的是|核心在于|再往后|接着))"
+        )
+        for unit in comma_units or [cleaned]:
+            parts = [item.strip() for item in re.split(connector_pattern, unit) if item.strip()]
+            expanded.extend(parts or [unit.strip()])
+
+        if len(expanded) <= 1 and len(cleaned) >= 88:
+            return [item.strip() for item in re.findall(r".{1,30}", cleaned) if item.strip()]
+        return expanded or [cleaned]
+
+    def _join_note_clause_units(self, left: str, right: str) -> str:
+        if not left:
+            return right.strip()
+        if not right:
+            return left.strip()
+        stripped_left = left.rstrip()
+        stripped_right = right.lstrip("，；、")
+        if stripped_left.endswith(("，", "；", "：")):
+            return f"{stripped_left}{stripped_right}"
+        return f"{stripped_left}，{stripped_right}"
+
+    def _ensure_note_sentence_terminal(self, text: str, terminal: str = "。") -> str:
+        cleaned = text.strip().rstrip("，；、,; ")
+        if not cleaned:
+            return ""
+        if cleaned.endswith(("。", "！", "？", "；", "...", "…")):
+            return cleaned
+        return f"{cleaned}{terminal}"
+
+    def _chunk_note_clause(self, text: str, *, chunk_size: int = 30) -> str:
+        chunks = [item.strip() for item in re.findall(rf".{{1,{chunk_size}}}", text) if item.strip()]
+        if len(chunks) <= 1:
+            return text.strip()
+        return "".join(
+            chunk if chunk.endswith(("，", "；", "。", "！", "？")) else f"{chunk}{'。' if index == len(chunks) - 1 else '，'}"
+            for index, chunk in enumerate(chunks)
+        )
 
     def _polish_note_prose(
         self,
@@ -1263,6 +1567,8 @@ class ImportService:
             cleaned = cleaned.replace("?", "？")
             cleaned = cleaned.replace("!", "！")
             cleaned = re.sub(r"(?<=[\u4e00-\u9fff]):(?=[\u4e00-\u9fffA-Za-z0-9])", "：", cleaned)
+            cleaned = self._restore_missing_note_punctuation(cleaned)
+            cleaned = "".join(self._split_note_sentences(cleaned)).strip() or cleaned
 
         cleaned = re.sub(r"\s*([，。！？；：])\s*", r"\1", cleaned)
         cleaned = re.sub(r"([，。！？；：…])\1+", r"\1", cleaned)
@@ -1270,6 +1576,51 @@ class ImportService:
         if ensure_terminal and cleaned and not cleaned.endswith(("...", "…")) and cleaned[-1] not in "。！？；":
             cleaned += "。"
         return cleaned
+
+    def _restore_missing_note_punctuation(self, text: str) -> str:
+        compact = re.sub(r"\s+", " ", text or "").strip()
+        if len(compact) < 28:
+            return compact
+
+        punctuation_count = len(re.findall(r"[，。！？；：、“”,.!?;:]", compact))
+        punctuation_density = punctuation_count / max(len(compact), 1)
+        if punctuation_density >= 0.014:
+            return compact
+
+        repaired = compact
+        repaired = re.sub(
+            r"(?<=[\u4e00-\u9fffA-Za-z0-9）】」])(?=(?:但是|不过|然而|所以|因此|另外|同时|接下来|随后|最后|总之|换句话说|这也说明|这意味着))",
+            "。",
+            repaired,
+        )
+        repaired = re.sub(
+            r"(?<=[\u4e00-\u9fffA-Za-z0-9）】」])(?=(?:而是|因为|如果|并且|而且|其中|尤其|比如|例如))",
+            "，",
+            repaired,
+        )
+        repaired = re.sub(
+            r"(?<=[\u4e00-\u9fffA-Za-z0-9）】」])(?=(?:它|这|那|今年|现在|随后|接着|再往后|这就是|问题是|更重要的是|核心在于))",
+            "。",
+            repaired,
+        )
+
+        comma_parts = [item.strip() for item in re.split(r"(?<=[，；])", repaired) if item.strip()]
+        if len(comma_parts) >= 3 and len(repaired) >= 96 and not re.search(r"[。！？；]", repaired):
+            grouped: list[str] = []
+            buffer = ""
+            for part in comma_parts:
+                buffer = self._join_note_clause_units(buffer, part) if buffer else part
+                if len(buffer) >= 48:
+                    grouped.append(self._ensure_note_sentence_terminal(buffer, "。"))
+                    buffer = ""
+            if buffer:
+                grouped.append(self._ensure_note_sentence_terminal(buffer, "。"))
+            repaired = "".join(grouped)
+
+        if not re.search(r"[。！？；]", repaired) and len(repaired) >= 72:
+            repaired = self._chunk_note_clause(repaired, chunk_size=28)
+
+        return repaired
 
     def _clean_note_line(self, value: Any, *, max_length: int | None = None) -> str:
         cleaned = str(value or "")

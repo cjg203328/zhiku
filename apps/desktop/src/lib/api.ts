@@ -150,6 +150,7 @@ export type AppSettings = {
     embedding_model: string;
     llm_api_base_url?: string;
     llm_api_key_configured?: boolean;
+    participation_mode?: string;
   };
   asr?: {
     selected?: boolean;
@@ -196,6 +197,7 @@ export type SettingsUpdatePayload = {
     embedding_model?: string;
     llm_api_base_url?: string;
     llm_api_key?: string;
+    participation_mode?: string;
   };
   asr?: {
     provider?: string;
@@ -330,6 +332,35 @@ export type NoteQualityDimension = {
   applicable?: boolean;
 };
 
+export type NoteQualityIssue = {
+  code?: string;
+  label?: string;
+  severity?: "success" | "info" | "warning" | string;
+  detail?: string;
+};
+
+export type NoteCoverageSection = {
+  label?: string;
+  position?: string;
+  excerpt?: string;
+};
+
+export type CaptureGapReport = {
+  blocked?: boolean;
+  gap_count?: number;
+  summary?: string;
+  items?: NoteQualityIssue[];
+};
+
+export type NoteCoverageReport = {
+  coverage_ratio?: number;
+  covered_units?: number;
+  total_units?: number;
+  summary?: string;
+  missing_positions?: string[];
+  missing_sections?: NoteCoverageSection[];
+};
+
 export type NoteQuality = {
   score?: number;
   level?: string;
@@ -348,6 +379,12 @@ export type NoteQuality = {
   semantic_score?: number;
   agent_ready?: boolean;
   llm_enhanced?: boolean;
+  source_reliability_score?: number;
+  coverage_score?: number;
+  note_structure_score?: number;
+  high_confidence_answer_ready?: boolean;
+  capture_gap_report?: CaptureGapReport;
+  note_coverage_report?: NoteCoverageReport;
   sort_score?: number;
   dimensions?: Record<string, NoteQualityDimension>;
   source_type?: string;
@@ -355,6 +392,8 @@ export type NoteQuality = {
   content_type?: string;
   capture_status?: string;
 };
+
+export type NoteGenerationMode = "local_only" | "hybrid" | "model_draft";
 
 export type ChatCitation = {
   content_id: string;
@@ -375,6 +414,8 @@ export type ChatRequestOptions = {
   contentId?: string;
   chunkId?: string;
   sessionId?: string;
+  chatModel?: string;
+  webSearchEnabled?: boolean;
 };
 
 export type ChatResponse = {
@@ -478,6 +519,7 @@ export type ContentItem = {
 export type UrlImportOptions = {
   noteStyle?: string;
   summaryFocus?: string;
+  noteGenerationMode?: NoteGenerationMode;
   asyncMode?: boolean;
 };
 
@@ -539,6 +581,7 @@ export type UpdateContentPayload = {
 export type ReparseContentPayload = {
   note_style?: string;
   summary_focus?: string;
+  note_generation_mode?: NoteGenerationMode;
   async_mode?: boolean;
 };
 
@@ -861,6 +904,8 @@ export function chatOnce(query: string, options?: ChatRequestOptions) {
       content_id: options?.contentId,
       chunk_id: options?.chunkId,
       session_id: options?.sessionId,
+      chat_model: options?.chatModel,
+      web_search_enabled: options?.webSearchEnabled,
     }),
   });
 }
@@ -940,6 +985,8 @@ export async function streamChat(
       content_id: options?.contentId,
       chunk_id: options?.chunkId,
       session_id: options?.sessionId,
+      chat_model: options?.chatModel,
+      web_search_enabled: options?.webSearchEnabled,
     }),
   });
 
@@ -1070,6 +1117,7 @@ export function createUrlImport(url: string, options?: UrlImportOptions) {
       url,
       note_style: options?.noteStyle ?? "structured",
       summary_focus: options?.summaryFocus ?? "",
+      note_generation_mode: options?.noteGenerationMode ?? "hybrid",
       async_mode: options?.asyncMode ?? false,
     }),
   });
@@ -1090,11 +1138,17 @@ export function getImportJob(jobId: string) {
   return readJson<ImportJob>(`/api/v1/imports/${jobId}`);
 }
 
-export function createFileImport(filePath: string, options?: { asyncMode?: boolean }) {
+export function createFileImport(
+  filePath: string,
+  options?: { noteStyle?: string; summaryFocus?: string; noteGenerationMode?: NoteGenerationMode; asyncMode?: boolean },
+) {
   return readJson<ImportResponse>("/api/v1/imports/file", {
     method: "POST",
     body: JSON.stringify({
       file_path: filePath,
+      note_style: options?.noteStyle ?? "structured",
+      summary_focus: options?.summaryFocus ?? "",
+      note_generation_mode: options?.noteGenerationMode ?? "hybrid",
       async_mode: options?.asyncMode ?? false,
     }),
   });
@@ -1113,7 +1167,10 @@ function arrayBufferToBase64(buffer: ArrayBuffer) {
   return btoa(binary);
 }
 
-export async function uploadFileImport(file: File, options?: { asyncMode?: boolean }) {
+export async function uploadFileImport(
+  file: File,
+  options?: { noteStyle?: string; summaryFocus?: string; noteGenerationMode?: NoteGenerationMode; asyncMode?: boolean },
+) {
   const contentBase64 = arrayBufferToBase64(await file.arrayBuffer());
 
   return readJson<ImportResponse>("/api/v1/imports/file-upload", {
@@ -1121,6 +1178,9 @@ export async function uploadFileImport(file: File, options?: { asyncMode?: boole
     body: JSON.stringify({
       filename: file.name,
       content_base64: contentBase64,
+      note_style: options?.noteStyle ?? "structured",
+      summary_focus: options?.summaryFocus ?? "",
+      note_generation_mode: options?.noteGenerationMode ?? "hybrid",
       async_mode: options?.asyncMode ?? false,
     }),
   });

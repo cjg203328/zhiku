@@ -1,4 +1,5 @@
 import { API_BASE_URL } from "./api";
+import { normalizeReadableChinese, splitReadableParagraphs } from "./readableNote";
 
 export type ParsedNoteScreenshot = {
   id: string;
@@ -65,6 +66,16 @@ function resolveAssetUrl(value: string) {
   return `${API_BASE_URL}/${cleaned}`;
 }
 
+function normalizeReadableSummary(value: string) {
+  return value
+    .replace(/\r/g, "\n")
+    .split(/\n+/)
+    .map((line) => normalizeReadableChinese(line))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
 export function parseNoteScreenshots(metadata: Record<string, unknown> | null | undefined) {
   const raw = metadata?.note_screenshots;
   if (!Array.isArray(raw)) return [] as ParsedNoteScreenshot[];
@@ -100,15 +111,17 @@ export function parseNoteScreenshots(metadata: Record<string, unknown> | null | 
 }
 
 export function splitStageDigestText(value: string, limit = 4) {
-  const normalized = value.replace(/\r/g, "\n").trim();
+  const normalized = normalizeReadableSummary(value.replace(/\r/g, "\n")).trim();
   if (!normalized) return [] as string[];
 
-  return normalized
+  const parts = normalized
     .split(/\n+/)
+    .flatMap((line) => splitReadableParagraphs(line))
     .flatMap((line) => line.split(/(?<=[。！？.!?])/))
     .map((item) => item.replace(/\s+/g, " ").trim())
-    .filter(Boolean)
-    .slice(0, Math.max(1, limit));
+    .filter(Boolean);
+
+  return parts.slice(0, Math.max(1, limit));
 }
 
 export function buildStageDigestSeeds(
@@ -122,7 +135,7 @@ export function buildStageDigestSeeds(
     const input = inputs[index];
     const item = typeof input === "string" ? { summary: input } : input;
     const title = item.title?.trim() || `${options.titlePrefix ?? "阶段"} ${index + 1}`;
-    const summary = item.summary?.trim() || "";
+    const summary = normalizeReadableSummary(item.summary?.trim() || "");
 
     if (!title && !summary) {
       continue;
@@ -164,11 +177,12 @@ export function buildStageDigestCards(
       screenshot?.timestampLabel ||
       screenshot?.rangeLabel ||
       `阶段 ${index + 1}`;
-    const summary =
+    const summary = normalizeReadableSummary(
       seed?.summary?.trim() ||
       screenshot?.caption?.trim() ||
       screenshot?.sourceText?.trim() ||
-      "";
+      "",
+    );
 
     if (!title && !summary && !screenshot?.imageUrl) {
       continue;

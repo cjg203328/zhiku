@@ -1,11 +1,10 @@
 import { Suspense, lazy } from "react";
-import { NavLink, Route, Routes } from "react-router-dom";
+import { Navigate, NavLink, Route, Routes } from "react-router-dom";
 import { Home, BookOpen, MessageCircle, Trash2, Settings } from "lucide-react";
 import { useLanguage, type AppLanguage } from "./lib/language";
 import ErrorBoundary from "./components/ErrorBoundary";
 import ToastContainer from "./components/ToastContainer";
 
-const StartupPage = lazy(() => import("./pages/StartupPage"));
 const OnboardingPage = lazy(() => import("./pages/OnboardingPage"));
 const LibraryPage = lazy(() => import("./pages/LibraryPage"));
 const ChatPage = lazy(() => import("./pages/ChatPage"));
@@ -20,6 +19,8 @@ const navItems = [
   { to: "/trash", label: "回收站", Icon: Trash2 },
   { to: "/settings", label: "设置", Icon: Settings },
 ];
+
+const visibleNavItems = navItems.filter((item) => item.to !== "/");
 
 const languageItems: { value: AppLanguage; label: string }[] = [
   { value: "zh-CN", label: "简体中文" },
@@ -55,7 +56,7 @@ export default function App() {
           </div>
 
           <nav className="nav">
-            {navItems.map(({ to, label, Icon }) => (
+            {visibleNavItems.map(({ to, label, Icon }) => (
               <NavLink
                 key={to}
                 to={to}
@@ -85,7 +86,8 @@ export default function App() {
           }
         >
           <Routes>
-            <Route path="/" element={<StartupPage />} />
+            <Route path="/" element={<Navigate to="/library" replace />} />
+            <Route path="/startup" element={<Navigate to="/library" replace />} />
             <Route path="/library" element={<LibraryPage />} />
             <Route path="/library/:contentId" element={<ContentDetailPage />} />
             <Route path="/trash" element={<RecycleBinPage />} />

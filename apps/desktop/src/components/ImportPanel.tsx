@@ -13,6 +13,7 @@ import {
   type AppSettings,
   createFileImport,
   getImportJob,
+  listImportJobs,
   createUrlImport,
   probeBilibiliUrl,
   reparseContent,
@@ -20,6 +21,7 @@ import {
   type ContentDetail,
   type ImportJob,
   type ImportResponse,
+  type NoteGenerationMode,
   type NoteQuality,
   type ReparseContentResponse,
   type SystemStatus,
@@ -64,6 +66,13 @@ type ImportCompletePayload = {
   suggestedQuestions: string[];
 };
 
+function normalizeNoteGenerationMode(value: unknown): NoteGenerationMode {
+  if (value === "model_draft" || value === "hybrid" || value === "local_only") {
+    return value;
+  }
+  return "hybrid";
+}
+
 type ImportPanelProps = {
   onImportCompleted?: (payload: ImportCompletePayload) => void;
 };
@@ -93,8 +102,8 @@ function getNoteQuality(metadata: Record<string, unknown>): NoteQuality | null {
 }
 
 function getStatusTone(status: string) {
-  if (status === "ready") return { label: "结果完整", tone: "success", hint: "已经形成可读笔记和可追问证据。" };
-  if (status === "ready_estimated") return { label: "正文已恢复", tone: "info", hint: "当前正文来自转写，可结合证据层核对。" };
+  if (status === "ready") return { label: "结果完整", tone: "success", hint: "已经形成可读笔记和可继续追问的材料。" };
+  if (status === "ready_estimated") return { label: "正文已恢复", tone: "info", hint: "当前正文来自转写，建议结合原文继续核对。" };
   if (status === "needs_cookie") return { label: "待补 Cookie", tone: "warning", hint: "当前只有基础档案，字幕层还不完整。" };
   if (status === "needs_asr") return { label: "待补转写", tone: "warning", hint: "当前没有正文，补转写后成功率会更高。" };
   if (status === "asr_failed") return { label: "转写异常", tone: "warning", hint: "需检查转写服务后重新导入。" };
@@ -132,6 +141,39 @@ function getMetadataText(metadata: Record<string, unknown>, key: string) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function getCaptureGapDetails(noteQuality: NoteQuality | null) {
+  const rawItems = noteQuality?.capture_gap_report?.items;
+  if (!Array.isArray(rawItems)) {
+    return [] as string[];
+  }
+  return rawItems
+    .map((item) => item.detail?.trim() || item.label?.trim() || "")
+    .filter(Boolean);
+}
+
+function getCoverageMissingLabels(noteQuality: NoteQuality | null) {
+  const rawItems = noteQuality?.note_coverage_report?.missing_sections;
+  if (!Array.isArray(rawItems)) {
+    return [] as string[];
+  }
+  return rawItems
+    .map((item) => item.label?.trim() || item.position?.trim() || "")
+    .filter(Boolean);
+}
+
+function buildDraftStatusValue(noteQuality: NoteQuality | null) {
+  if (noteQuality?.llm_enhanced) {
+    return "模型成稿";
+  }
+  if (typeof noteQuality?.note_structure_score === "number" && noteQuality.note_structure_score >= 72) {
+    return "已整理";
+  }
+  if (typeof noteQuality?.note_structure_score === "number" && noteQuality.note_structure_score >= 56) {
+    return "待顺一遍";
+  }
+  return "待补强";
+}
+
 function getTranscriptSourceLabel(value: string) {
   if (value === "subtitle") return "字幕正文";
   if (value === "asr") return "音频转写";
@@ -143,6 +185,15 @@ function getCaptureStrategyLabel(value: unknown) {
   if (value === "yt_dlp") return "yt-dlp 兜底";
   if (value === "native_api") return "原生接口";
   return "未确定";
+}
+
+function getScoreTone(score: number | undefined): DiagnosticItem["tone"] {
+  if (typeof score !== "number") {
+    return "info";
+  }
+  if (score >= 72) return "success";
+  if (score >= 56) return "info";
+  return "warning";
 }
 
 function buildCaptureRouteSummary(options: {
@@ -242,14 +293,6 @@ function buildImportDiagnostics(options: {
 }) {
   const { noteQuality, metadata, transcriptSegmentCount } = options;
   const transcriptSource = getTranscriptSourceLabel(getMetadataText(metadata, "transcript_source"));
-  const noisyAsrDetected = metadata.noisy_asr_detected === true;
-  const qaStatus = noisyAsrDetected
-    ? "证据可用，理解待重整"
-    : noteQuality?.question_answer_ready
-      ? "可直接追问"
-      : noteQuality?.retrieval_ready
-        ? "可检索"
-        : "待补强";
   const evidenceValue = transcriptSegmentCount > 0 ? `${transcriptSegmentCount} 段` : "较弱";
   const seekReadyCount = typeof noteQuality?.seek_ready_segments === "number" ? noteQuality.seek_ready_segments : 0;
   const timelineValue = noteQuality?.time_jump_ready
@@ -259,29 +302,16 @@ function buildImportDiagnostics(options: {
     : metadata.timestamps_available
       ? "已定位待补全"
       : "待补全";
-  const captureRouteValue = buildCaptureRouteSummary({
-    subtitleStrategy: metadata.subtitle_fetch_strategy,
-    audioStrategy: metadata.audio_fetch_strategy,
-    subtitleAvailable: metadata.transcript_source === "subtitle" || metadata.subtitle_ytdlp_fallback_used === true,
-    audioAvailable: metadata.audio_available === true || metadata.audio_ytdlp_fallback_used === true || metadata.transcript_source === "asr",
-  });
-  const captureRouteTone: DiagnosticItem["tone"] =
-    metadata.subtitle_ytdlp_fallback_used === true || metadata.audio_ytdlp_fallback_used === true
-      ? "info"
-      : metadata.transcript_source === "subtitle" || metadata.transcript_source === "asr"
-        ? "success"
-        : "warning";
 
   return [
     { label: "正文来源", value: transcriptSource, tone: transcriptSource === "仅基础档案" ? "warning" : "success" },
+    { label: "原文", value: evidenceValue, tone: transcriptSegmentCount > 0 ? "success" : "warning" },
+    { label: "时间", value: timelineValue, tone: noteQuality?.time_jump_ready ? "success" : metadata.timestamps_available ? "info" : "warning" },
     {
-      label: "问答状态",
-      value: qaStatus,
-      tone: noisyAsrDetected ? "warning" : noteQuality?.question_answer_ready ? "success" : noteQuality?.retrieval_ready ? "info" : "warning",
+      label: "笔记",
+      value: buildDraftStatusValue(noteQuality),
+      tone: noteQuality?.llm_enhanced ? "success" : getScoreTone(noteQuality?.note_structure_score),
     },
-    { label: "证据层", value: evidenceValue, tone: transcriptSegmentCount > 0 ? "success" : "warning" },
-    { label: "时间回看", value: timelineValue, tone: noteQuality?.time_jump_ready ? "success" : metadata.timestamps_available ? "info" : "warning" },
-    { label: "抓取链路", value: captureRouteValue, tone: captureRouteTone },
   ] satisfies DiagnosticItem[];
 }
 
@@ -438,8 +468,16 @@ function buildImportIssueList(
 ) {
   if (!enabled) return [] as string[];
 
+  const captureGapDetails = getCaptureGapDetails(noteQuality);
+  const coverageMissingLabels = getCoverageMissingLabels(noteQuality);
+
   return [
     metadata.noisy_asr_detected === true ? "检测到转写噪声，当前更适合围绕时间片段继续提问并核对原视频。" : "",
+    typeof noteQuality?.source_reliability_score === "number" && noteQuality.source_reliability_score < 56 ? "当前采集可靠性偏弱，最好先核对正文来源或补稳字幕 / 转写层。" : "",
+    typeof noteQuality?.coverage_score === "number" && noteQuality.coverage_score < 56 ? "当前正文覆盖度偏弱，可能缺少中段、结尾或关键条件。" : "",
+    typeof noteQuality?.note_structure_score === "number" && noteQuality.note_structure_score < 56 ? "当前笔记结构还不够规整，建议再做一次成稿整理。" : "",
+    ...captureGapDetails.slice(0, 2),
+    coverageMissingLabels.length ? `当前笔记更可能遗漏：${coverageMissingLabels.slice(0, 2).join("、")}。` : "",
     getMetadataText(metadata, "asr_model_used") ? `本次转写模型：${getMetadataText(metadata, "asr_model_used")}` : "",
     metadata.asr_model_auto_upgraded === true && getMetadataText(metadata, "asr_model_used")
       ? `已自动抬升本地模型到 ${getMetadataText(metadata, "asr_model_used")} 尝试保底。`
@@ -450,22 +488,6 @@ function buildImportIssueList(
     getMetadataText(metadata, "asr_error") ? `转写过程：${getMetadataText(metadata, "asr_error")}` : "",
     !noteQuality?.time_jump_ready && getMetadataText(metadata, "capture_recommended_action"),
   ].filter((item): item is string => Boolean(item));
-}
-
-function plainText(value: string) {
-  return value
-    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
-    .replace(/^[#>*-]\s*/gm, "")
-    .replace(/`/g, "")
-    .replace(/\n+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function snippet(primary: string, fallback: string, limit = 140) {
-  const value = plainText(primary || fallback);
-  if (!value) return "";
-  return value.length <= limit ? value : `${value.slice(0, limit).trimEnd()}...`;
 }
 
 function chatLink(query: string, options?: { contentId?: string; title?: string }) {
@@ -668,6 +690,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [noteStyle, setNoteStyle] = useState("structured");
   const [summaryFocus, setSummaryFocus] = useState("");
+  const [noteGenerationMode, setNoteGenerationMode] = useState<NoteGenerationMode>("hybrid");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [lastResult, setLastResult] = useState<ImportResponse | null>(null);
   const [lastProbeResult, setLastProbeResult] = useState<BilibiliProbeResponse | null>(null);
@@ -676,6 +699,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
   const [activeImportJobId, setActiveImportJobId] = useState("");
   const [activeImportJob, setActiveImportJob] = useState<ImportJob | null>(null);
   const [reparseFeedbackMessage, setReparseFeedbackMessage] = useState("");
+  const [reparseNoteGenerationMode, setReparseNoteGenerationMode] = useState<NoteGenerationMode>("hybrid");
   const [retryingImportJobId, setRetryingImportJobId] = useState("");
   const systemStatusQuery = useQuery({
     queryKey: ["system-status"],
@@ -688,6 +712,14 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
     queryFn: getSettings,
     retry: 1,
     staleTime: 30000,
+  });
+  const importJobsQuery = useQuery({
+    queryKey: ["import-jobs"],
+    queryFn: () => listImportJobs(),
+    retry: 1,
+    staleTime: 1000,
+    refetchInterval: 1800,
+    refetchIntervalInBackground: true,
   });
 
   function reportImportCompleted(
@@ -725,6 +757,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
     data: ImportResponse,
     options?: { clearUrl?: boolean; clearFilePath?: boolean; clearSelectedFile?: boolean; preserveReparseFeedback?: boolean },
   ) {
+    void queryClient.invalidateQueries({ queryKey: ["import-jobs"] });
     if (options?.clearUrl) setUrlValue("");
     if (options?.clearFilePath) setFilePathValue("");
     if (options?.clearSelectedFile) setSelectedFile(null);
@@ -750,6 +783,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
       data.job.preview.metadata && typeof data.job.preview.metadata === "object"
         ? (data.job.preview.metadata as Record<string, unknown>)
         : {};
+    setReparseNoteGenerationMode(normalizeNoteGenerationMode(metadata.note_generation_mode));
     reportImportCompleted(data.job.preview, metadata, getNoteQuality(metadata));
     queryClient.invalidateQueries({ queryKey: ["contents"] });
   }
@@ -764,8 +798,18 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
   });
 
   const urlMutation = useMutation({
-    mutationFn: ({ url, noteStyle, summaryFocus }: { url: string; noteStyle: string; summaryFocus: string }) =>
-      createUrlImport(url, { noteStyle, summaryFocus, asyncMode: true }),
+    mutationFn: ({
+      url,
+      noteStyle,
+      summaryFocus,
+      noteGenerationMode,
+    }: {
+      url: string;
+      noteStyle: string;
+      summaryFocus: string;
+      noteGenerationMode: NoteGenerationMode;
+    }) =>
+      createUrlImport(url, { noteStyle, summaryFocus, noteGenerationMode, asyncMode: true }),
     onSuccess: (data, variables) => {
       const trimmedUrl = variables.url.trim();
       const matchedProbe = lastProbeResult?.probe && lastProbedUrl === trimmedUrl ? lastProbeResult.probe : null;
@@ -801,14 +845,34 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
   });
 
   const fileMutation = useMutation({
-    mutationFn: (filePath: string) => createFileImport(filePath, { asyncMode: true }),
+    mutationFn: ({
+      filePath,
+      noteStyle,
+      summaryFocus,
+      noteGenerationMode,
+    }: {
+      filePath: string;
+      noteStyle: string;
+      summaryFocus: string;
+      noteGenerationMode: NoteGenerationMode;
+    }) => createFileImport(filePath, { noteStyle, summaryFocus, noteGenerationMode, asyncMode: true }),
     onSuccess: (data) => {
       acceptImportResponse(data, { clearFilePath: true });
     },
   });
 
   const fileUploadMutation = useMutation({
-    mutationFn: (file: File) => uploadFileImport(file, { asyncMode: true }),
+    mutationFn: ({
+      file,
+      noteStyle,
+      summaryFocus,
+      noteGenerationMode,
+    }: {
+      file: File;
+      noteStyle: string;
+      summaryFocus: string;
+      noteGenerationMode: NoteGenerationMode;
+    }) => uploadFileImport(file, { noteStyle, summaryFocus, noteGenerationMode, asyncMode: true }),
     onSuccess: (data) => {
       acceptImportResponse(data, { clearSelectedFile: true });
     },
@@ -818,6 +882,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
       reparseContent(contentId, {
         note_style: noteStyle,
         summary_focus: summaryFocus,
+        note_generation_mode: reparseNoteGenerationMode,
         async_mode: true,
       }),
     onMutate: () => {
@@ -868,11 +933,12 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
           }
           return job;
         });
-        if (isImportJobTerminal(job.status)) {
-          setActiveImportJobId("");
-          if (job.status === "completed") {
-            const metadata =
-              job.preview.metadata && typeof job.preview.metadata === "object"
+      if (isImportJobTerminal(job.status)) {
+        setActiveImportJobId("");
+        await queryClient.invalidateQueries({ queryKey: ["import-jobs"] });
+        if (job.status === "completed") {
+          const metadata =
+            job.preview.metadata && typeof job.preview.metadata === "object"
                 ? (job.preview.metadata as Record<string, unknown>)
                 : {};
             const jobMessage = typeof metadata.job_message === "string" ? metadata.job_message.trim() : "";
@@ -936,32 +1002,34 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
   const metadata = getMetadata(lastResult);
   const noteQuality = getNoteQuality(metadata);
   const probe = lastProbeResult?.probe ?? null;
-  const runningImportJob = activeImportJob && !isImportJobTerminal(activeImportJob.status) ? activeImportJob : null;
-  const isImporting =
-    Boolean(runningImportJob) || urlMutation.isPending || fileMutation.isPending || fileUploadMutation.isPending;
+  const runningImportJobs = useMemo(() => {
+    const merged = new Map<string, ImportJob>();
+    for (const job of importJobsQuery.data?.items ?? []) {
+      if (!isImportJobTerminal(job.status)) {
+        merged.set(job.id, job);
+      }
+    }
+    if (activeImportJob && !isImportJobTerminal(activeImportJob.status)) {
+      merged.set(activeImportJob.id, activeImportJob);
+    }
+    return Array.from(merged.values()).sort((left, right) => {
+      const leftTime = Date.parse(left.updated_at || left.created_at || "");
+      const rightTime = Date.parse(right.updated_at || right.created_at || "");
+      const safeLeft = Number.isNaN(leftTime) ? 0 : leftTime;
+      const safeRight = Number.isNaN(rightTime) ? 0 : rightTime;
+      return safeRight - safeLeft;
+    });
+  }, [activeImportJob, importJobsQuery.data?.items]);
+  const hasRunningJobs = runningImportJobs.length > 0;
+  const visibleRunningImportJobs = runningImportJobs.slice(0, 4);
+  const hiddenRunningJobCount = Math.max(0, runningImportJobs.length - visibleRunningImportJobs.length);
   const activeError =
     (urlMutation.error as Error | null)?.message ||
     (fileMutation.error as Error | null)?.message ||
     (fileUploadMutation.error as Error | null)?.message ||
     (activeImportJob?.status === "failed" ? activeImportJob.error_message || "导入任务执行失败，请稍后再试。" : "") ||
     "";
-  const importStageItems = useMemo(
-    () => getImportStageItems(runningImportJob?.source_kind),
-    [runningImportJob?.source_kind],
-  );
-  const importStepMeta = useMemo(
-    () => getImportJobStepMeta(runningImportJob?.step),
-    [runningImportJob?.step],
-  );
-  const importStageIndex = useMemo(
-    () => resolveImportStageIndex(runningImportJob?.step, runningImportJob?.source_kind),
-    [runningImportJob?.source_kind, runningImportJob?.step],
-  );
 
-  const evidenceSnippet = useMemo(() => {
-    const raw = typeof metadata.raw_transcript_markdown === "string" ? metadata.raw_transcript_markdown : "";
-    return snippet(raw, preview?.content_text || "");
-  }, [metadata.raw_transcript_markdown, preview?.content_text]);
   const transcriptSegmentCount = useMemo(() => {
     if (typeof noteQuality?.transcript_segments === "number") {
       return noteQuality.transcript_segments;
@@ -1090,7 +1158,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
 
   async function handleUrlImportStart() {
     const trimmedUrl = urlValue.trim();
-    if (!trimmedUrl || isImporting) {
+    if (!trimmedUrl || urlMutation.isPending) {
       return;
     }
 
@@ -1113,7 +1181,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
       return;
     }
 
-    urlMutation.mutate({ url: trimmedUrl, noteStyle, summaryFocus: summaryFocus.trim() });
+    urlMutation.mutate({ url: trimmedUrl, noteStyle, summaryFocus: summaryFocus.trim(), noteGenerationMode });
   }
 
   function resetPanel() {
@@ -1126,8 +1194,10 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
     setLastProbeResult(null);
     setLastProbedUrl("");
     setAwaitingImportConfirmation(false);
-    setActiveImportJobId("");
-    setActiveImportJob(null);
+    if (activeImportJob && isImportJobTerminal(activeImportJob.status)) {
+      setActiveImportJobId("");
+      setActiveImportJob(null);
+    }
     reparseMutation.reset();
     probeMutation.reset();
     urlMutation.reset();
@@ -1154,14 +1224,18 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
         setNoteStyle={setNoteStyle}
         summaryFocus={summaryFocus}
         setSummaryFocus={setSummaryFocus}
+        noteGenerationMode={noteGenerationMode}
+        setNoteGenerationMode={setNoteGenerationMode}
         showAdvanced={showAdvanced}
         setShowAdvanced={setShowAdvanced}
         awaitingImportConfirmation={awaitingImportConfirmation}
         probeRequiresConfirmation={probeRequiresConfirmation}
         lastProbedUrl={lastProbedUrl}
-        isImporting={isImporting}
+        hasRunningJobs={hasRunningJobs}
         isProbePending={probeMutation.isPending}
         isUrlPending={urlMutation.isPending}
+        isFilePending={fileMutation.isPending}
+        isFileUploadPending={fileUploadMutation.isPending}
         desktopRuntime={desktopRuntime}
         filePathValue={filePathValue}
         setFilePathValue={setFilePathValue}
@@ -1169,8 +1243,8 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
         setSelectedFile={setSelectedFile}
         onProbe={() => probeMutation.mutate(urlValue.trim())}
         onUrlImportStart={() => { void handleUrlImportStart(); }}
-        onFileMutate={(path) => fileMutation.mutate(path)}
-        onFileUploadMutate={(file) => fileUploadMutation.mutate(file)}
+        onFileMutate={(path) => fileMutation.mutate({ filePath: path, noteStyle, summaryFocus: summaryFocus.trim(), noteGenerationMode })}
+        onFileUploadMutate={(file) => fileUploadMutation.mutate({ file, noteStyle, summaryFocus: summaryFocus.trim(), noteGenerationMode })}
       />
 
       {probeMutation.error && (
@@ -1205,18 +1279,34 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
           isProbePending={probeMutation.isPending}
           noteStyle={noteStyle}
           summaryFocus={summaryFocus}
-          onDirectImport={() => { setAwaitingImportConfirmation(false); urlMutation.mutate({ url: urlValue.trim(), noteStyle, summaryFocus: summaryFocus.trim() }); }}
+          noteGenerationMode={noteGenerationMode}
+          onDirectImport={() => { setAwaitingImportConfirmation(false); urlMutation.mutate({ url: urlValue.trim(), noteStyle, summaryFocus: summaryFocus.trim(), noteGenerationMode }); }}
           onCollapse={() => { setLastProbeResult(null); setLastProbedUrl(""); setAwaitingImportConfirmation(false); }}
         />
       )}
 
-      {isImporting && (
-        <ImportProgressCard
-          runningImportJob={runningImportJob}
-          importStepMeta={importStepMeta}
-          importStageItems={importStageItems}
-          importStageIndex={importStageIndex}
-        />
+      {hasRunningJobs && (
+        <section className="import-job-queue">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">{displayText("后台任务")}</p>
+              <h4>{displayText(`处理中 ${runningImportJobs.length} 条`)}</h4>
+              <p className="muted-text">{displayText("单条任务卡住时，其他导入仍会继续在后台排队和处理。")}</p>
+            </div>
+          </div>
+          {visibleRunningImportJobs.map((job) => (
+            <ImportProgressCard
+              key={job.id}
+              runningImportJob={job}
+              importStepMeta={getImportJobStepMeta(job.step)}
+              importStageItems={getImportStageItems(job.source_kind)}
+              importStageIndex={resolveImportStageIndex(job.step, job.source_kind)}
+            />
+          ))}
+          {hiddenRunningJobCount > 0 && (
+            <p className="muted-text">{displayText(`其余 ${hiddenRunningJobCount} 条任务仍在后台继续处理。`)}</p>
+          )}
+        </section>
       )}
 
       {Boolean(activeError) && (
@@ -1241,6 +1331,7 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
                     setRetryingImportJobId(activeImportJob.id);
                     try {
                       const result = await retryImportJob(activeImportJob.id);
+                      void queryClient.invalidateQueries({ queryKey: ["import-jobs"] });
                       setActiveImportJob(result.job);
                       setActiveImportJobId(result.job.id);
                     } catch {}
@@ -1273,14 +1364,13 @@ export default function ImportPanel({ onImportCompleted }: ImportPanelProps) {
           shouldOfferReparse={shouldOfferReparse}
           recoveryHints={recoveryHints}
           shouldShowRecoveryPanel={shouldShowRecoveryPanel}
-          transcriptSegmentCount={transcriptSegmentCount}
-          evidenceSnippet={evidenceSnippet}
-          summaryFocus={summaryFocus}
-          isReparsePending={reparseMutation.isPending || Boolean(runningImportJob)}
-          isReparseSuccess={Boolean(reparseFeedbackMessage) && !Boolean(runningImportJob)}
+          isReparsePending={reparseMutation.isPending}
+          isReparseSuccess={Boolean(reparseFeedbackMessage) && !reparseMutation.isPending}
           reparseMessage={reparseFeedbackMessage}
-          isReparseError={reparseMutation.isError || activeImportJob?.status === "failed"}
-          reparseErrorMessage={(reparseMutation.error as Error | null)?.message || activeImportJob?.error_message || undefined}
+          isReparseError={reparseMutation.isError}
+          reparseErrorMessage={(reparseMutation.error as Error | null)?.message || undefined}
+          reparseNoteGenerationMode={reparseNoteGenerationMode}
+          onReparseNoteGenerationModeChange={setReparseNoteGenerationMode}
           onReparse={() => reparseMutation.mutate({ contentId: preview.content_id!, noteStyle, summaryFocus: summaryFocus.trim() })}
           onReset={resetPanel}
         />

@@ -19,6 +19,9 @@ class NoteQualityService:
         is_video_like = platform == "bilibili" or content_type == "video"
         llm_enhanced = bool(metadata.get("llm_enhanced"))
         noisy_asr_detected = bool(metadata.get("noisy_asr_detected"))
+        transcript_source = str(metadata.get("transcript_source") or "").strip()
+        note_style = str(metadata.get("note_style") or "").strip()
+        note_output_quality = metadata.get("note_output_quality") if isinstance(metadata.get("note_output_quality"), dict) else {}
 
         refined_note = str(metadata.get("refined_note_markdown") or metadata.get("note_markdown") or "").strip()
         raw_transcript = str(metadata.get("raw_transcript_markdown") or "").strip()
@@ -31,7 +34,7 @@ class NoteQualityService:
             summary=summary,
             key_points=key_points,
             refined_note=refined_note,
-            transcript_source=str(metadata.get("transcript_source") or "").strip(),
+            transcript_source=transcript_source,
             llm_enhanced=llm_enhanced,
             noisy_asr_detected=noisy_asr_detected,
         )
@@ -40,6 +43,24 @@ class NoteQualityService:
         seek_ready_count = len([item for item in transcript_segments if item["seek_url"]])
         timestamps_available = bool(metadata.get("timestamps_available")) or any(item["start_ms"] is not None for item in transcript_segments)
         timestamps_estimated = bool(metadata.get("timestamps_estimated"))
+        semantic_units = self._read_semantic_units(metadata, content_text)
+        capture_gap_report = self._build_capture_gap_report(
+            capture_status=capture_status,
+            transcript_source=transcript_source,
+            is_video_like=is_video_like,
+            timestamps_available=timestamps_available,
+            timestamps_estimated=timestamps_estimated,
+            segment_count=segment_count,
+            seek_ready_count=seek_ready_count,
+            noisy_asr_detected=noisy_asr_detected,
+            content_text=content_text,
+        )
+        note_coverage_report = self._build_note_coverage_report(
+            semantic_units=semantic_units,
+            refined_note=refined_note,
+            summary=summary,
+            key_points=key_points,
+        )
 
         capture_score = self._score_capture(
             capture_status=capture_status,
@@ -74,6 +95,34 @@ class NoteQualityService:
             seek_ready_count=seek_ready_count,
             segment_count=segment_count,
         )
+        accuracy_score = self._score_source_reliability(
+            capture_status=capture_status,
+            transcript_source=transcript_source,
+            llm_enhanced=llm_enhanced,
+            noisy_asr_detected=noisy_asr_detected,
+            timestamps_available=timestamps_available,
+            content_text=content_text,
+        )
+        coverage_score = self._score_content_coverage(
+            is_video_like=is_video_like,
+            capture_status=capture_status,
+            content_text=content_text,
+            summary=summary,
+            key_point_count=key_point_count,
+            segment_count=segment_count,
+            timestamps_available=timestamps_available,
+            note_coverage_report=note_coverage_report,
+            capture_gap_report=capture_gap_report,
+        )
+        note_structure_score = self._score_note_structure(
+            refined_note=refined_note,
+            summary=summary,
+            key_points=key_points,
+            note_style=note_style,
+            llm_enhanced=llm_enhanced,
+            note_output_quality=note_output_quality,
+            note_coverage_report=note_coverage_report,
+        )
 
         double_note_ready = refined_score >= 72 and raw_evidence_score >= 70
         time_jump_ready = is_video_like and time_jump_score >= 80
@@ -86,6 +135,13 @@ class NoteQualityService:
             and (not noisy_asr_detected or llm_enhanced)
         )
         agent_ready = llm_enhanced or (semantic_score >= 68 and not noisy_asr_detected)
+        high_confidence_answer_ready = (
+            question_answer_ready
+            and accuracy_score >= 72
+            and coverage_score >= 72
+            and note_structure_score >= 68
+            and float(note_coverage_report.get("coverage_ratio") or 0.0) >= 0.55
+        )
 
         dimensions = {
             "capture": {
@@ -124,21 +180,42 @@ class NoteQualityService:
                 "ready": agent_ready,
                 "applicable": True,
             },
+            "accuracy": {
+                "score": accuracy_score,
+                "label": self._describe_dimension("accuracy", accuracy_score, ready=accuracy_score >= 72),
+                "ready": accuracy_score >= 72,
+                "applicable": True,
+            },
+            "coverage": {
+                "score": coverage_score,
+                "label": self._describe_dimension("coverage", coverage_score, ready=coverage_score >= 72),
+                "ready": coverage_score >= 72,
+                "applicable": True,
+            },
+            "note_structure": {
+                "score": note_structure_score,
+                "label": self._describe_dimension("note_structure", note_structure_score, ready=note_structure_score >= 72),
+                "ready": note_structure_score >= 72,
+                "applicable": True,
+            },
         }
 
         weights = {
-            "capture": 0.24,
-            "refined_note": 0.18,
-            "raw_evidence": 0.20,
-            "retrieval": 0.16,
-            "time_jump": 0.10,
-            "understanding": 0.12,
+            "capture": 0.20,
+            "refined_note": 0.16,
+            "raw_evidence": 0.18,
+            "retrieval": 0.14,
+            "time_jump": 0.09,
+            "understanding": 0.11,
+            "accuracy": 0.05,
+            "coverage": 0.04,
+            "note_structure": 0.03,
         }
-        applicable_weight = sum(weights[name] for name, item in dimensions.items() if item["applicable"])
+        applicable_weight = sum(weights.get(name, 0.0) for name, item in dimensions.items() if item["applicable"])
         overall_score = 0
         if applicable_weight > 0:
             overall_score = round(
-                sum(dimensions[name]["score"] * weights[name] for name in dimensions if dimensions[name]["applicable"])
+                sum(dimensions[name]["score"] * weights.get(name, 0.0) for name in dimensions if dimensions[name]["applicable"])
                 / applicable_weight
             )
 
@@ -166,6 +243,11 @@ class NoteQualityService:
             semantic_score=semantic_score,
             llm_enhanced=llm_enhanced,
             noisy_asr_detected=noisy_asr_detected,
+            accuracy_score=accuracy_score,
+            coverage_score=coverage_score,
+            note_structure_score=note_structure_score,
+            capture_gap_report=capture_gap_report,
+            note_coverage_report=note_coverage_report,
         )
         recommended_action = self._build_recommended_action(
             level=level,
@@ -178,6 +260,11 @@ class NoteQualityService:
             semantic_score=semantic_score,
             llm_enhanced=llm_enhanced,
             noisy_asr_detected=noisy_asr_detected,
+            accuracy_score=accuracy_score,
+            coverage_score=coverage_score,
+            note_structure_score=note_structure_score,
+            capture_gap_report=capture_gap_report,
+            note_coverage_report=note_coverage_report,
         )
 
         return {
@@ -190,6 +277,7 @@ class NoteQualityService:
             "time_jump_ready": time_jump_ready,
             "retrieval_ready": retrieval_ready,
             "question_answer_ready": question_answer_ready,
+            "high_confidence_answer_ready": high_confidence_answer_ready,
             "refined_note_ready": refined_score >= 72,
             "raw_evidence_ready": raw_evidence_score >= 70,
             "transcript_segments": segment_count,
@@ -198,6 +286,11 @@ class NoteQualityService:
             "semantic_score": semantic_score,
             "agent_ready": agent_ready,
             "llm_enhanced": llm_enhanced,
+            "source_reliability_score": accuracy_score,
+            "coverage_score": coverage_score,
+            "note_structure_score": note_structure_score,
+            "capture_gap_report": capture_gap_report,
+            "note_coverage_report": note_coverage_report,
             "sort_score": overall_score,
             "dimensions": dimensions,
             "source_type": source_type,
@@ -223,6 +316,106 @@ class NoteQualityService:
                 }
             )
         return segments
+
+    def _read_semantic_units(self, metadata: dict[str, Any], content_text: str) -> list[dict[str, Any]]:
+        for key in ("semantic_transcript_segments", "transcript_segments"):
+            raw_segments = metadata.get(key)
+            if not isinstance(raw_segments, list):
+                continue
+
+            raw_texts = [
+                item for item in raw_segments
+                if isinstance(item, dict) and str(item.get("text") or "").strip()
+            ]
+            total = len(raw_texts)
+            if total <= 0:
+                continue
+
+            units: list[dict[str, Any]] = []
+            for index, item in enumerate(raw_texts):
+                text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+                if not text:
+                    continue
+                start_ms = self._coerce_milliseconds(item.get("start_ms"))
+                units.append(
+                    {
+                        "index": index,
+                        "label": self._describe_semantic_unit_label(index, start_ms, total),
+                        "position": self._describe_unit_position(index, total),
+                        "text": text,
+                    }
+                )
+            if units:
+                return units[:10]
+
+        fallback_units = self._split_text_units(content_text, max_units=6, target_chars=140)
+        total = len(fallback_units)
+        return [
+            {
+                "index": index,
+                "label": self._describe_semantic_unit_label(index, None, total),
+                "position": self._describe_unit_position(index, total),
+                "text": text,
+            }
+            for index, text in enumerate(fallback_units)
+        ]
+
+    def _describe_semantic_unit_label(self, index: int, start_ms: int | None, total: int) -> str:
+        position = self._describe_unit_position(index, total)
+        if start_ms is not None:
+            return f"{position} · {self._format_timestamp_label(start_ms)}"
+        return position
+
+    def _describe_unit_position(self, index: int, total: int) -> str:
+        if total <= 1:
+            return "核心内容"
+        if index == 0:
+            return "开头背景"
+        if index == total - 1:
+            return "收尾结论"
+        if total <= 3:
+            return "中段展开"
+        pivot = total / 2
+        if index < pivot:
+            return "前段展开"
+        return "中后段展开"
+
+    def _format_timestamp_label(self, milliseconds: int) -> str:
+        total_seconds = max(0, int(milliseconds / 1000))
+        minutes, seconds = divmod(total_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _split_text_units(self, text: str, *, max_units: int, target_chars: int) -> list[str]:
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not compact:
+            return []
+
+        sentence_parts = [
+            item.strip()
+            for item in re.split(r"(?<=[。！？；.!?])\s+|(?<=[。！？；.!?])", compact)
+            if item and item.strip()
+        ]
+        if not sentence_parts:
+            sentence_parts = [compact]
+
+        chunks: list[str] = []
+        buffer = ""
+        for part in sentence_parts:
+            candidate = f"{buffer}{part}".strip()
+            if buffer and len(candidate) > target_chars:
+                chunks.append(buffer.strip())
+                buffer = part
+                if len(chunks) >= max_units:
+                    break
+                continue
+            buffer = candidate
+
+        if buffer and len(chunks) < max_units:
+            chunks.append(buffer.strip())
+        return chunks[:max_units]
 
     def _score_capture(
         self,
@@ -347,6 +540,369 @@ class NoteQualityService:
             return 24
         return 0
 
+    def _score_source_reliability(
+        self,
+        *,
+        capture_status: str,
+        transcript_source: str,
+        llm_enhanced: bool,
+        noisy_asr_detected: bool,
+        timestamps_available: bool,
+        content_text: str,
+    ) -> int:
+        if capture_status in {"preview_ready", "limited"}:
+            return 28
+        if capture_status in {"needs_cookie", "needs_asr", "asr_failed"}:
+            return 24
+
+        if transcript_source == "subtitle":
+            score = 94 if timestamps_available else 88
+        elif transcript_source.startswith("asr"):
+            score = 74
+        elif transcript_source == "description":
+            score = 48
+        elif len(content_text) >= 800:
+            score = 82
+        elif len(content_text) >= 240:
+            score = 66
+        else:
+            score = 38
+
+        if noisy_asr_detected:
+            score -= 16
+        if transcript_source.startswith("asr") and llm_enhanced:
+            score += 6
+        return max(18, min(96, round(score)))
+
+    def _score_content_coverage(
+        self,
+        *,
+        is_video_like: bool,
+        capture_status: str,
+        content_text: str,
+        summary: str,
+        key_point_count: int,
+        segment_count: int,
+        timestamps_available: bool,
+        note_coverage_report: dict[str, Any],
+        capture_gap_report: dict[str, Any],
+    ) -> int:
+        if capture_status in {"preview_ready", "limited"}:
+            return 22
+        score = 28
+        if is_video_like:
+            if segment_count >= 10 and len(content_text) >= 1200 and timestamps_available:
+                score = 94
+            elif segment_count >= 6 and len(content_text) >= 800:
+                score = 84
+            elif segment_count >= 3 and len(content_text) >= 360:
+                score = 72
+            elif len(summary) >= 80 and key_point_count >= 3:
+                score = 56
+        else:
+            if len(content_text) >= 2200 and key_point_count >= 4:
+                score = 94
+            elif len(content_text) >= 1200 and key_point_count >= 3:
+                score = 84
+            elif len(content_text) >= 480 and (key_point_count >= 2 or len(summary) >= 80):
+                score = 72
+            elif len(summary) >= 60:
+                score = 54
+            else:
+                score = 26
+
+        coverage_ratio = float(note_coverage_report.get("coverage_ratio") or 0.0)
+        total_units = int(note_coverage_report.get("total_units") or 0)
+        if total_units >= 3:
+            if coverage_ratio >= 0.78:
+                score += 8
+            elif coverage_ratio >= 0.58:
+                score += 3
+            elif coverage_ratio < 0.35:
+                score -= 14
+            elif coverage_ratio < 0.5:
+                score -= 8
+
+        gap_count = int(capture_gap_report.get("gap_count") or 0)
+        if gap_count >= 3:
+            score -= min(14, (gap_count - 1) * 4)
+        elif gap_count == 2:
+            score -= 4
+        return max(18, min(96, round(score)))
+
+    def _score_note_structure(
+        self,
+        *,
+        refined_note: str,
+        summary: str,
+        key_points: list[Any],
+        note_style: str,
+        llm_enhanced: bool,
+        note_output_quality: dict[str, Any],
+        note_coverage_report: dict[str, Any],
+    ) -> int:
+        note = refined_note.strip()
+        if not note:
+            if len(summary) >= 60 and len([item for item in key_points if str(item).strip()]) >= 3:
+                return 54
+            return 22
+
+        score = 72
+        required_sections = ("## 核心结论", "## 精炼正文", "## 重点摘录")
+        if note_style == "qa":
+            required_sections = ("## 问题结论", "## 回答整理", "## 关键答案")
+        elif note_style == "brief":
+            required_sections = ("## 快速摘要", "## 精炼正文", "## 重点摘录")
+
+        present_sections = sum(1 for title in required_sections if title in note)
+        if present_sections == len(required_sections):
+            score += 12
+        elif present_sections >= 2:
+            score += 4
+        else:
+            score -= 18
+
+        paragraphs = [
+            line.strip()
+            for line in note.splitlines()
+            if line.strip() and not line.lstrip().startswith("#") and not re.match(r"^[-*]\s+", line.strip())
+        ]
+        if len(paragraphs) >= 3:
+            score += 4
+        elif len(paragraphs) <= 1:
+            score -= 10
+
+        max_paragraph_length = max((len(item) for item in paragraphs), default=0)
+        if max_paragraph_length > 200:
+            score -= 14
+        elif max_paragraph_length > 140:
+            score -= 8
+
+        punctuation_density = (len(re.findall(r"[，。；：、“”！？,.!?;:]", note)) / max(len(note), 1))
+        if punctuation_density < 0.014:
+            score -= 12
+        if punctuation_density < 0.008:
+            score -= 10
+
+        normalized_paragraphs = [re.sub(r"\s+", "", item.lower()) for item in paragraphs if item]
+        duplicate_hits = 0
+        seen: set[str] = set()
+        for item in normalized_paragraphs:
+            signature = item[:48]
+            if signature in seen:
+                duplicate_hits += 1
+                continue
+            seen.add(signature)
+        score -= duplicate_hits * 10
+
+        bullet_count = len(re.findall(r"(?m)^[-*]\s+", note))
+        if bullet_count >= 3:
+            score += 4
+        elif bullet_count == 0:
+            score -= 4
+
+        if llm_enhanced and present_sections >= 2:
+            score += 2
+
+        section_count = int(note_output_quality.get("section_count") or 0)
+        paragraph_count = int(note_output_quality.get("paragraph_count") or 0)
+        duplicate_hits_meta = int(note_output_quality.get("duplicate_hits") or 0)
+        max_paragraph_length_meta = int(note_output_quality.get("max_paragraph_length") or 0)
+        if section_count >= 3:
+            score += 2
+        if paragraph_count <= 2 and note:
+            score -= 4
+        if duplicate_hits_meta > duplicate_hits:
+            score -= min(10, (duplicate_hits_meta - duplicate_hits) * 4)
+        if max_paragraph_length_meta > max_paragraph_length and max_paragraph_length_meta > 180:
+            score -= 4
+
+        coverage_ratio = float(note_coverage_report.get("coverage_ratio") or 0.0)
+        total_units = int(note_coverage_report.get("total_units") or 0)
+        if total_units >= 3 and coverage_ratio < 0.4:
+            score -= 8
+        elif total_units >= 3 and coverage_ratio < 0.55:
+            score -= 4
+        return max(18, min(96, round(score)))
+
+    def _build_capture_gap_report(
+        self,
+        *,
+        capture_status: str,
+        transcript_source: str,
+        is_video_like: bool,
+        timestamps_available: bool,
+        timestamps_estimated: bool,
+        segment_count: int,
+        seek_ready_count: int,
+        noisy_asr_detected: bool,
+        content_text: str,
+    ) -> dict[str, Any]:
+        items: list[dict[str, str]] = []
+        seen_codes: set[str] = set()
+
+        def add_item(code: str, label: str, severity: str, detail: str) -> None:
+            if code in seen_codes:
+                return
+            seen_codes.add(code)
+            items.append(
+                {
+                    "code": code,
+                    "label": label,
+                    "severity": severity,
+                    "detail": detail,
+                }
+            )
+
+        if capture_status == "needs_cookie":
+            add_item("needs_cookie", "字幕层需要登录态", "warning", "当前公开视频链路拿不到完整字幕，继续整理前最好先补 Cookie。")
+        elif capture_status == "needs_asr":
+            add_item("needs_asr", "仍缺可用正文", "warning", "当前还没有拿到可直接使用的正文层，更适合先补转写。")
+        elif capture_status == "asr_failed":
+            add_item("asr_failed", "转写链路未完成", "warning", "字幕和转写都还没有稳定返回可用正文。")
+        elif capture_status == "limited":
+            add_item("limited", "当前仅有基础档案", "warning", "目前保留的仍是弱材料，不适合直接当作完整笔记。")
+        elif capture_status == "preview_ready":
+            add_item("preview_ready", "当前仍是预览结果", "warning", "这条内容还没有完成正式解析与正文提取。")
+
+        if transcript_source == "description":
+            add_item("description_only", "仍以简介材料为主", "warning", "当前正文主要来自简介或基础档案，完整度通常不够稳。")
+        elif transcript_source.startswith("asr") and noisy_asr_detected:
+            add_item("noisy_asr", "转写噪声偏高", "warning", "当前转写可用，但语句切分和个别细节仍需要核对。")
+
+        if is_video_like and not timestamps_available:
+            add_item("missing_timestamps", "缺少稳定时间定位", "warning", "当前还不能稳定回跳到原视频片段。")
+        elif is_video_like and timestamps_estimated:
+            add_item("estimated_timestamps", "时间定位仍是估算值", "info", "当前可以回看，但关键结论最好再回原视频核对一次。")
+
+        if is_video_like and timestamps_available and segment_count > 0 and seek_ready_count < max(1, min(segment_count, 2)):
+            add_item("seek_links_partial", "回看链接还不完整", "info", "已经有时间片段，但部分定位还没有稳定可点击入口。")
+
+        if is_video_like and segment_count <= 2:
+            add_item("few_segments", "正文片段偏少", "warning", f"当前仅保留 {max(segment_count, 0)} 段正文片段，中段和尾段更容易缺失。")
+        elif not is_video_like and len(content_text.strip()) < 240:
+            add_item("short_body", "正文长度偏短", "info", "当前可用正文仍然偏少，更适合作为草稿而不是最终整理。")
+
+        if len(content_text.strip()) < (240 if is_video_like else 180):
+            add_item("thin_content", "正文密度偏弱", "info", "当前保留下来的正文还不够厚，后续总结时更容易丢条件。")
+
+        top_labels = [item["label"] for item in items[:2]]
+        summary = "当前采集链路稳定。"
+        if top_labels:
+            summary = f"当前仍有 {len(items)} 处采集缺口：{'、'.join(top_labels)}。"
+
+        return {
+            "blocked": self._is_capture_blocked(capture_status),
+            "gap_count": len(items),
+            "summary": summary,
+            "items": items,
+        }
+
+    def _build_note_coverage_report(
+        self,
+        *,
+        semantic_units: list[dict[str, Any]],
+        refined_note: str,
+        summary: str,
+        key_points: list[Any],
+    ) -> dict[str, Any]:
+        total_units = len(semantic_units)
+        if total_units <= 0:
+            return {
+                "coverage_ratio": 0.0,
+                "covered_units": 0,
+                "total_units": 0,
+                "summary": "当前没有足够的章节线索来判断覆盖度。",
+                "missing_positions": [],
+                "missing_sections": [],
+            }
+
+        note_source = "\n".join(
+            [
+                summary.strip(),
+                *[str(item).strip() for item in key_points if str(item).strip()],
+                refined_note.strip(),
+            ]
+        ).strip()
+        note_signals = self._build_overlap_signals(note_source)
+
+        covered_units = 0
+        missing_sections: list[dict[str, str]] = []
+        for unit in semantic_units:
+            unit_text = str(unit.get("text") or "").strip()
+            unit_signals = self._build_overlap_signals(unit_text)
+            overlap_hits = len(note_signals & unit_signals)
+            if unit_signals:
+                if len(unit_signals) <= 6:
+                    required_hits = 1
+                elif len(unit_signals) <= 14:
+                    required_hits = 2
+                else:
+                    required_hits = 3
+            else:
+                required_hits = 1
+
+            if overlap_hits >= required_hits:
+                covered_units += 1
+                continue
+
+            missing_sections.append(
+                {
+                    "label": str(unit.get("label") or "待补片段"),
+                    "position": str(unit.get("position") or "待补内容"),
+                    "excerpt": self._truncate_excerpt(unit_text, 42),
+                }
+            )
+
+        coverage_ratio = covered_units / max(total_units, 1)
+        missing_positions = list(dict.fromkeys(item["position"] for item in missing_sections if item.get("position")))
+        if coverage_ratio >= 0.8:
+            summary_text = f"笔记已经覆盖大部分关键段落，当前命中 {covered_units} / {total_units} 段。"
+        elif missing_positions:
+            summary_text = f"笔记当前命中 {covered_units} / {total_units} 段，更可能遗漏：{'、'.join(missing_positions[:2])}。"
+        else:
+            summary_text = f"笔记当前命中 {covered_units} / {total_units} 段。"
+
+        return {
+            "coverage_ratio": round(coverage_ratio, 4),
+            "covered_units": covered_units,
+            "total_units": total_units,
+            "summary": summary_text,
+            "missing_positions": missing_positions,
+            "missing_sections": missing_sections[:4],
+        }
+
+    def _build_overlap_signals(self, text: str) -> set[str]:
+        signals: set[str] = set()
+        compact = re.sub(r"\s+", "", str(text or "").lower())
+        if not compact:
+            return signals
+
+        for token in re.findall(r"[a-z0-9]{3,}", compact):
+            signals.add(token)
+            if len(signals) >= 80:
+                return signals
+
+        for token in re.findall(r"[\u4e00-\u9fff]{2,}", compact):
+            if len(token) <= 3:
+                signals.add(token)
+            else:
+                for index in range(len(token) - 1):
+                    signals.add(token[index:index + 2])
+                    if len(signals) >= 80:
+                        return signals
+                signals.add(token[:4])
+                signals.add(token[-4:])
+                if len(signals) >= 80:
+                    return signals
+        return signals
+
+    def _truncate_excerpt(self, text: str, limit: int) -> str:
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(compact) <= limit:
+            return compact
+        return compact[:limit].rstrip() + "…"
+
     def _resolve_level(
         self,
         *,
@@ -391,7 +947,24 @@ class NoteQualityService:
         semantic_score: int,
         llm_enhanced: bool,
         noisy_asr_detected: bool,
+        accuracy_score: int,
+        coverage_score: int,
+        note_structure_score: int,
+        capture_gap_report: dict[str, Any],
+        note_coverage_report: dict[str, Any],
     ) -> str:
+        if accuracy_score < 56:
+            capture_focus = self._format_report_labels(capture_gap_report.get("items"), limit=2)
+            if capture_focus:
+                return f"当前已经拿到基础内容，但采集链路还存在 {capture_focus}，更适合先核稳来源和正文，再继续做高置信成稿。"
+            return "当前已经拿到基础内容，但采集可靠性还偏弱，更适合先核稳来源和正文，再继续做高置信成稿。"
+        if coverage_score < 56:
+            missing_focus = self._format_missing_positions(note_coverage_report)
+            if missing_focus:
+                return f"当前内容已经形成基础整理，但正文覆盖度还不够稳，当前更可能遗漏 {missing_focus}，更适合作为补齐前的草稿。"
+            return "当前内容已经形成基础整理，但正文覆盖度还不够稳，容易漏掉关键段和中段条件，更适合作为补齐前的草稿。"
+        if note_structure_score < 56:
+            return "当前笔记已经有核心信息，但结构、断句和段落组织还不够规整，适合继续做一次成稿整理后再作为最终笔记。"
         if level == "blocked":
             return capture_summary or "这条内容还没有形成完整的正文证据层，继续做精准问答的风险较高。"
         if level == "high":
@@ -427,7 +1000,24 @@ class NoteQualityService:
         semantic_score: int,
         llm_enhanced: bool,
         noisy_asr_detected: bool,
+        accuracy_score: int,
+        coverage_score: int,
+        note_structure_score: int,
+        capture_gap_report: dict[str, Any],
+        note_coverage_report: dict[str, Any],
     ) -> str:
+        if accuracy_score < 56:
+            capture_focus = self._format_report_labels(capture_gap_report.get("items"), limit=2)
+            if capture_focus:
+                return f"优先补稳正文来源，先处理 {capture_focus}，再继续做高质量成稿会更稳。"
+            return "优先补稳正文来源，确认是字幕、网页正文还是转写恢复，再继续做高质量成稿。"
+        if coverage_score < 56:
+            missing_focus = self._format_missing_positions(note_coverage_report)
+            if missing_focus:
+                return f"优先补齐正文覆盖度，先把 {missing_focus} 补稳，再进行总结和问答会更稳。"
+            return "优先补齐正文覆盖度，尤其是中段、结尾和关键条件，再进行总结和问答会更稳。"
+        if note_structure_score < 56:
+            return "优先再做一次成稿整理，把长句拆开、段落补齐、重复压掉，再把当前笔记当作最终版本。"
         if level == "blocked":
             return capture_action or "先补齐登录态或音频转写能力，再重新解析这条内容。"
         if noisy_asr_detected and not llm_enhanced:
@@ -463,9 +1053,31 @@ class NoteQualityService:
             "retrieval": "检索层",
             "time_jump": "回看层",
             "understanding": "理解层",
+            "accuracy": "采集可靠",
+            "coverage": "内容完整",
+            "note_structure": "笔记规范",
         }
         suffix = "已就绪" if ready else "待加强"
         return f"{name_map.get(name, name)}{state}，{suffix}"
+
+    def _format_report_labels(self, raw_items: Any, *, limit: int) -> str:
+        if not isinstance(raw_items, list):
+            return ""
+        labels = [
+            str(item.get("label") or "").strip()
+            for item in raw_items
+            if isinstance(item, dict) and str(item.get("label") or "").strip()
+        ]
+        deduped = list(dict.fromkeys(labels))
+        return "、".join(deduped[:limit])
+
+    def _format_missing_positions(self, note_coverage_report: dict[str, Any]) -> str:
+        raw_positions = note_coverage_report.get("missing_positions")
+        if not isinstance(raw_positions, list):
+            return ""
+        positions = [str(item).strip() for item in raw_positions if str(item).strip()]
+        deduped = list(dict.fromkeys(positions))
+        return "、".join(deduped[:2])
 
     def _is_capture_blocked(self, capture_status: str) -> bool:
         return capture_status in {"needs_cookie", "needs_asr", "asr_failed", "limited", "preview_ready"}

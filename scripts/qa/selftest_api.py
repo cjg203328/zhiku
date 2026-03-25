@@ -178,6 +178,202 @@ def run() -> dict:
 
         steps.append({'name': 'bilinote_screenshot_marker_smoke', 'status': 200})
 
+    def run_llm_note_markdown_preserve_smoke() -> None:
+        service = ImportService(settings)
+
+        class FakeGateway:
+            def is_enabled(self) -> bool:
+                return True
+
+            def enhance_import_result(self, **kwargs):
+                return {
+                    'summary': '这是一条经过模型理解后的摘要。',
+                    'key_points': ['第一点已经整理成独立短句。', '第二点也保留了清晰停顿。'],
+                    'note_markdown': (
+                        '## 核心结论\n\n'
+                        '这是一条经过模型理解后的摘要，句子边界清晰。\n\n'
+                        '## 精炼正文\n\n'
+                        '第一段应该有清晰句号。第二段也应该保留自然停顿。\n\n'
+                        '## 重点摘录\n\n'
+                        '- 第一条是完整句子。\n'
+                        '- 第二条也不是转写碎片。'
+                    ),
+                }
+
+        service.llm_gateway = FakeGateway()
+        payload = {
+            'source_type': 'file',
+            'platform': 'file',
+            'source_url': None,
+            'source_file': 'selftest.md',
+            'title': 'LLM Note Preserve Smoke',
+            'author': None,
+            'content_text': '这是一段足够长的原始文本，用于验证模型输出的完整笔记会被保留下来，而不会在后续的本地模板刷新阶段被覆盖掉。' * 3,
+            'summary': '原始摘要',
+            'key_points': ['原始要点一', '原始要点二'],
+            'quotes': [],
+            'category': 'selftest',
+            'content_type': 'article',
+            'use_case': 'test',
+            'tags': ['selftest'],
+            'metadata': {},
+            'local_path': None,
+            'status': 'ready',
+        }
+
+        enriched = service._attach_import_metadata(payload, import_mode='parsed', note_style='structured', summary_focus='')
+        note_markdown = str(((enriched.get('metadata') or {}).get('refined_note_markdown') or '')).strip()
+        if '## 精炼正文' not in note_markdown:
+            raise RuntimeError('llm_note_markdown_preserve_smoke missing 精炼正文 section')
+        if '第一段应该有清晰句号。第二段也应该保留自然停顿。' not in note_markdown:
+            raise RuntimeError('llm_note_markdown_preserve_smoke did not preserve llm-generated note_markdown')
+        steps.append({'name': 'llm_note_markdown_preserve_smoke', 'status': 200})
+
+    def run_note_generation_mode_smoke() -> None:
+        service = ImportService(settings)
+
+        class FakeGateway:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def is_enabled(self) -> bool:
+                return True
+
+            def enhance_import_result(self, **kwargs):
+                self.calls += 1
+                return {
+                    'summary': '模型已经根据原文整理出清晰摘要。',
+                    'key_points': ['模型成稿路径已经触发。'],
+                    'note_markdown': (
+                        '## 核心结论\n\n'
+                        '模型已经根据原文整理出清晰摘要。\n\n'
+                        '## 精炼正文\n\n'
+                        '这里保留了一段由模型整理后的正文。\n\n'
+                        '## 重点摘录\n\n'
+                        '- 模型成稿路径已经触发。'
+                    ),
+                }
+
+        payload = {
+            'source_type': 'file',
+            'platform': 'file',
+            'source_url': None,
+            'source_file': 'mode-smoke.md',
+            'title': 'Note Generation Mode Smoke',
+            'author': None,
+            'content_text': '这是一段用于验证重解析成稿模式的正文，它长度不长，但已经足够让我们观察本地整理和模型成稿之间的差异。',
+            'summary': '原始摘要',
+            'key_points': ['原始要点'],
+            'quotes': [],
+            'category': 'selftest',
+            'content_type': 'article',
+            'use_case': 'test',
+            'tags': ['selftest'],
+            'metadata': {},
+            'local_path': None,
+            'status': 'ready',
+        }
+
+        local_gateway = FakeGateway()
+        service.llm_gateway = local_gateway
+        local_result = service._attach_import_metadata(
+            json.loads(json.dumps(payload, ensure_ascii=False)),
+            import_mode='parsed',
+            note_style='structured',
+            summary_focus='',
+            note_generation_mode='local_only',
+        )
+        local_metadata = (local_result.get('metadata') or {})
+        if local_gateway.calls != 0:
+            raise RuntimeError('note_generation_mode_smoke unexpectedly called llm in local_only mode')
+        if local_metadata.get('llm_enhanced') is True:
+            raise RuntimeError('note_generation_mode_smoke local_only mode still marked llm_enhanced')
+
+        model_gateway = FakeGateway()
+        service.llm_gateway = model_gateway
+        model_result = service._attach_import_metadata(
+            json.loads(json.dumps(payload, ensure_ascii=False)),
+            import_mode='parsed',
+            note_style='structured',
+            summary_focus='',
+            note_generation_mode='model_draft',
+        )
+        model_metadata = (model_result.get('metadata') or {})
+        if model_gateway.calls != 1:
+            raise RuntimeError('note_generation_mode_smoke did not trigger llm in model_draft mode')
+        if model_metadata.get('llm_enhanced') is not True:
+            raise RuntimeError('note_generation_mode_smoke model_draft mode did not preserve llm_enhanced')
+        steps.append({'name': 'note_generation_mode_smoke', 'status': 200})
+
+    def run_note_sentence_spacing_smoke() -> None:
+        service = ImportService(settings)
+        dense_text = (
+            '会发生什么有意思的事儿这完全不需要什么魔法这就是刚刚过去的几天前GTC才发生的事'
+            '从腾讯网易米哈游到谷歌微软英伟达都在讨论下一代游戏生产方式'
+            '更重要的是这些判断已经开始落到具体项目和研发流程里'
+        )
+        paragraphs = service._build_note_paragraphs(dense_text, max_length=240)
+        if len(paragraphs) < 2:
+            raise RuntimeError('note_sentence_spacing_smoke did not split dense Chinese text into multiple paragraphs')
+        if not all(any(token in paragraph for token in ('。', '！', '？', '；')) for paragraph in paragraphs):
+            raise RuntimeError('note_sentence_spacing_smoke paragraphs still miss sentence-ending punctuation')
+        steps.append({'name': 'note_sentence_spacing_smoke', 'status': 200})
+
+    def run_note_quality_diagnostics_smoke() -> None:
+        service = ImportService(settings)
+        payload = {
+            'source_type': 'url',
+            'platform': 'bilibili',
+            'source_url': 'https://example.com/video/diagnostics-smoke',
+            'source_file': None,
+            'title': 'Note Quality Diagnostics Smoke',
+            'author': None,
+            'content_text': '开头讲选题判断。中段讲执行步骤。结尾讲复盘方式。',
+            'summary': '这里只整理了选题判断。',
+            'key_points': ['选题判断要先明确目标。'],
+            'quotes': [],
+            'category': 'selftest',
+            'content_type': 'video',
+            'use_case': 'test',
+            'tags': ['selftest'],
+            'metadata': {
+                'transcript_source': 'description',
+                'timestamps_available': False,
+                'timestamps_estimated': False,
+                'capture_status': 'needs_asr',
+                'refined_note_markdown': (
+                    '## 核心结论\n\n'
+                    '这里只保留了选题判断。\n\n'
+                    '## 精炼正文\n\n'
+                    '当前只先整理开头的目标判断。\n\n'
+                    '## 重点摘录\n\n'
+                    '- 选题判断要先明确目标。'
+                ),
+                'semantic_transcript_segments': [
+                    {'start_ms': 0, 'text': '开头讲选题判断。'},
+                    {'start_ms': 15000, 'text': '中段讲执行步骤。'},
+                    {'start_ms': 30000, 'text': '结尾讲复盘方式。'},
+                ],
+                'transcript_segments': [
+                    {'start_ms': 0, 'text': '开头讲选题判断。'},
+                    {'start_ms': 15000, 'text': '中段讲执行步骤。'},
+                    {'start_ms': 30000, 'text': '结尾讲复盘方式。'},
+                ],
+            },
+            'local_path': None,
+            'status': 'needs_asr',
+        }
+        quality = service.note_quality_service.evaluate(payload)
+        capture_gap_report = quality.get('capture_gap_report') or {}
+        note_coverage_report = quality.get('note_coverage_report') or {}
+        if int(capture_gap_report.get('gap_count', 0)) < 2:
+            raise RuntimeError('note_quality_diagnostics_smoke did not report expected capture gaps')
+        if int(note_coverage_report.get('covered_units', 0)) >= int(note_coverage_report.get('total_units', 0)):
+            raise RuntimeError('note_quality_diagnostics_smoke unexpectedly marked full coverage')
+        if quality.get('high_confidence_answer_ready') is True:
+            raise RuntimeError('note_quality_diagnostics_smoke unexpectedly marked low-confidence content as high confidence')
+        steps.append({'name': 'note_quality_diagnostics_smoke', 'status': 200})
+
     health = check('health', 'GET', '/api/v1/health')
     static_asset = check('static_asset', 'GET', '/static/selftest/ok.txt')
     if str(static_asset).strip() != 'ok':
@@ -229,7 +425,7 @@ def run() -> dict:
         'reparse_content',
         'POST',
         f'/api/v1/contents/{content_id}/reparse',
-        json={'note_style': 'brief', 'summary_focus': '自测重解析'},
+        json={'note_style': 'brief', 'summary_focus': '自测重解析', 'note_generation_mode': 'model_draft'},
     )
     reparsed_metadata = (reparsed.get('content', {}).get('metadata', {})) or {}
     reparsed_versions = reparsed_metadata.get('note_versions') or []
@@ -240,6 +436,8 @@ def run() -> dict:
         raise RuntimeError('reparse_content note_versions missing previous note_style snapshot')
     if reparsed_metadata.get('note_style') != 'brief':
         raise RuntimeError('reparse_content did not apply requested note_style')
+    if reparsed_metadata.get('note_generation_mode') != 'model_draft':
+        raise RuntimeError('reparse_content did not apply requested note_generation_mode')
     restored_version = check(
         'restore_note_version',
         'POST',
@@ -256,6 +454,18 @@ def run() -> dict:
     chat = check('chat_once', 'POST', '/api/v1/chat', json={'query': '盘符医生', 'limit': 3})
     if not chat['citations']:
         raise RuntimeError('chat_once returned no citations')
+    model_override_chat = check(
+        'chat_model_override_meta',
+        'POST',
+        '/api/v1/chat',
+        json={'query': '你是什么模型', 'limit': 2, 'chat_model': 'gpt-5.4'},
+    )
+    if model_override_chat.get('mode') != 'assistant_model_info':
+        raise RuntimeError('chat_model_override_meta did not return assistant_model_info')
+    if (model_override_chat.get('runtime') or {}).get('chat_model') != 'gpt-5.4':
+        raise RuntimeError('chat_model_override_meta did not expose runtime chat_model override')
+    if 'gpt-5.4' not in str(model_override_chat.get('answer') or ''):
+        raise RuntimeError('chat_model_override_meta answer did not reflect overridden chat model')
     repository = LibraryRepository(settings.db_path)
     import_service = ImportService(settings)
     timestamped_content = repository.create_content(
@@ -476,11 +686,28 @@ def run() -> dict:
         raise RuntimeError('chat_quality_rank did not prefer ready content over blocked content')
 
     run_bilinote_screenshot_marker_smoke()
+    run_llm_note_markdown_preserve_smoke()
+    run_note_generation_mode_smoke()
+    run_note_sentence_spacing_smoke()
+    run_note_quality_diagnostics_smoke()
 
     stream = client.post('/api/v1/chat/stream', json={'query': '盘符医生', 'limit': 3})
     if stream.status_code != 200 or 'event: done' not in stream.text:
         raise RuntimeError(f'stream_chat failed: {stream.status_code} {stream.text}')
     steps.append({'name': 'stream_chat', 'status': stream.status_code})
+    stream_override = client.post(
+        '/api/v1/chat/stream',
+        json={'query': '你是什么模型', 'limit': 2, 'chat_model': 'gpt-5.4', 'web_search_enabled': True},
+    )
+    if stream_override.status_code != 200 or 'event: meta' not in stream_override.text:
+        raise RuntimeError(f'stream_chat_runtime_meta failed: {stream_override.status_code} {stream_override.text}')
+    meta_payload = stream_override.text.split('event: meta\ndata: ', 1)[1].split('\n\n', 1)[0]
+    meta = json.loads(meta_payload)
+    if meta.get('chat_model') != 'gpt-5.4':
+        raise RuntimeError('stream_chat_runtime_meta missing overridden chat_model in meta event')
+    if meta.get('web_search_enabled') is not True:
+        raise RuntimeError('stream_chat_runtime_meta missing web_search_enabled flag in meta event')
+    steps.append({'name': 'stream_chat_runtime_meta', 'status': stream_override.status_code})
 
     markdown = check('export_markdown', 'POST', f'/api/v1/contents/{content_id}/export-markdown')
     if not Path(markdown['path']).exists():
